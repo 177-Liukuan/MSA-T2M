@@ -68,7 +68,8 @@ class TEMOS(BaseModel):
         self.fact = None
         
         if self.cfg.LOSS.USE_INFONCE_FILTER:
-            self.filter_model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
+            # self.filter_model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
+            self.filter_model = SentenceTransformer('deps/paraphrase-MiniLM-L6-v2')
 
         self.retrieval_text_embedding = []
         self.retrieval_motion_embedding = []

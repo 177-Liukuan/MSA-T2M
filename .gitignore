@@ -1,0 +1,48 @@
+# ========================
+# Python & Jupyter Caches
+# ========================
+__pycache__/
+*.py[cod]
+*.class
+.ipynb_checkpoints/
+.cache/
+
+# ========================
+# OS & System Trash
+# ========================
+.Trash-0/
+.DS_Store
+
+# ========================
+# Experiment Outputs & Logs
+# ========================
+Experiments/
+Causal_TAE/
+Evaluator_272/experiments/
+
+# ========================
+# Datasets & Large Files
+# ========================
+babel_272/
+babel_272_stream/
+humanml3d_272/motion_data/
+humanml3d_272/mean_std/
+humanml3d_272/split/
+humanml3d_272/texts/
+humanml3d_272/humanml3d_272
+Evaluator_272/datasets/humanml3d_272
+
+# ========================
+# Archives & Weights
+# ========================
+*.zip
+*.ckpt
+*.pth
+*.pt
+Evaluator_272/epoch=99.ckpt
+
+# ========================
+# External Dependencies
+# ========================
+deps/
+Evaluator_272/deps/

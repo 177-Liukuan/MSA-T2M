@@ -15,7 +15,7 @@ accelerate launch --num_processes $NUM_GPUS train_causal_TAE.py \
 --dilation-growth-rate 3 \
 --out-dir Experiments \
 --dataname $dataset_name \
---exp-name causal_TAE_${dataset_name} \
+--exp-name causal_TAE_${dataset_name}_h100*1 \
 --root_loss 7.0 \
 --latent_dim 16 \
 --hidden_size 1024 \

@@ -84,6 +84,8 @@ dependencies:
   - zlib=1.2.11=h7b6447c_3
   - zstd=1.4.9=haebb681_0
   - pip:
+      - git+https://github.com/openai/CLIP.git
+      - git+https://github.com/nghorbani/human_body_prior.git
       - absl-py==0.13.0
       - accelerate==1.0.1
       - aiohappyeyeballs==2.4.3
@@ -100,7 +102,7 @@ dependencies:
       - charset-normalizer==2.0.4
       - chumpy==0.70
       - click==8.1.7
-      - clip==1.0
+#      - clip==1.0
       - cloudpathlib==0.20.0
       - confection==0.1.5
       - cycler==0.10.0
@@ -123,7 +125,7 @@ dependencies:
       - grpcio==1.68.0
       - h5py==3.11.0
       - huggingface-hub==0.26.2
-      - human-body-prior==2.2.2.0
+      # - human-body-prior==2.2.2.0
       - idna==3.2
       - imageio==2.9.0
       - imageio-ffmpeg==0.5.1
