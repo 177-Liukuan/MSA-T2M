@@ -9,7 +9,7 @@ accelerate launch --num_processes $NUM_GPUS train_t2m.py \
 --lr 0.0001 \
 --total-iter 100000 \
 --out-dir Experiments \
---exp-name t2m_model \
+--exp-name MotionStreamer_vaebyh100_t2m_h100_20260204 \
 --dataname t2m_272 \
 --latent_dir humanml3d_272/t2m_latents \
 --num_gpus $NUM_GPUS

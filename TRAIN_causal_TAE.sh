@@ -5,6 +5,7 @@ BATCH_SIZE=$((128 / NUM_GPUS))
 
 echo "Using $NUM_GPUS GPUs, each with a batch size of $BATCH_SIZE"
 
+# accelerate launch --num_processes $NUM_GPUS -m ipdb train_causal_TAE.py \
 accelerate launch --num_processes $NUM_GPUS train_causal_TAE.py \
 --batch-size $BATCH_SIZE \
 --lr 0.00005 \
@@ -15,7 +16,7 @@ accelerate launch --num_processes $NUM_GPUS train_causal_TAE.py \
 --dilation-growth-rate 3 \
 --out-dir Experiments \
 --dataname $dataset_name \
---exp-name causal_TAE_${dataset_name}_h100*1 \
+--exp-name causal_TAE_${dataset_name}_h100_20260203 \
 --root_loss 7.0 \
 --latent_dim 16 \
 --hidden_size 1024 \

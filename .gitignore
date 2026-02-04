@@ -46,3 +46,9 @@ Evaluator_272/epoch=99.ckpt
 # ========================
 deps/
 Evaluator_272/deps/
+output/
+sentencet5-xxl/
+humanml3d_272/t2m_latents/
+.vscode/
+__pycache__/
+*.pyc

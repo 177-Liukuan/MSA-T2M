@@ -59,12 +59,17 @@ import torch
 from mld.models.architectures.temos.textencoder.distillbert_actor import DistilbertActorAgnosticEncoder
 from mld.models.architectures.temos.motionencoder.actor import ActorAgnosticEncoder
 
-modelpath = 'distilbert-base-uncased'
+## 使用本地文件
+modelpath = './deps/distilbert-base-uncased'
 
 textencoder = DistilbertActorAgnosticEncoder(modelpath, num_layers=4, latent_dim=256)
 motionencoder = ActorAgnosticEncoder(nfeats=272, vae = True, num_layers=4, latent_dim=256, max_len=300)
 
-ckpt = torch.load('epoch=99.ckpt')
+# 使用ms作者提供的已经训练好的评估器
+# ckpt = torch.load('epoch=99.ckpt')
+# 使用我自己训练的评估器
+ckpt = torch.load('./experiments/temos/EXP1/checkpoints/epoch=99.ckpt')
+
 
 # load textencoder
 textencoder_ckpt = {}

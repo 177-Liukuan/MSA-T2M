@@ -86,7 +86,6 @@ avg_recons, avg_kl, avg_root = 0., 0., 0.
 for nb_iter in range(1, args.warm_up_iter):
     
     optimizer, current_lr = update_lr_warm_up(optimizer, nb_iter, args.warm_up_iter, args.lr)
-
     gt_motion = next(train_loader_iter)
     gt_motion = gt_motion.to(comp_device).float()
 
