@@ -52,3 +52,8 @@ humanml3d_272/t2m_latents/
 .vscode/
 __pycache__/
 *.pyc
+*.npy
+body_models/
+Unimotion/
+body_models/
+*.npy

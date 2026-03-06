@@ -87,12 +87,15 @@ from mld.models.architectures.temos.textencoder.distillbert_actor import Distilb
 from mld.models.architectures.temos.motionencoder.actor import ActorAgnosticEncoder
 from collections import OrderedDict
 
-modelpath = 'distilbert-base-uncased'
+#modelpath = 'distilbert-base-uncased'
+## 使用本地文件
+modelpath = './deps/distilbert-base-uncased'
 
 textencoder = DistilbertActorAgnosticEncoder(modelpath, num_layers=4, latent_dim=256)
 motionencoder = ActorAgnosticEncoder(nfeats=272, vae = True, num_layers=4, latent_dim=256, max_len=300)
 
-ckpt_path = 'epoch=99.ckpt'
+ckpt_path = '../Evaluator_272/experiments/temos/EXP1/checkpoints/epoch=99.ckpt'
+#ckpt_path = '../Evaluator_272/epoch=99.ckpt'
 print(f'Loading evaluator checkpoint from {ckpt_path}')
 ckpt = torch.load(ckpt_path)
 # load textencoder

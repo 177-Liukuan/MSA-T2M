@@ -9,7 +9,10 @@ accelerate launch --num_processes $NUM_GPUS train_t2m.py \
 --lr 0.0001 \
 --total-iter 100000 \
 --out-dir Experiments \
---exp-name MotionStreamer_vaebyh100_t2m_h100_20260204 \
+--exp-name MotionStreamer_vae_causal_TAE_t2m_272_h100_20260203_t2m_h100_20260206 \
 --dataname t2m_272 \
---latent_dir humanml3d_272/t2m_latents \
+--latent_dir humanml3d_272/t2m_latents/causal_TAE_t2m_272_h100_20260203 \
 --num_gpus $NUM_GPUS
+
+
+# python get_latent.py --resume-pth Experiments/causal_TAE_t2m_272_h100_20260203/net_last.pth --latent_dir humanml3d_272/t2m_latents/causal_TAE_t2m_272_h100_20260203
