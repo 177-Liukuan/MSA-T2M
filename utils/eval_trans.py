@@ -404,3 +404,136 @@ def calculate_frechet_feature_distance(feature_list1, feature_list2):
         sigma2=np.cov(feature_list2, rowvar=False),
     )
     return dist
+
+
+# ---------------------------------------------------------------------------
+#  MSA-VAE evaluation: MPJPE + FID + R_precision + Matching Score
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
+                              nb_iter, best_iter, best_fid, best_mpjpe,
+                              evaluator,
+                              device=torch.device('cuda'),
+                              accelerator=None):
+    """MSA-VAE evaluation with MPJPE + FID + R_precision@1/2/3 + MM-dist.
+
+    Args:
+        val_loader_t2m: returns (caption, motion, m_length). NOT prepared by accelerator.
+        net:           EvalCompat-wrapped model (forward -> x_recon, mu, logvar).
+        evaluator:     [textencoder, motionencoder] - TMR/TEMOS evaluator pair.
+        accelerator:   if multi-GPU, non-main ranks wait while main computes.
+    """
+    is_main = (accelerator is None) or accelerator.is_main_process
+
+    net.eval()
+
+    if is_main:
+        textencoder, motionencoder = evaluator
+
+        motion_annotation_list = []
+        motion_pred_list = []
+        R_precision_real = np.zeros(3)
+        R_precision_pred = np.zeros(3)
+        matching_score_real = 0.0
+        matching_score_pred = 0.0
+
+        nb_sample = 0
+        mpjpe_sum = 0.0
+        num_poses = 0
+        num_joints = 22
+
+        for batch in val_loader_t2m:
+            text, motion, m_length = batch
+            motion = motion.to(device).float()
+            bs, seq = motion.shape[:2]
+
+            pred_pose_eval = torch.zeros((bs, seq, motion.shape[-1]), device=device)
+
+            for i in range(bs):
+                pred_pose, _, _ = net(motion[i:i+1, :m_length[i]])
+                cur_len = pred_pose.shape[1]
+                pred_pose_eval[i:i+1, :cur_len] = pred_pose
+
+                # MPJPE in xyz space
+                pose_np = val_loader_t2m.dataset.inv_transform(
+                    motion[i:i+1, :m_length[i]].detach().cpu().numpy())
+                pose_xyz = recover_from_local_position(pose_np.squeeze(0), num_joints)
+
+                pred_np = val_loader_t2m.dataset.inv_transform(
+                    pred_pose.detach().cpu().numpy())
+                pred_xyz = recover_from_local_position(pred_np.squeeze(0), num_joints)
+
+                mpjpe_sum += torch.sum(calculate_mpjpe(
+                    torch.from_numpy(pose_xyz).float().to(device),
+                    torch.from_numpy(pred_xyz).float().to(device),
+                )).item()
+                num_poses += pose_xyz.shape[0]
+
+            # Evaluator embeddings
+            et = textencoder(text).loc                            # (B, 256)
+            em = motionencoder(motion, m_length).loc              # (B, 256)
+            em_pred = motionencoder(pred_pose_eval, m_length).loc
+
+            motion_annotation_list.append(em.cpu().numpy())
+            motion_pred_list.append(em_pred.cpu().numpy())
+
+            # R_precision & matching score - GT pairs
+            temp_R, temp_match = calculate_R_precision(
+                et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
+            R_precision_real += temp_R
+            matching_score_real += temp_match
+
+            # R_precision & matching score - reconstructed pairs
+            temp_R, temp_match = calculate_R_precision(
+                et.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
+            R_precision_pred += temp_R
+            matching_score_pred += temp_match
+
+            nb_sample += bs
+
+        # Final metrics
+        mpjpe = mpjpe_sum / num_poses * 1000  # mm
+
+        R_precision_real = R_precision_real / nb_sample
+        R_precision_pred = R_precision_pred / nb_sample
+        matching_score_real = matching_score_real / nb_sample
+        matching_score_pred = matching_score_pred / nb_sample
+
+        motion_annotation_np = np.concatenate(motion_annotation_list, axis=0)
+        motion_pred_np = np.concatenate(motion_pred_list, axis=0)
+        gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
+        mu, cov = calculate_activation_statistics(motion_pred_np)
+        fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
+
+        msg = (f"--> \t Eva. Iter {nb_iter}: "
+               f"FID {fid:.4f}, MPJPE {mpjpe:.3f}mm, "
+               f"R@1 {R_precision_pred[0]:.4f} (real {R_precision_real[0]:.4f}), "
+               f"R@2 {R_precision_pred[1]:.4f}, R@3 {R_precision_pred[2]:.4f}, "
+               f"MM-dist {matching_score_pred:.4f} (real {matching_score_real:.4f})")
+        logger.info(msg)
+
+        writer.add_scalar('./Test/mpjpe', mpjpe, nb_iter)
+        writer.add_scalar('./Test/FID', fid, nb_iter)
+        writer.add_scalar('./Test/R_precision_top1', R_precision_pred[0], nb_iter)
+        writer.add_scalar('./Test/R_precision_top2', R_precision_pred[1], nb_iter)
+        writer.add_scalar('./Test/R_precision_top3', R_precision_pred[2], nb_iter)
+        writer.add_scalar('./Test/R_precision_top1_real', R_precision_real[0], nb_iter)
+        writer.add_scalar('./Test/matching_score', matching_score_pred, nb_iter)
+        writer.add_scalar('./Test/matching_score_real', matching_score_real, nb_iter)
+
+        if fid < best_fid:
+            logger.info(f"--> --> \t FID improved from {best_fid:.4f} to {fid:.4f}")
+            best_fid = fid
+            torch.save({'net': net.state_dict()}, os.path.join(out_dir, 'net_best_fid.pth'))
+        if mpjpe < best_mpjpe:
+            logger.info(f"--> --> \t MPJPE improved from {best_mpjpe:.5f} to {mpjpe:.5f}")
+            best_mpjpe = mpjpe
+            torch.save({'net': net.state_dict()}, os.path.join(out_dir, 'net_best_mpjpe.pth'))
+        torch.save({'net': net.state_dict()}, os.path.join(out_dir, 'net_last.pth'))
+
+    # Synchronize all ranks
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+
+    net.train()
+    return best_iter, best_fid, best_mpjpe, writer, logger
