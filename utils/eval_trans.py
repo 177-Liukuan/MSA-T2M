@@ -413,6 +413,7 @@ def calculate_frechet_feature_distance(feature_list1, feature_list2):
 def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
                               nb_iter, best_iter, best_fid, best_mpjpe,
                               evaluator,
+                              draw=True, save=True, savegif=True,
                               device=torch.device('cuda'),
                               accelerator=None):
     """MSA-VAE evaluation with MPJPE + FID + R_precision@1/2/3 + MM-dist.
@@ -442,6 +443,10 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
         num_poses = 0
         num_joints = 22
 
+        draw_org  = []
+        draw_pred = []
+        draw_text = []
+
         for batch in val_loader_t2m:
             text, motion, m_length = batch
             motion = motion.to(device).float()
@@ -468,6 +473,11 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
                     torch.from_numpy(pred_xyz).float().to(device),
                 )).item()
                 num_poses += pose_xyz.shape[0]
+
+                if len(draw_org) < 4:
+                    draw_org.append(torch.from_numpy(pose_xyz).float())
+                    draw_pred.append(torch.from_numpy(pred_xyz).float())
+                    draw_text.append(text[i] if isinstance(text, (list, tuple)) else '')
 
             # Evaluator embeddings
             et = textencoder(text).loc                            # (B, 256)
@@ -521,6 +531,22 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
         writer.add_scalar('./Test/matching_score', matching_score_pred, nb_iter)
         writer.add_scalar('./Test/matching_score_real', matching_score_real, nb_iter)
 
+        if draw and nb_iter % 20000 == 0:
+            for ii in range(min(4, len(draw_org))):
+                draw_org[ii] = draw_org[ii].unsqueeze(0)
+                tensorborad_add_video_xyz(writer, draw_org[ii], nb_iter,
+                    tag='./Vis/org_eval' + str(ii),
+                    title_batch=[draw_text[ii]],
+                    outname=[os.path.join(out_dir, 'gt' + str(ii) + '.gif')] if savegif else None,
+                    fps=30)
+            for ii in range(min(4, len(draw_pred))):
+                draw_pred[ii] = draw_pred[ii].unsqueeze(0)
+                tensorborad_add_video_xyz(writer, draw_pred[ii], nb_iter,
+                    tag='./Vis/pred_eval' + str(ii),
+                    title_batch=[draw_text[ii]],
+                    outname=[os.path.join(out_dir, 'pred' + str(ii) + '.gif')] if savegif else None,
+                    fps=30)
+
         if fid < best_fid:
             logger.info(f"--> --> \t FID improved from {best_fid:.4f} to {fid:.4f}")
             best_fid = fid
@@ -537,3 +563,112 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
 
     net.train()
     return best_iter, best_fid, best_mpjpe, writer, logger
+
+
+# ---------------------------------------------------------------------------
+#  Single-GPU evaluation for MSA-VAE (test time)
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def evaluation_msa_vae_single(out_dir, val_loader, net, logger, writer, evaluator,
+                               device=torch.device('cuda')):
+    """Single-GPU evaluation for MSA-VAE.
+
+    Computes: MPJPE, FID, R@1/2/3, MM-dist, Diversity.
+
+    Args:
+        val_loader: returns (text, motion, m_length) - from dataset_eval_t2m.
+        net:        EvalCompat-wrapped model (forward -> x_recon, mu, logvar).
+        evaluator:  [textencoder, motionencoder] - TMR/TEMOS evaluator pair.
+    """
+    net.eval()
+    textencoder, motionencoder = evaluator
+    num_joints = 22
+
+    motion_annotation_list = []
+    motion_pred_list = []
+    R_precision_real  = torch.tensor([0, 0, 0], device=device, dtype=torch.float)
+    R_precision_pred  = torch.tensor([0, 0, 0], device=device, dtype=torch.float)
+    matching_score_real = torch.tensor(0.0, device=device)
+    matching_score_pred = torch.tensor(0.0, device=device)
+    nb_sample  = torch.tensor(0,   device=device)
+    mpjpe_acc  = torch.tensor(0.0, device=device)
+    num_poses  = torch.tensor(0,   device=device)
+
+    for batch in val_loader:
+        text, motion, m_length = batch
+        motion = motion.to(device).float()
+        bs, seq = motion.shape[:2]
+
+        pred_pose_eval = torch.zeros((bs, seq, motion.shape[-1]), device=device)
+
+        for i in range(bs):
+            pred_pose, _, _ = net(motion[i:i+1, :m_length[i]])
+            cur_len = pred_pose.shape[1]
+            pred_pose_eval[i:i+1, :cur_len] = pred_pose
+
+            # MPJPE in 3D xyz space
+            pose_np = val_loader.dataset.inv_transform(
+                motion[i:i+1, :m_length[i]].detach().cpu().numpy())
+            pose_xyz = recover_from_local_position(pose_np.squeeze(0), num_joints)
+
+            pred_np = val_loader.dataset.inv_transform(
+                pred_pose.detach().cpu().numpy())
+            pred_xyz = recover_from_local_position(pred_np.squeeze(0), num_joints)
+
+            mpjpe_acc += torch.sum(calculate_mpjpe(
+                torch.from_numpy(pose_xyz).float().to(device),
+                torch.from_numpy(pred_xyz).float().to(device),
+            ))
+            num_poses += pose_xyz.shape[0]
+
+        # TMR embeddings
+        et     = textencoder(text).loc
+        em     = motionencoder(motion, m_length).loc
+        em_pred = motionencoder(pred_pose_eval, m_length).loc
+
+        motion_annotation_list.append(em)
+        motion_pred_list.append(em_pred)
+
+        temp_R, temp_match = calculate_R_precision(
+            et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
+        R_precision_real  += torch.tensor(temp_R, device=device, dtype=torch.float)
+        matching_score_real += temp_match
+
+        temp_R, temp_match = calculate_R_precision(
+            et.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
+        R_precision_pred  += torch.tensor(temp_R, device=device, dtype=torch.float)
+        matching_score_pred += temp_match
+
+        nb_sample += bs
+
+    mpjpe = mpjpe_acc / num_poses * 1000  # mm
+    R_precision_real /= nb_sample
+    R_precision_pred /= nb_sample
+    matching_score_real /= nb_sample
+    matching_score_pred /= nb_sample
+
+    motion_annotation_np = torch.cat(motion_annotation_list, dim=0).cpu().numpy()
+    motion_pred_np       = torch.cat(motion_pred_list,       dim=0).cpu().numpy()
+    gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
+    mu,    cov    = calculate_activation_statistics(motion_pred_np)
+    fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
+
+    ns = int(nb_sample.item())
+    diversity_real = calculate_diversity(motion_annotation_np, 300 if ns > 300 else 100)
+    diversity_pred = calculate_diversity(motion_pred_np,       300 if ns > 300 else 100)
+
+    msg = (
+        f"--> Eva. MSA-VAE | "
+        f"FID {fid:.4f} | "
+        f"MPJPE {float(mpjpe):.3f}mm | "
+        f"R@1 {float(R_precision_pred[0]):.4f} (GT {float(R_precision_real[0]):.4f}) | "
+        f"R@2 {float(R_precision_pred[1]):.4f} | "
+        f"R@3 {float(R_precision_pred[2]):.4f} | "
+        f"MM-dist {float(matching_score_pred):.4f} (GT {float(matching_score_real):.4f}) | "
+        f"Div {diversity_pred:.4f} (GT {diversity_real:.4f})"
+    )
+    logger.info(msg)
+
+    return (fid, float(mpjpe), diversity_pred,
+            float(R_precision_pred[0]), float(R_precision_pred[1]), float(R_precision_pred[2]),
+            float(matching_score_pred), writer, logger)

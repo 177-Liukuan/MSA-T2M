@@ -128,9 +128,12 @@ class EvalCompat(nn.Module):
 #   Helpers
 # ---------------------------------------------------------------------------
 def update_lr_warm_up(optimizer, nb_iter, warm_up_iter, lr):
-    current_lr = lr * (nb_iter + 1) / (warm_up_iter + 1)
+    scale = (nb_iter + 1) / (warm_up_iter + 1)
+    current_lr = lr * scale
     for param_group in optimizer.param_groups:
-        param_group["lr"] = current_lr
+        # Respect per-group base LR (set during optimizer init)
+        base_lr = param_group.get('initial_lr', lr)
+        param_group["lr"] = base_lr * scale
     return optimizer, current_lr
 
 
@@ -211,12 +214,37 @@ if args.resume_pth:
     state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
     net.load_state_dict(state, strict=True)
 
-net.train()
 net.to(comp_device)
 
 clip_text_encoder.to(comp_device)
 clip_text_encoder.eval()
 
+##### ---- Phase-aware freeze / unfreeze ---- #####
+# Identify CNN params (bottom layer) vs top-layer params
+cnn_modules = ['msa_vae.cnn_encoder', 'msa_vae.cnn_decoder', 'msa_vae.decode_proj']
+top_modules = ['msa_vae.trans_encoder', 'msa_vae.trans_decoder',
+               'msa_vae.global_proj', 'msa_vae.local_proj']
+
+def set_cnn_frozen(model, frozen):
+    """Freeze or unfreeze CNN encoder/decoder/decode_proj."""
+    for name, param in model.named_parameters():
+        if any(name.startswith(m) for m in cnn_modules):
+            param.requires_grad = not frozen
+
+if args.phase == 1:
+    # Phase 1: freeze CNN, only train Transformer + projections
+    set_cnn_frozen(net, frozen=True)
+    n_frozen = sum(1 for n, p in net.named_parameters() if not p.requires_grad)
+    n_train = sum(1 for n, p in net.named_parameters() if p.requires_grad)
+    logger.info(f'Phase 1: CNN frozen ({n_frozen} params frozen, {n_train} trainable)')
+elif args.phase == 2:
+    # Phase 2: all unfrozen (differential LR set in optimizer)
+    set_cnn_frozen(net, frozen=False)
+    logger.info(f'Phase 2: all params unfrozen, CNN LR scale = {args.cnn_lr_scale}')
+else:
+    logger.info(f'Phase 0: legacy mode, all params trainable with uniform LR')
+
+net.train()
 net_eval = EvalCompat(net)
 
 ##### ---- Evaluator for R_precision / FID ---- #####
@@ -246,8 +274,29 @@ evaluator = [eval_textencoder, eval_motionencoder]
 logger.info(f'Loaded TMR evaluator from {evaluator_ckpt_path}')
 
 ##### ---- Optimizer & Scheduler ---- #####
-optimizer = optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.99),
-                        weight_decay=args.weight_decay)
+if args.phase == 2:
+    # Differential LR: CNN params get scaled-down LR
+    cnn_params, top_params = [], []
+    for name, param in net.named_parameters():
+        if any(name.startswith(m) for m in cnn_modules):
+            cnn_params.append(param)
+        else:
+            top_params.append(param)
+    param_groups = [
+        {'params': top_params, 'lr': args.lr},
+        {'params': cnn_params, 'lr': args.lr * args.cnn_lr_scale},
+    ]
+    optimizer = optim.AdamW(param_groups, betas=(0.9, 0.99),
+                            weight_decay=args.weight_decay)
+    logger.info(f'Optimizer: top LR={args.lr}, CNN LR={args.lr * args.cnn_lr_scale}')
+else:
+    # Phase 0/1: uniform LR on trainable params only
+    trainable_params = [p for p in net.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=args.lr, betas=(0.9, 0.99),
+                            weight_decay=args.weight_decay)
+# Store initial_lr for warm-up scheduling
+for pg in optimizer.param_groups:
+    pg['initial_lr'] = pg['lr']
 scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer, milestones=args.lr_scheduler, gamma=args.gamma,
 )
@@ -278,9 +327,16 @@ def compute_losses(batch, net_module):
     out = net_module(gt_motion)
 
     # --- Reconstruction losses ---
-    loss_motion = Loss(out['x_recon'], gt_motion)
-    loss_kl = Loss.forward_KL(out['mu'], out['logvar'])
-    loss_root = Loss.forward_root(out['x_recon'], gt_motion)
+    # Phase 1: skip recon/kl/root (CNN frozen, these produce zero gradients)
+    if args.phase == 1:
+        zero = torch.tensor(0.0, device=comp_device)
+        loss_motion = zero
+        loss_kl = zero
+        loss_root = zero
+    else:
+        loss_motion = Loss(out['x_recon'], gt_motion)
+        loss_kl = Loss.forward_KL(out['mu'], out['logvar'])
+        loss_root = Loss.forward_root(out['x_recon'], gt_motion)
     loss_latent = latent_recon_loss_fn(out['z_recon'], out['z_local'].detach())
 
     loss_dict = {
@@ -308,12 +364,19 @@ def compute_losses(batch, net_module):
     loss_dict['local_align'] = loss_local
 
     # --- Total loss ---
-    total_loss = (loss_motion
-                  + loss_kl
-                  + args.root_loss * loss_root
-                  + args.latent_recon_weight * loss_latent
-                  + args.global_align_weight * loss_global
-                  + args.local_align_weight * loss_local)
+    if args.phase == 1:
+        # Phase 1: only latent + alignment losses
+        total_loss = (args.latent_recon_weight * loss_latent
+                      + args.global_align_weight * loss_global
+                      + args.local_align_weight * loss_local)
+    else:
+        # Phase 0/2: all losses
+        total_loss = (loss_motion
+                      + loss_kl
+                      + args.root_loss * loss_root
+                      + args.latent_recon_weight * loss_latent
+                      + args.global_align_weight * loss_global
+                      + args.local_align_weight * loss_local)
 
     return total_loss, loss_dict
 

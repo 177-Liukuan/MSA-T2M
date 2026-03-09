@@ -222,17 +222,20 @@ class MSA_VAE(nn.Module):
 
         # ========== CLIP alignment projection heads ==========
         # Global: [CLS] -> CLIP text space
-        self.global_proj = nn.Sequential(
-            nn.Linear(trans_d_model, trans_d_model),
-            nn.GELU(),
-            nn.Linear(trans_d_model, clip_dim),
-        )
+        # trans_d_model == clip_dim: Identity (force direct CLIP space collapse)
+        # otherwise: single Linear only, no nonlinearity
+        if trans_d_model == clip_dim:
+            self.global_proj = nn.Identity()
+        else:
+            self.global_proj = nn.Linear(trans_d_model, clip_dim)
+
         # Local: each z_i -> CLIP text space
-        self.local_proj = nn.Sequential(
-            nn.Linear(latent_dim, trans_d_model),
-            nn.GELU(),
-            nn.Linear(trans_d_model, clip_dim),
-        )
+        # latent_dim == clip_dim: Identity
+        # otherwise: single Linear only, no nonlinearity
+        if latent_dim == clip_dim:
+            self.local_proj = nn.Identity()
+        else:
+            self.local_proj = nn.Linear(latent_dim, clip_dim)
 
     # ------------------------------------------------------------------
     #  Utility

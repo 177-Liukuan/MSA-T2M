@@ -65,7 +65,7 @@ with open(SPLIT_FILE, 'r') as f:
 print(f"  train_ft 总数: {len(ft_ids)}")
 
 sample_id = None
-count = 5
+count = 2048
 for sid in ft_ids:
     mp = pjoin(MOTION_DIR, sid + '.npy')
     tp = pjoin(TEXT_DIR, sid + '.txt')

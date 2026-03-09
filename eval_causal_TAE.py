@@ -49,7 +49,7 @@ net = tae.Causal_HumanTAE(
 
 print ('loading checkpoint from {}'.format(args.resume_pth))
 ckpt = torch.load(args.resume_pth, map_location='cpu')
-net.load_state_dict(ckpt['net'], strict=True)
+net.load_state_dict(ckpt['net'], strict=False)
 net.eval()
 net.to(comp_device)
 

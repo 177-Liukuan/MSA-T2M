@@ -51,6 +51,14 @@ def get_args_parser():
     parser.add_argument('--global_align_weight', default=0.5, type=float, help='global CLIP alignment loss weight')
     parser.add_argument('--local_align_weight', default=0.2, type=float, help='local CLIP alignment loss weight')
 
+    ## phased training
+    parser.add_argument('--phase', default=0, type=int, choices=[0, 1, 2],
+                        help='training phase: 0=all-at-once (legacy), '
+                             '1=freeze CNN (only train Transformer+proj), '
+                             '2=unfreeze all with differential LR')
+    parser.add_argument('--cnn_lr_scale', default=0.1, type=float,
+                        help='LR scale factor for CNN params in phase 2 (e.g. 0.1 means CNN LR = 0.1 * lr)')
+
     ## resume
     parser.add_argument("--resume-pth", type=str, default=None, help='resume pth for MSA-VAE')
     parser.add_argument("--resume-cnn-pth", type=str, default=None, help='resume pth for pretrained Causal CNN VAE (load CNN weights only)')
