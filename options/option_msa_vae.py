@@ -45,6 +45,12 @@ def get_args_parser():
     parser.add_argument('--clip_dim', default=512, type=int, help='CLIP feature dimension')
     parser.add_argument('--clip_version', default='ViT-B/32', type=str, help='CLIP model version')
 
+    # --- Spotlight global alignment ---
+    parser.add_argument('--spotlight_alpha', default=-1.0, type=float,
+                        help='Spotlight interpolation alpha. '
+                             '-1 = dynamic (window_size / total_frames), '
+                             '>=0 = fixed value in [0,1]')
+
     # --- Loss weights ---
     parser.add_argument('--root_loss', default=7.0, type=float, help='root joint loss weight')
     parser.add_argument('--latent_recon_weight', default=1.0, type=float, help='Transformer latent recon loss weight')

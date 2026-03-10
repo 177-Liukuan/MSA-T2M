@@ -141,17 +141,22 @@ class MSAVAEDataset(data.Dataset):
             indices_30 = np.round(np.linspace(0, T_20 - 1, T_30)).astype(int)
             clip_enc_30 = clip_enc_20[indices_30]
             # Crop to window
-            local_clip_window = clip_enc_30[idx:idx + self.window_size]
-            # Average-pool to latent rate
+            local_clip_window = clip_enc_30[idx:idx + self.window_size]  # (64, 512)
+            # Mean-pool all 64 frames -> single semantic vector for Spotlight
+            local_clip_pooled = local_clip_window.mean(axis=0)  # (512,)
+            # Average-pool to latent rate for local alignment loss
             local_clip_latent = _pool_to_latent(local_clip_window, latent_len)
         else:
             local_clip_latent = np.zeros((latent_len, 512), dtype=np.float32)
+            local_clip_pooled = np.zeros((512,), dtype=np.float32)
 
         return (
             motion_window.astype(np.float32),
             caption,
             local_clip_latent.astype(np.float32),
             has_local,
+            len(motion),  # total_frames for spotlight alpha
+            local_clip_pooled.astype(np.float32),  # (512,) mean of 64 raw frames
         )
 
 
@@ -168,12 +173,14 @@ def _pool_to_latent(clip_window, latent_len):
 
 
 def collate_fn(batch):
-    """Custom collate: tensors + strings + bools."""
-    motions, captions, local_clips, has_locals = zip(*batch)
+    """Custom collate: tensors + strings + bools + total_frames + pooled local."""
+    motions, captions, local_clips, has_locals, total_frames, local_pooled = zip(*batch)
     motions = torch.from_numpy(np.stack(motions))
     local_clips = torch.from_numpy(np.stack(local_clips))
     has_locals = torch.tensor(has_locals, dtype=torch.bool)
-    return motions, list(captions), local_clips, has_locals
+    total_frames = torch.tensor(total_frames, dtype=torch.long)
+    local_pooled = torch.from_numpy(np.stack(local_pooled))
+    return motions, list(captions), local_clips, has_locals, total_frames, local_pooled
 
 
 def DATALoader(dataset_name, batch_size, num_workers=8,

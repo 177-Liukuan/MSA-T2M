@@ -318,11 +318,13 @@ def compute_losses(batch, net_module):
 
     Returns: (total_loss, loss_dict)
     """
-    gt_motion, captions, local_clip_gt, has_local = batch
+    gt_motion, captions, local_clip_gt, has_local, total_frames, local_clip_pooled = batch
 
     gt_motion = gt_motion.to(comp_device).float()
     local_clip_gt = local_clip_gt.to(comp_device).float()
     has_local = has_local.to(comp_device)
+    total_frames = total_frames.to(comp_device)
+    local_clip_pooled = local_clip_pooled.to(comp_device).float()
 
     out = net_module(gt_motion)
 
@@ -346,13 +348,36 @@ def compute_losses(batch, net_module):
         'latent': loss_latent,
     }
 
-    # --- Global alignment: h_cls vs CLIP(caption) ---
+    # --- Global alignment: h_cls vs Spotlight(CLIP caption, local) ---
     loss_global = torch.tensor(0.0, device=comp_device, requires_grad=True)
     if args.global_align_weight > 0:
         with torch.no_grad():
             clip_text_feat = clip_text_encoder.encode_text(captions, comp_device)
-            # clip_text_feat: (B, 512)
-        loss_global = global_align_loss_fn(out['clip_global_feat'], clip_text_feat)
+            # clip_text_feat: (B, 512) — original global text vector G_origin
+
+            # --- Spotlight: dynamic context label ---
+            # Compute interpolation alpha
+            if args.spotlight_alpha < 0:
+                # Dynamic: alpha = window_size / total_frames (per sample)
+                alpha = (args.window_size / total_frames.float().to(comp_device)).clamp(0, 1)
+            else:
+                alpha = torch.full((gt_motion.size(0),), args.spotlight_alpha,
+                                   device=comp_device)
+
+            # L_pooled: pre-computed mean of 64 raw frame-level CLIP features -> (B, 512)
+            l_pooled = local_clip_pooled
+
+            # Zero out alpha for samples without local CLIP embeddings
+            alpha = alpha * has_local.float()
+
+            # G_mixed = (1 - alpha) * G_origin + alpha * L_pooled
+            alpha = alpha.unsqueeze(-1)  # (B, 1)
+            g_mixed = (1 - alpha) * clip_text_feat + alpha * l_pooled
+
+            # L2 normalize -> project back to CLIP unit hypersphere
+            g_target = F.normalize(g_mixed, dim=-1)
+
+        loss_global = global_align_loss_fn(out['clip_global_feat'], g_target)
     loss_dict['global_align'] = loss_global
 
     # --- Local alignment: z_i projected vs CLIP(local label) ---
@@ -424,6 +449,8 @@ best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_
 logger.info(f'=== Main training: {args.total_iter} iterations ===')
 logger.info(f'  Loss weights: root={args.root_loss}, latent={args.latent_recon_weight}, '
             f'global={args.global_align_weight}, local={args.local_align_weight}')
+logger.info(f'  Spotlight alpha: {args.spotlight_alpha} '
+            f'({"dynamic: window/total" if args.spotlight_alpha < 0 else "fixed"})')
 
 for nb_iter in range(1, args.total_iter + 1):
     batch = next(train_loader_iter)

@@ -69,7 +69,6 @@ class TransformerLatentEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
         )
-        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, z_local, key_padding_mask=None):
         """
@@ -95,7 +94,6 @@ class TransformerLatentEncoder(nn.Module):
             src_key_padding_mask = None
 
         h_seq = self.transformer_encoder(z_seq, src_key_padding_mask=src_key_padding_mask)
-        h_seq = self.norm(h_seq)
         h_cls = h_seq[:, 0, :]                                    # (B, d_model)
         return h_cls, h_seq
 
@@ -122,7 +120,6 @@ class TransformerLatentDecoder(nn.Module):
         self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=num_layers
         )
-        self.norm = nn.LayerNorm(d_model)
         self.output_proj = nn.Linear(d_model, latent_dim)
 
     def forward(self, h_cls, seq_len, tgt_key_padding_mask=None):
@@ -145,7 +142,6 @@ class TransformerLatentDecoder(nn.Module):
             tgt=time_queries, memory=memory,
             tgt_key_padding_mask=tgt_key_padding_mask,
         )
-        h_decoded = self.norm(h_decoded)
         z_recon = self.output_proj(h_decoded)                     # (B, seq_len, latent_dim)
         return z_recon
 
