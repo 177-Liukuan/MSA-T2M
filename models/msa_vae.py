@@ -5,15 +5,16 @@ Architecture:
   Bottom layer: Causal 1D CNN VAE - local physical representation with temporal causal property
   Top layer:    Transformer AE    - global semantic aggregation via [CLS] token
 
-  Forward flow:
-    Motion -> CausalEncoder -> z_local (mu, logvar, reparameterize)
-           -> TransformerEncoder (with [CLS]) -> h_cls (global representation)
-           -> TransformerDecoder (h_cls -> z_recon, for latent reconstruction loss)
-    z_local -> CausalDecoder -> x_recon (reconstructed motion)
+  Forward flow (dual-track decoupling):
+    Motion -> CausalEncoder -> mu, logvar -> z_local (reparameterize)
+    Physical track:  z_local  -> CausalDecoder -> x_recon (robust noisy decoding)
+    Semantic track:  mu_local -> TransformerEncoder([CLS]) -> h_cls
+                     h_cls    -> TransformerDecoder -> mu_recon
+                     Loss: ||mu_recon - mu_local||^2
 
-  Projection heads (for cross-modal CLIP alignment, used in training):
-    global_proj: h_cls -> CLIP text space (global alignment with HumanML3D)
-    local_proj:  z_i   -> CLIP text space (local alignment with BABEL)
+  Projection heads (CLIP alignment, based on deterministic mu):
+    global_proj: h_cls  -> CLIP text space (global alignment)
+    local_proj:  mu_i   -> CLIP text space (local alignment)
 """
 
 import math
@@ -291,7 +292,8 @@ class MSA_VAE(nn.Module):
             z_local, mu, logvar, h_cls
         """
         z_local, mu, logvar = self.encode_cnn(x)
-        h_cls, _ = self.encode_transformer(z_local, key_padding_mask=key_padding_mask)
+        # Semantic track: Transformer receives deterministic mu (not noisy z_local)
+        h_cls, _ = self.encode_transformer(mu, key_padding_mask=key_padding_mask)
         return z_local, mu, logvar, h_cls
 
     # ------------------------------------------------------------------
@@ -327,8 +329,8 @@ class MSA_VAE(nn.Module):
             x_recon          - reconstructed motion         (B, T, 272)
             mu, logvar       - CNN VAE distribution params  (B, T', latent_dim)
             h_cls            - global [CLS] representation  (B, d_model)
-            z_local          - local latent tokens          (B, T', latent_dim)
-            z_recon          - Transformer-decoded latents  (B, T', latent_dim)
+            z_local          - noisy local latents (for CNN decoder)    (B, T', latent_dim)
+            mu_recon         - Transformer-decoded deterministic mu     (B, T', latent_dim)
             clip_global_feat - projected global feature     (B, clip_dim)
             clip_local_feat  - projected local features     (B, T', clip_dim)
         """
@@ -345,17 +347,17 @@ class MSA_VAE(nn.Module):
         else:
             key_padding_mask = None
 
-        # --- Top: Transformer AE ---
-        h_cls, _ = self.encode_transformer(z_local, key_padding_mask=key_padding_mask)
-        z_recon = self.decode_transformer(h_cls, seq_len=z_local.size(1),
-                                          tgt_key_padding_mask=key_padding_mask)
+        # --- Semantic track: Transformer AE operates on deterministic mu ---
+        h_cls, _ = self.encode_transformer(mu, key_padding_mask=key_padding_mask)
+        mu_recon = self.decode_transformer(h_cls, seq_len=mu.size(1),
+                                           tgt_key_padding_mask=key_padding_mask)
 
-        # --- CNN Decoder: reconstruct motion from local latents ---
+        # --- Physical track: CNN Decoder receives noisy z_local ---
         x_recon = self.decode_cnn(z_local)
 
-        # --- CLIP projection heads ---
+        # --- CLIP projection heads (based on deterministic mu) ---
         clip_global_feat = self.global_proj(h_cls)
-        clip_local_feat = self.local_proj(z_local)
+        clip_local_feat = self.local_proj(mu)
 
         return {
             'x_recon': x_recon,
@@ -363,7 +365,7 @@ class MSA_VAE(nn.Module):
             'logvar': logvar,
             'h_cls': h_cls,
             'z_local': z_local,
-            'z_recon': z_recon,
+            'mu_recon': mu_recon,
             'clip_global_feat': clip_global_feat,
             'clip_local_feat': clip_local_feat,
         }
