@@ -18,9 +18,9 @@ Why this works:
 Usage:
   # Single text query
   python visualize_t2m_generation.py \
-      --resume-pth ./Experiments/xxx/net_best_fid.pth \
-      --text "a person walks forward and waves their right hand" \
-      --target-frames 120 --output-dir viz_output
+      --resume-pth ./Experiments/MSA_VAEv5_t2m_272_dynamic02/net_last.pth \
+      --text "a person walks forward slowly." \
+      --target-frames 128 --output-dir viz_output
 
   # Multiple queries from file (one per line)
   python visualize_t2m_generation.py \
@@ -61,9 +61,9 @@ def parse_args():
     p.add_argument('--latent-dim',           type=int,   default=16)
     p.add_argument('--trans-d-model',        type=int,   default=512)
     p.add_argument('--trans-nhead',          type=int,   default=8)
-    p.add_argument('--trans-enc-layers',     type=int,   default=4)
-    p.add_argument('--trans-dec-layers',     type=int,   default=4)
-    p.add_argument('--trans-ff-size',        type=int,   default=1024)
+    p.add_argument('--trans-enc-layers',     type=int,   default=6)
+    p.add_argument('--trans-dec-layers',     type=int,   default=6)
+    p.add_argument('--trans-ff-size',        type=int,   default=2048)
     p.add_argument('--trans-dropout',        type=float, default=0.1)
     p.add_argument('--clip-version',         type=str,   default='ViT-B/32')
     p.add_argument('--clip-dim',             type=int,   default=512)
@@ -81,6 +81,8 @@ def parse_args():
     # Output
     p.add_argument('--output-dir', type=str,  default='viz_gen_output')
     p.add_argument('--fps',        type=int,  default=30)
+    p.add_argument('--temperature', type=float, default=0.0,
+                   help='Temperature for diversity sampling (0=deterministic, >0=stochastic)')
     p.add_argument('--save-npy',   action='store_true',
                    help='Also save raw 272-dim motion as .npy')
     return p.parse_args()
@@ -151,7 +153,7 @@ def load_model(args, device):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def generate_from_text(text, net, clip_model, mean, std, target_frames,
-                       unit_length, device):
+                       unit_length, device, temperature=0.0):
     """
     Zero-shot generation pipeline.
 
@@ -191,8 +193,15 @@ def generate_from_text(text, net, clip_model, mean, std, target_frames,
     #   decode_transformer(h_cls, seq_len) internally does:
     #       memory = h_cls.unsqueeze(1)  →  (B, 1, d_model)
     #       cross-attention over positional queries  →  z_recon (B, T', latent_dim)
-    z_gen = net.msa_vae.decode_transformer(clip_txt_emb, seq_len=seq_len)
-    # z_gen: (1, T', latent_dim)
+    mu_gen = net.msa_vae.decode_transformer(clip_txt_emb, seq_len=seq_len)
+    # mu_gen: (1, T', latent_dim) — deterministic semantic centre
+
+    # --- (3b) Temperature sampling for diversity ---
+    if temperature > 0:
+        epsilon = torch.randn_like(mu_gen)
+        z_gen = mu_gen + temperature * epsilon
+    else:
+        z_gen = mu_gen
 
     # --- (4) CNN Decoder: z → x (normalized 272-dim) ---
     x_gen = net.msa_vae.decode_cnn(z_gen)                         # (1, T, 272)
@@ -240,6 +249,7 @@ def run_queries(queries, net, clip_model, mean, std, args, device):
             target_frames=args.target_frames,
             unit_length=unit_length,
             device=device,
+            temperature=args.temperature,
         )
         T = motion_272.shape[0]
         print(f'  → Generated {T} frames ({T/args.fps:.1f}s @ {args.fps}fps)')

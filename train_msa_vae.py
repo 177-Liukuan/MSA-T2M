@@ -339,7 +339,7 @@ def compute_losses(batch, net_module):
         loss_motion = Loss(out['x_recon'], gt_motion)
         loss_kl = Loss.forward_KL(out['mu'], out['logvar'])
         loss_root = Loss.forward_root(out['x_recon'], gt_motion)
-    loss_latent = latent_recon_loss_fn(out['z_recon'], out['z_local'].detach())
+    loss_latent = latent_recon_loss_fn(out['mu_recon'], out['mu'].detach())
 
     loss_dict = {
         'recon': loss_motion,
