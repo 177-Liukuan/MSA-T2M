@@ -63,13 +63,13 @@ net = msa_vae.MSA_HumanVAE(
     activation='relu',
     latent_dim=args.latent_dim,
     clip_range=clip_range,
-    trans_d_model=args.trans_d_model if hasattr(args, 'trans_d_model') else 512,
+    trans_d_model=args.trans_d_model if hasattr(args, 'trans_d_model') else 768,
     trans_nhead=args.trans_nhead if hasattr(args, 'trans_nhead') else 8,
     trans_enc_layers=args.trans_enc_layers if hasattr(args, 'trans_enc_layers') else 4,
     trans_dec_layers=args.trans_dec_layers if hasattr(args, 'trans_dec_layers') else 4,
     trans_ff_size=args.trans_ff_size if hasattr(args, 'trans_ff_size') else 1024,
     trans_dropout=args.trans_dropout if hasattr(args, 'trans_dropout') else 0.1,
-    clip_dim=args.clip_dim if hasattr(args, 'clip_dim') else 512,
+    clip_dim=args.clip_dim if hasattr(args, 'clip_dim') else 768,
 )
 
 # Load model checkpoint

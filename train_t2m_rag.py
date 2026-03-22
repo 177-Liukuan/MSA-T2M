@@ -8,8 +8,10 @@ Core design:
 """
 
 import os
+import sys
 import math
 import json
+import argparse
 import torch
 import warnings
 from torch.utils.tensorboard import SummaryWriter
@@ -65,21 +67,31 @@ class WarmupCosineDecayScheduler:
 
 
 def parse_args():
-    args = option_trans.get_args_parser()
+    extra_parser = argparse.ArgumentParser(add_help=False)
+    extra_parser.add_argument('--text_latent_dir', type=str, default='./humanml3d_272/text_latents_t5')
+    extra_parser.add_argument('--hcls_dir', type=str, default='./humanml3d_272/h_cls_latents_msa_vae/exp')
+    extra_parser.add_argument('--empty_text_path', type=str, default='./humanml3d_272/text_latents_t5/empty_text_embedding.npy')
+    extra_parser.add_argument('--retrieval_topk', type=int, default=3)
+    extra_parser.add_argument('--cfg_dropout_prob', type=float, default=0.1)
+    extra_parser.add_argument('--num_workers', type=int, default=0)
+    extra_parser.add_argument('--text_embed_dim', type=int, default=768)
 
-    # RAG-specific args
-    if not hasattr(args, 'text_latent_dir'):
-        args.text_latent_dir = './humanml3d_272/text_latents_clip'
-    if not hasattr(args, 'hcls_dir'):
-        args.hcls_dir = './humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv5_phase2_t2m_272_iter2000_α0'
-    if not hasattr(args, 'empty_text_path'):
-        args.empty_text_path = './humanml3d_272/text_latents_clip/empty_cfg_text.npy'
-    if not hasattr(args, 'retrieval_topk'):
-        args.retrieval_topk = 3
-    if not hasattr(args, 'cfg_dropout_prob'):
-        args.cfg_dropout_prob = 0.1
-    if not hasattr(args, 'num_workers'):
-        args.num_workers = 0
+    custom_args, remaining = extra_parser.parse_known_args()
+
+    argv_backup = sys.argv
+    try:
+        sys.argv = [sys.argv[0]] + remaining
+        args = option_trans.get_args_parser()
+    finally:
+        sys.argv = argv_backup
+
+    args.text_latent_dir = custom_args.text_latent_dir
+    args.hcls_dir = custom_args.hcls_dir
+    args.empty_text_path = custom_args.empty_text_path
+    args.retrieval_topk = custom_args.retrieval_topk
+    args.cfg_dropout_prob = custom_args.cfg_dropout_prob
+    args.num_workers = custom_args.num_workers
+    args.text_embed_dim = custom_args.text_embed_dim
 
     return args
 
@@ -210,28 +222,38 @@ def main():
         hcls_dir=args.hcls_dir,
         topk=args.retrieval_topk,
         num_workers=args.num_workers,
+        text_embed_dim=args.text_embed_dim,
     )
 
     # Load precomputed empty text embedding for CFG unconditional branch.
     empty_text_path = args.empty_text_path
     if not os.path.exists(empty_text_path):
-        fallback_path = os.path.join(args.text_latent_dir, 'empty_cfg_text_clip.npy')
-        if os.path.exists(fallback_path):
-            empty_text_path = fallback_path
-        else:
-            raise FileNotFoundError(
-                f'Cannot find empty CFG text embedding. checked: {args.empty_text_path} and {fallback_path}'
-            )
+        fallback_candidates = [
+            os.path.join(args.text_latent_dir, 'empty_text_embedding.npy'),
+            os.path.join(args.text_latent_dir, 'empty_cfg_text_t5.npy'),
+            os.path.join(args.text_latent_dir, 'empty_cfg_text_clip.npy'),
+        ]
+        for p in fallback_candidates:
+            if os.path.exists(p):
+                empty_text_path = p
+                break
+
+    if not os.path.exists(empty_text_path):
+        raise FileNotFoundError(
+            f'Cannot find empty CFG text embedding. checked: {args.empty_text_path} and defaults under {args.text_latent_dir}'
+        )
 
     empty_text_emb = torch.from_numpy(__import__('numpy').load(empty_text_path).astype('float32')).reshape(-1)
-    if empty_text_emb.shape[0] != 512:
-        raise ValueError(f'empty text embedding dim should be 512, got {empty_text_emb.shape[0]}')
+    if empty_text_emb.shape[0] != args.text_embed_dim:
+        raise ValueError(
+            f'empty text embedding dim should be {args.text_embed_dim}, got {empty_text_emb.shape[0]} from {empty_text_path}'
+        )
 
     # Backbone + RAG wrapper
     config = LLaMAHFConfig.from_name('Normal_size')
     config.block_size = 78
     base_model = LLaMAHF(config, args.num_diffusion_head_layers, args.latent_dim, comp_device)
-    rag_model = LLaMARAGWrapper(base_model=base_model, text_dim=512, retrieval_dim=512, model_dim=config.n_embd)
+    rag_model = LLaMARAGWrapper(base_model=base_model, model_dim=config.n_embd)
 
     if args.resume_trans is not None:
         logger.info(f'Loading checkpoint from {args.resume_trans}')
@@ -284,6 +306,10 @@ def main():
 
         text_emb = text_emb.to(comp_device)
         top3_h_cls = top3_h_cls.to(comp_device)
+        if text_emb.shape[-1] != args.text_embed_dim:
+            raise ValueError(f'text_emb dim mismatch: got {text_emb.shape[-1]}, expected {args.text_embed_dim}')
+        if top3_h_cls.shape[-1] != args.text_embed_dim:
+            raise ValueError(f'top3_h_cls dim mismatch: got {top3_h_cls.shape[-1]}, expected {args.text_embed_dim}')
         top3_sim_scores = top3_sim_scores.to(comp_device)
         m_tokens = m_tokens.to(comp_device)
 

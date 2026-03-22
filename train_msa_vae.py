@@ -20,7 +20,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import clip
+try:
+    import clip
+except ImportError:
+    clip = None
+
 from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator
 
@@ -36,12 +40,14 @@ warnings.filterwarnings('ignore')
 
 
 # ---------------------------------------------------------------------------
-#   CLIP Text Encoder (frozen)
+#   Text Encoders (frozen)
 # ---------------------------------------------------------------------------
 class FrozenCLIPTextEncoder(nn.Module):
     """Wraps OpenAI CLIP ViT-B/32 text encoder. All params frozen."""
     def __init__(self, clip_version='ViT-B/32', device='cpu'):
         super().__init__()
+        if clip is None:
+            raise ImportError('clip package is required when text_encoder_type=clip')
         self.clip_model, _ = clip.load(clip_version, device=device, jit=False)
         self.clip_model.eval()
         for p in self.clip_model.parameters():
@@ -49,9 +55,31 @@ class FrozenCLIPTextEncoder(nn.Module):
 
     @torch.no_grad()
     def encode_text(self, text_list, device):
-        """Encode a list of strings -> (B, 512) float tensor."""
         tokens = clip.tokenize(text_list, truncate=True).to(device)
         return self.clip_model.encode_text(tokens).float()
+
+
+class FrozenT5TextEncoder(nn.Module):
+    """Wraps SentenceT5 text encoder. All params frozen."""
+    def __init__(self, t5_model_path='sentencet5-xxl/', device='cpu', batch_size=32):
+        super().__init__()
+        self.batch_size = batch_size
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(t5_model_path, device=device)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    @torch.no_grad()
+    def encode_text(self, text_list, device):
+        emb = self.model.encode(
+            text_list,
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        )
+        return torch.from_numpy(emb).to(device=device, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +179,27 @@ os.makedirs(args.out_dir, exist_ok=True)
 
 logger = utils_model.get_logger(args.out_dir)
 writer = SummaryWriter(args.out_dir)
+
+# Resolve text encoder setup
+default_text_dim = 512 if args.text_encoder_type == 'clip' else 768
+if args.text_embed_dim <= 0:
+    args.text_embed_dim = default_text_dim
+
+# Force Transformer CLS dim to text embedding dim for alignment compatibility
+if args.trans_d_model != args.text_embed_dim:
+    logger.info(f'Adjust trans_d_model from {args.trans_d_model} to {args.text_embed_dim} to match text embedding dim')
+    args.trans_d_model = args.text_embed_dim
+
+# Keep legacy field in sync
+args.clip_dim = args.text_embed_dim
+
+# Resolve offline global embedding directory by encoder type
+args.global_embed_dir = args.clip_global_embed_dir if args.text_encoder_type == 'clip' else args.t5_global_embed_dir
+
 logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
+logger.info(f"Global text mode: {'offline' if args.use_offline_global_text else 'online'}")
+if args.use_offline_global_text:
+    logger.info(f'Offline global embed dir: {args.global_embed_dir}')
 logger.info(f'Training MSA-VAE on {args.dataname}, motions are with {args.nb_joints} joints')
 
 ##### ---- Dataloader ---- #####
@@ -159,6 +207,13 @@ train_loader = dataset_msa_vae.DATALoader(
     args.dataname, args.batch_size,
     window_size=args.window_size, unit_length=2 ** args.down_t,
     use_ft_split=args.use_ft_split,
+    text_encoder_type=args.text_encoder_type,
+    clip_embed_dir=args.clip_embed_dir,
+    t5_embed_dir=args.t5_embed_dir,
+    text_embed_dim=args.text_embed_dim,
+    use_offline_global_text=args.use_offline_global_text,
+    clip_global_embed_dir=args.clip_global_embed_dir,
+    t5_global_embed_dir=args.t5_global_embed_dir,
 )
 val_loader = dataset_eval_tae.DATALoader(
     args.dataname, False, 32, unit_length=2 ** args.down_t,
@@ -182,13 +237,20 @@ net = msa_vae.MSA_HumanVAE(
     trans_dec_layers=args.trans_dec_layers,
     trans_ff_size=args.trans_ff_size,
     trans_dropout=args.trans_dropout,
-    clip_dim=args.clip_dim,
+    clip_dim=args.text_embed_dim,
 )
 
-# ---- Frozen CLIP text encoder ----
-clip_text_encoder = FrozenCLIPTextEncoder(
-    clip_version=args.clip_version, device='cpu'
-)
+# ---- Frozen text encoder (only needed for online global text mode) ----
+text_encoder = None
+if args.global_align_weight > 0 and not args.use_offline_global_text:
+    if args.text_encoder_type == 'clip':
+        text_encoder = FrozenCLIPTextEncoder(
+            clip_version=args.clip_version, device='cpu'
+        )
+    else:
+        text_encoder = FrozenT5TextEncoder(
+            t5_model_path=args.t5_model_path, device='cpu', batch_size=args.t5_batch_size
+        )
 
 # Optionally load pretrained CNN VAE weights
 if args.resume_cnn_pth:
@@ -216,8 +278,9 @@ if args.resume_pth:
 
 net.to(comp_device)
 
-clip_text_encoder.to(comp_device)
-clip_text_encoder.eval()
+if text_encoder is not None:
+    text_encoder.to(comp_device)
+    text_encoder.eval()
 
 ##### ---- Phase-aware freeze / unfreeze ---- #####
 # Identify CNN params (bottom layer) vs top-layer params
@@ -318,13 +381,14 @@ def compute_losses(batch, net_module):
 
     Returns: (total_loss, loss_dict)
     """
-    gt_motion, captions, local_clip_gt, has_local, total_frames, local_clip_pooled = batch
-
+    gt_motion, captions, global_text_gt, has_global, local_text_gt, has_local, total_frames, local_text_pooled = batch
     gt_motion = gt_motion.to(comp_device).float()
-    local_clip_gt = local_clip_gt.to(comp_device).float()
+    global_text_gt = global_text_gt.to(comp_device).float()
+    has_global = has_global.to(comp_device)
+    local_text_gt = local_text_gt.to(comp_device).float()
     has_local = has_local.to(comp_device)
     total_frames = total_frames.to(comp_device)
-    local_clip_pooled = local_clip_pooled.to(comp_device).float()
+    local_text_pooled = local_text_pooled.to(comp_device).float()
 
     out = net_module(gt_motion)
 
@@ -348,43 +412,44 @@ def compute_losses(batch, net_module):
         'latent': loss_latent,
     }
 
-    # --- Global alignment: h_cls vs Spotlight(CLIP caption, local) ---
+    # --- Global alignment: h_cls vs Spotlight(global text, local pooled text) ---
     loss_global = torch.tensor(0.0, device=comp_device, requires_grad=True)
     if args.global_align_weight > 0:
         with torch.no_grad():
-            clip_text_feat = clip_text_encoder.encode_text(captions, comp_device)
-            # clip_text_feat: (B, 512) — original global text vector G_origin
+            if args.use_offline_global_text:
+                text_feat = global_text_gt
+                valid_global = has_global
+            else:
+                text_feat = text_encoder.encode_text(captions, comp_device)
+                valid_global = torch.ones_like(has_local, dtype=torch.bool)
 
-            # --- Spotlight: dynamic context label ---
             # Compute interpolation alpha
             if args.spotlight_alpha < 0:
-                # Dynamic: alpha = window_size / total_frames (per sample)
                 alpha = (args.window_size / total_frames.float().to(comp_device)).clamp(0, 1)
             else:
                 alpha = torch.full((gt_motion.size(0),), args.spotlight_alpha,
                                    device=comp_device)
 
-            # L_pooled: pre-computed mean of 64 raw frame-level CLIP features -> (B, 512)
-            l_pooled = local_clip_pooled
+            # local pooled text embedding from frame-level labels
+            l_pooled = local_text_pooled
 
-            # Zero out alpha for samples without local CLIP embeddings
+            # Zero out alpha for samples without local embeddings
             alpha = alpha * has_local.float()
 
-            # G_mixed = (1 - alpha) * G_origin + alpha * L_pooled
-            alpha = alpha.unsqueeze(-1)  # (B, 1)
-            g_mixed = (1 - alpha) * clip_text_feat + alpha * l_pooled
-
-            # L2 normalize -> project back to CLIP unit hypersphere
+            # G_mixed = (1 - alpha) * global + alpha * local pooled
+            alpha = alpha.unsqueeze(-1)
+            g_mixed = (1 - alpha) * text_feat + alpha * l_pooled
             g_target = F.normalize(g_mixed, dim=-1)
 
-        loss_global = global_align_loss_fn(out['clip_global_feat'], g_target)
+        if valid_global.any():
+            loss_global = global_align_loss_fn(out['clip_global_feat'], g_target, mask=valid_global)
     loss_dict['global_align'] = loss_global
 
     # --- Local alignment: z_i projected vs CLIP(local label) ---
     loss_local = torch.tensor(0.0, device=comp_device, requires_grad=True)
     if args.local_align_weight > 0 and has_local.any():
         loss_local = local_align_loss_fn(
-            out['clip_local_feat'], local_clip_gt, mask=has_local
+            out['clip_local_feat'], local_text_gt, mask=has_local
         )
     loss_dict['local_align'] = loss_local
 
