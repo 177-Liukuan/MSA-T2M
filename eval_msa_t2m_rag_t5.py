@@ -302,15 +302,15 @@ def parse_args():
     extra_parser.add_argument('--cfg_scale', type=float, default=4.0)
     extra_parser.add_argument('--text_embed_dim', type=int, default=768)
     extra_parser.add_argument('--eval_split', type=str, default='test', choices=['test', 'val'])
-    extra_parser.add_argument('--text_source', type=str, default='offline', choices=['offline', 'online_t5'])
+    extra_parser.add_argument('--text_source', type=str, default='online_t5', choices=['offline', 'online_t5'])
     extra_parser.add_argument('--t5_model_path', type=str, default='sentencet5-xxl/')
 
     # MSA-VAE architecture args
     extra_parser.add_argument('--trans_d_model', type=int, default=768)
     extra_parser.add_argument('--trans_nhead', type=int, default=8)
-    extra_parser.add_argument('--trans_enc_layers', type=int, default=4)
-    extra_parser.add_argument('--trans_dec_layers', type=int, default=4)
-    extra_parser.add_argument('--trans_ff_size', type=int, default=1024)
+    extra_parser.add_argument('--trans_enc_layers', type=int, default=6)
+    extra_parser.add_argument('--trans_dec_layers', type=int, default=6)
+    extra_parser.add_argument('--trans_ff_size', type=int, default=2048)
     extra_parser.add_argument('--trans_dropout', type=float, default=0.1)
     extra_parser.add_argument('--clip_dim', type=int, default=768)
 

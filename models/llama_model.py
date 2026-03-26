@@ -120,33 +120,82 @@ class LLaMAHF(nn.Module):
 
     
 
+    # def sample_for_eval_CFG(self, text, length=196, tokenize_model=None, device=torch.device('cuda'), unit_length=4, cfg=4.0):
+    #     max_token_len = length // unit_length
+    #     for k in range(max_token_len): 
+    #         if k == 0:
+    #             x = []
+    #         else:
+    #             x = xs
+            
+    #         feat_text = torch.from_numpy(tokenize_model.encode(text)).float()
+    #         feat_text = feat_text.to(device)
+    #         conditions = self.forward(x, feat_text)
+    #         conditions = conditions[:, -1, :]                            
+            
+    #         empty_text = ''
+    #         empty_feat_text = torch.from_numpy(tokenize_model.encode(empty_text)).float()   
+    #         empty_feat_text = empty_feat_text.unsqueeze(0)
+    #         empty_feat_text = empty_feat_text.to(device)
+    #         empty_conditions = self.forward(x, empty_feat_text)       
+    #         empty_conditions = empty_conditions[:, -1, :]                             
+    #         temperature = 1.0
+            
+    #         # chunk
+    #         if cfg != 1:
+    #             mix_conditions = torch.cat([conditions, empty_conditions], dim=0)     
+    #             sampled_token_latent = self.diff_loss.sample(mix_conditions, temperature=temperature, cfg=cfg)  
+    #             scaled_logits, _ = sampled_token_latent.chunk(2, dim=0)          
+    #         else:   # no cfg
+    #             scaled_logits = self.diff_loss.sample(conditions, temperature=temperature, cfg=1) 
+
+    #         scaled_logits = scaled_logits.unsqueeze(0)     
+            
+    #         if k == 0:
+    #             xs = scaled_logits
+    #         else:
+    #             xs = torch.cat((xs, scaled_logits), dim=1)
+
+    #     return xs
+
     def sample_for_eval_CFG(self, text, length=196, tokenize_model=None, device=torch.device('cuda'), unit_length=4, cfg=4.0):
         max_token_len = length // unit_length
+        
+        # ==========================================================
+        # 性能修复：将文本和空文本的编码全部提取到自回归循环外部
+        # ==========================================================
+        # 1. 编码真实文本 (整个 batch 只算 1 次)
+        feat_text = torch.from_numpy(tokenize_model.encode(text)).float()
+        feat_text = feat_text.to(device)
+
+        # 2. 编码用于 CFG 的空文本 (整个 batch 只算 1 次)
+        empty_text = ''
+        empty_feat_text = torch.from_numpy(tokenize_model.encode(empty_text)).float()
+        empty_feat_text = empty_feat_text.unsqueeze(0).to(device)
+        # ==========================================================
+        
+        # 开始自回归动作生成
         for k in range(max_token_len): 
             if k == 0:
                 x = []
             else:
                 x = xs
             
-            feat_text = torch.from_numpy(tokenize_model.encode(text)).float()
-            feat_text = feat_text.to(device)
+            # 循环内部此时极其轻量，只剩下 LLaMA 和 扩散采样
             conditions = self.forward(x, feat_text)
-            conditions = conditions[:, -1, :]                            
+            conditions = conditions[:, -1, :]
+
+            empty_conditions = self.forward(x, empty_feat_text)
+            empty_conditions = empty_conditions[:, -1, :]
             
-            empty_text = ''
-            empty_feat_text = torch.from_numpy(tokenize_model.encode(empty_text)).float()   
-            empty_feat_text = empty_feat_text.unsqueeze(0)
-            empty_feat_text = empty_feat_text.to(device)
-            empty_conditions = self.forward(x, empty_feat_text)       
-            empty_conditions = empty_conditions[:, -1, :]                             
             temperature = 1.0
             
-            # chunk
+            # ... 下方的 chunk 和 sample 逻辑保持不变 ...
             if cfg != 1:
-                mix_conditions = torch.cat([conditions, empty_conditions], dim=0)     
-                sampled_token_latent = self.diff_loss.sample(mix_conditions, temperature=temperature, cfg=cfg)  
+                mix_conditions = torch.cat([conditions, empty_conditions], dim=0)
+                sampled_token_latent = self.diff_loss.sample(mix_conditions, temperature=temperature, cfg=cfg)
                 scaled_logits, _ = sampled_token_latent.chunk(2, dim=0)          
-            else:   # no cfg
+            else:   
                 scaled_logits = self.diff_loss.sample(conditions, temperature=temperature, cfg=1) 
 
             scaled_logits = scaled_logits.unsqueeze(0)     
@@ -159,9 +208,8 @@ class LLaMAHF(nn.Module):
         return xs
     
     
-    
     # For inference, can stop sampling when the distance between the current token and the reference end token is less than the threshold.
-    def sample_for_eval_CFG_inference(self, text, length=312, tokenizer=None, device=torch.device('cuda'), unit_length=4, reference_end_latent=None, threshold=0.1, cfg=4.0, temperature=1.0):
+    def sample_for_eval_CFG_inference(self, text, length=312, tokenizer=None, device=torch.device('cuda'), unit_length=4, reference_end_latent=None, threshold=0.1, cfg=6.0, temperature=1.0):
         max_token_len = length // unit_length
         feat_text = torch.from_numpy(tokenizer.encode(text)).float()
         feat_text = feat_text.to(device)
