@@ -165,6 +165,32 @@ def update_lr_warm_up(optimizer, nb_iter, warm_up_iter, lr):
     return optimizer, current_lr
 
 
+def log_model_params(model, name="Model", accelerator=None):
+    """Print model parameter counts and trainable status."""
+    if accelerator is not None and not accelerator.is_main_process:
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f"{name} Parameter Statistics")
+    print('=' * 60)
+
+    total_params = 0
+    trainable_params = 0
+    for n, p in model.named_parameters():
+        num = p.numel()
+        total_params += num
+        if p.requires_grad:
+            trainable_params += num
+            print(f"  {n:60s} {str(p.shape):20s} trainable")
+        else:
+            print(f"  {n:60s} {str(p.shape):20s} frozen")
+
+    print(f"Total params      : {total_params:,}")
+    print(f"Trainable params  : {trainable_params:,}")
+    print(f"Non-trainable     : {total_params - trainable_params:,}")
+    print('=' * 60 + '\n')
+
+
 # ---------------------------------------------------------------------------
 #   Main
 # ---------------------------------------------------------------------------
@@ -201,6 +227,8 @@ logger.info(f"Global text mode: {'offline' if args.use_offline_global_text else 
 if args.use_offline_global_text:
     logger.info(f'Offline global embed dir: {args.global_embed_dir}')
 logger.info(f'Training MSA-VAE on {args.dataname}, motions are with {args.nb_joints} joints')
+if args.disable_decoupling:
+    logger.info('Using z as Transformer AE input/target (decoupling disabled)')
 
 ##### ---- Dataloader ---- #####
 train_loader = dataset_msa_vae.DATALoader(
@@ -238,7 +266,10 @@ net = msa_vae.MSA_HumanVAE(
     trans_ff_size=args.trans_ff_size,
     trans_dropout=args.trans_dropout,
     clip_dim=args.text_embed_dim,
+    disable_decoupling=args.disable_decoupling,
 )
+
+log_model_params(net, name='MSA-HumanVAE (Initial)', accelerator=accelerator)
 
 # ---- Frozen text encoder (only needed for online global text mode) ----
 text_encoder = None
@@ -269,6 +300,7 @@ if args.resume_cnn_pth:
         mapped[new_key] = v
     missing, unexpected = net.load_state_dict(mapped, strict=False)
     logger.info(f'CNN weights loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}')
+    log_model_params(net, name='MSA-HumanVAE (After CNN weight load)', accelerator=accelerator)
 
 if args.resume_pth:
     logger.info(f'Resuming full MSA-VAE from {args.resume_pth}')
@@ -306,6 +338,9 @@ elif args.phase == 2:
     logger.info(f'Phase 2: all params unfrozen, CNN LR scale = {args.cnn_lr_scale}')
 else:
     logger.info(f'Phase 0: legacy mode, all params trainable with uniform LR')
+
+phase_desc = 'Phase 1, CNN frozen' if args.phase == 1 else ('Phase 2, all unfrozen' if args.phase == 2 else 'Phase 0, legacy')
+log_model_params(net, name=f'MSA-HumanVAE ({phase_desc})', accelerator=accelerator)
 
 net.train()
 net_eval = EvalCompat(net)
@@ -403,7 +438,10 @@ def compute_losses(batch, net_module):
         loss_motion = Loss(out['x_recon'], gt_motion)
         loss_kl = Loss.forward_KL(out['mu'], out['logvar'])
         loss_root = Loss.forward_root(out['x_recon'], gt_motion)
-    loss_latent = latent_recon_loss_fn(out['mu_recon'], out['mu'].detach())
+    if args.disable_decoupling:
+        loss_latent = latent_recon_loss_fn(out['mu_recon'], out['trans_latent_target'].detach())
+    else:
+        loss_latent = latent_recon_loss_fn(out['mu_recon'], out['mu'].detach())
 
     loss_dict = {
         'recon': loss_motion,

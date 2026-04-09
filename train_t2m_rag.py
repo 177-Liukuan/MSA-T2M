@@ -75,6 +75,7 @@ def parse_args():
     extra_parser.add_argument('--cfg_dropout_prob', type=float, default=0.1)
     extra_parser.add_argument('--num_workers', type=int, default=0)
     extra_parser.add_argument('--text_embed_dim', type=int, default=768)
+    extra_parser.add_argument('--disable_rag', action='store_true', default=True, help='Ablation: disable retrieval token and use text-only conditioning.')
 
     custom_args, remaining = extra_parser.parse_known_args()
 
@@ -92,6 +93,7 @@ def parse_args():
     args.cfg_dropout_prob = custom_args.cfg_dropout_prob
     args.num_workers = custom_args.num_workers
     args.text_embed_dim = custom_args.text_embed_dim
+    args.disable_rag = custom_args.disable_rag
 
     return args
 
@@ -253,7 +255,7 @@ def main():
     config = LLaMAHFConfig.from_name('Normal_size')
     config.block_size = 78
     base_model = LLaMAHF(config, args.num_diffusion_head_layers, args.latent_dim, comp_device)
-    rag_model = LLaMARAGWrapper(base_model=base_model, model_dim=config.n_embd)
+    rag_model = LLaMARAGWrapper(base_model=base_model, model_dim=config.n_embd, disable_rag=args.disable_rag)
 
     if args.resume_trans is not None:
         logger.info(f'Loading checkpoint from {args.resume_trans}')
@@ -299,7 +301,7 @@ def main():
     print_iter = 100
     save_iter = 10000
 
-    logger.info('Start training RAG-guided MotionStreamer...')
+    logger.info('Start training no-RAG ablation MotionStreamer...' if args.disable_rag else 'Start training RAG-guided MotionStreamer...')
 
     while nb_iter <= args.total_iter:
         text_emb, top3_h_cls, top3_sim_scores, m_tokens = next(train_loader_iter)

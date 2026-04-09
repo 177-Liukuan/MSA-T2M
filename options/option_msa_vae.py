@@ -57,16 +57,18 @@ def get_args_parser():
     parser.add_argument('--hidden_size', default=1024, type=int, help='CNN hidden size')
 
     # --- Transformer AE architecture ---
-    parser.add_argument('--trans_d_model', default=512, type=int,
+    parser.add_argument('--trans_d_model', default=768, type=int,
                         help='Transformer model dimension (will be forced to text_embed_dim)')
     parser.add_argument('--trans_nhead', default=8, type=int, help='number of attention heads')
     parser.add_argument('--trans_enc_layers', default=4, type=int, help='number of Transformer encoder layers')
     parser.add_argument('--trans_dec_layers', default=4, type=int, help='number of Transformer decoder layers')
     parser.add_argument('--trans_ff_size', default=1024, type=int, help='Transformer feed-forward dimension')
     parser.add_argument('--trans_dropout', default=0.1, type=float, help='Transformer dropout')
+    parser.add_argument('--disable_decoupling', action='store_true', default=False,
+                        help='ablation: disable dual-track decoupling, use sampled z as Transformer AE input/target')
 
     # --- text alignment (legacy names kept for compatibility) ---
-    parser.add_argument('--clip_dim', default=512, type=int,
+    parser.add_argument('--clip_dim', default=768, type=int,
                         help='[legacy] alignment feature dimension; auto-overridden by text_embed_dim')
     parser.add_argument('--clip_version', default='ViT-B/32', type=str,
                         help='CLIP model version (for clip mode)')

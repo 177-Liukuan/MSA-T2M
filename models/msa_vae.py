@@ -12,9 +12,9 @@ Architecture:
                      h_cls    -> TransformerDecoder -> mu_recon
                      Loss: ||mu_recon - mu_local||^2
 
-  Projection heads (CLIP alignment, based on deterministic mu):
-    global_proj: h_cls  -> CLIP text space (global alignment)
-    local_proj:  mu_i   -> CLIP text space (local alignment)
+  Projection heads (Semantic alignment, based on deterministic mu):
+    global_proj: h_cls  -> Semantic text space (global alignment)
+    local_proj:  mu_i   -> Semantic text space (local alignment)
 """
 
 import math
@@ -182,6 +182,8 @@ class MSA_VAE(nn.Module):
         trans_dropout=0.1,
         # --- CLIP alignment ---
         clip_dim=512,
+        # --- Ablation ---
+        disable_decoupling=False,
     ):
         super().__init__()
         if clip_range is None:
@@ -191,6 +193,7 @@ class MSA_VAE(nn.Module):
         self.trans_d_model = trans_d_model
         self.stride_t = stride_t
         self.down_t = down_t
+        self.disable_decoupling = bool(disable_decoupling)
 
         # ========== Bottom layer: Causal CNN VAE ==========
         cnn_width = hidden_size  # match original Causal_HumanTAE convention
@@ -335,6 +338,7 @@ class MSA_VAE(nn.Module):
             clip_local_feat  - projected local features     (B, T', clip_dim)
         """
         # --- Bottom: Causal CNN VAE ---
+        # z_local is the reparameterized sample z = mu + eps * exp(0.5 * logvar) from CNN VAE.
         z_local, mu, logvar = self.encode_cnn(x)
 
         # --- Build padding mask for latent tokens ---
@@ -347,9 +351,10 @@ class MSA_VAE(nn.Module):
         else:
             key_padding_mask = None
 
-        # --- Semantic track: Transformer AE operates on deterministic mu ---
-        h_cls, _ = self.encode_transformer(mu, key_padding_mask=key_padding_mask)
-        mu_recon = self.decode_transformer(h_cls, seq_len=mu.size(1),
+        # --- Semantic track: Transformer AE input/target switch for decoupling ablation ---
+        trans_latent_target = z_local if self.disable_decoupling else mu
+        h_cls, _ = self.encode_transformer(trans_latent_target, key_padding_mask=key_padding_mask)
+        mu_recon = self.decode_transformer(h_cls, seq_len=trans_latent_target.size(1),
                                            tgt_key_padding_mask=key_padding_mask)
 
         # --- Physical track: CNN Decoder receives noisy z_local ---
@@ -366,6 +371,7 @@ class MSA_VAE(nn.Module):
             'h_cls': h_cls,
             'z_local': z_local,
             'mu_recon': mu_recon,
+            'trans_latent_target': trans_latent_target,
             'clip_global_feat': clip_global_feat,
             'clip_local_feat': clip_local_feat,
         }
@@ -400,6 +406,7 @@ class MSA_HumanVAE(nn.Module):
         trans_ff_size=1024,
         trans_dropout=0.1,
         clip_dim=512,
+        disable_decoupling=False,
     ):
         super().__init__()
         self.msa_vae = MSA_VAE(
@@ -420,6 +427,7 @@ class MSA_HumanVAE(nn.Module):
             trans_ff_size=trans_ff_size,
             trans_dropout=trans_dropout,
             clip_dim=clip_dim,
+            disable_decoupling=disable_decoupling,
         )
 
     def encode(self, x, key_padding_mask=None):

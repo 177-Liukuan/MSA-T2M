@@ -8,14 +8,16 @@ class LLaMARAGWrapper(nn.Module):
     """Add retrieval-enhanced conditioning on top of the original LLaMAHF backbone.
 
     Condition sequence layout:
-        [t_text, t_ret, motion_token_0, motion_token_1, ...]
+        RAG mode: [t_text, t_ret, motion_token_0, motion_token_1, ...]
+        no-RAG ablation mode: [t_text, motion_token_0, motion_token_1, ...]
     """
 
-    def __init__(self, base_model, model_dim=768, retrieval_dim=768):
+    def __init__(self, base_model, model_dim=768, retrieval_dim=768, disable_rag=False):
         super().__init__()
         self.base_model = base_model
+        # Ablation switch: disable retrieval token and fall back to text-only conditioning.
+        self.disable_rag = bool(disable_rag)
 
-        # 现在这一行就不会报错了，因为 retrieval_dim 已经作为参数传入
         self.retrieval_embed = nn.Linear(retrieval_dim, model_dim)
 
         if retrieval_dim == model_dim:
@@ -25,7 +27,7 @@ class LLaMARAGWrapper(nn.Module):
 
         # Keep only a learnable null retrieval token for CFG branch.
         self.null_retrieval_token = nn.Parameter(torch.randn(1, 1, model_dim))
-        self.num_condition_tokens = 2
+        self.num_condition_tokens = 1 if self.disable_rag else 2
 
     def _fuse_retrieval(self, top3_h_cls, top3_sim_scores):
         """Fuse Top-K retrieved h_cls vectors into one retrieval token.
@@ -36,68 +38,76 @@ class LLaMARAGWrapper(nn.Module):
         Returns:
             t_ret: [B, 1, D_model]
         """
-        # 1. 投影：让检索特征穿上 Transformer 的“制服”，对齐特征空间
         projected_h_cls = self.retrieval_embed(top3_h_cls)  # [B, K, model_dim]
-        
-        # 2. 计算余弦相似度转化来的 Softmax 权重
         weights = torch.softmax(top3_sim_scores, dim=1).unsqueeze(-1)  # [B, K, 1]
-        
-        # 3. 加权融合：利用权重把 K 个动作先验融合成 1 个综合先验
         t_ret = (projected_h_cls * weights).sum(dim=1, keepdim=True)  # [B, 1, model_dim]
-        
         return t_ret
 
     def _build_condition_tokens(
         self,
         text_emb,
-        top3_h_cls,
-        top3_sim_scores,
+        top3_h_cls=None,
+        top3_sim_scores=None,
         cfg_drop_mask=None,
         empty_text_emb=None,
     ):
-        """Build [t_text, t_ret] condition tokens with optional joint CFG dropout."""
+        """Build condition tokens with optional joint CFG dropout.
+
+        In full mode, build [t_text, t_ret].
+        In no-RAG ablation mode, build [t_text] only.
+        """
         bsz = text_emb.shape[0]
 
         t_text = self.base_model.transformer.cond_embed(text_emb).unsqueeze(1)  # [B, 1, D_model]
-        t_ret = self._fuse_retrieval(top3_h_cls, top3_sim_scores)  # [B, 1, D_model]
+        t_ret = None
+
+        if not self.disable_rag:
+            if top3_h_cls is None or top3_sim_scores is None:
+                raise ValueError('top3_h_cls and top3_sim_scores are required when disable_rag=False.')
+            t_ret = self._fuse_retrieval(top3_h_cls, top3_sim_scores)  # [B, 1, D_model]
 
         if cfg_drop_mask is not None:
             if empty_text_emb is None:
                 raise ValueError('empty_text_emb is required when cfg_drop_mask is provided.')
-
             if empty_text_emb.ndim == 1:
                 empty_text_emb = empty_text_emb.unsqueeze(0).expand(bsz, -1)
             elif empty_text_emb.ndim == 2 and empty_text_emb.shape[0] == 1:
                 empty_text_emb = empty_text_emb.expand(bsz, -1)
 
             empty_t_text = self.base_model.transformer.cond_embed(empty_text_emb).unsqueeze(1)
-            null_ret = self.null_retrieval_token.expand(bsz, -1, -1)
 
             mask = cfg_drop_mask.view(-1, 1, 1)
             t_text = torch.where(mask, empty_t_text, t_text)
-            t_ret = torch.where(mask, null_ret, t_ret)
 
-        cond_tokens = torch.cat([t_text, t_ret], dim=1)  # [B, 2, D_model]
+            if not self.disable_rag:
+                null_ret = self.null_retrieval_token.expand(bsz, -1, -1)
+                t_ret = torch.where(mask, null_ret, t_ret)
+
+        if self.disable_rag:
+            cond_tokens = t_text  # [B, 1, D_model]
+        else:
+            cond_tokens = torch.cat([t_text, t_ret], dim=1)  # [B, 2, D_model]
+
         return cond_tokens
 
     def forward(
         self,
         motion_latents,
         text_emb,
-        top3_h_cls,
-        top3_sim_scores,
+        top3_h_cls=None,
+        top3_sim_scores=None,
         cfg_drop_mask=None,
         empty_text_emb=None,
     ):
-        """Forward with retrieval-augmented condition tokens.
+        """Forward with condition tokens.
 
         Args:
             motion_latents: [B, T, latent_dim]
             text_emb: [B, D_text]
-            top3_h_cls: [B, K, D_text]
-            top3_sim_scores: [B, K]
+            top3_h_cls: [B, K, D_text], optional when disable_rag=True
+            top3_sim_scores: [B, K], optional when disable_rag=True
         Returns:
-            hidden_states: [B, T+2, D_model]
+            hidden_states: [B, T+2, D_model] in RAG mode, [B, T+1, D_model] in no-RAG mode
         """
         cond_tokens = self._build_condition_tokens(
             text_emb,
@@ -127,9 +137,9 @@ class LLaMARAGWrapper(nn.Module):
         self,
         motion_prefix,
         text_emb,
-        top3_h_cls,
-        top3_sim_scores,
         empty_text_emb,
+        top3_h_cls=None,
+        top3_sim_scores=None,
         cfg_scale=4.0,
         temperature=1.0,
     ):
