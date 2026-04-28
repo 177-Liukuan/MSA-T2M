@@ -1,3 +1,12 @@
+"""
+msa_gen_motion_mca.py
+---------------------
+Inference & visualization script for the MSA T2M model with cross-attention
+(LLaMARAGMultiTextCAWrapper).  Drop-in counterpart of msa_gen_motion.py.
+
+Usage:
+    python msa_gen_motion_mca.py
+"""
 import os
 import re
 import time
@@ -7,9 +16,10 @@ import warnings
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from models.llama_model import LLaMAHF, LLaMAHFConfig
-from models.llama_rag_model import LLaMARAGWrapper
+from models.llama_rag_model_mca import LLaMARAGMultiTextCAWrapper
 import models.msa_vae as msa_vae
 from visualization.recover_visualize import recover_from_local_position
 import visualization.plot_3d_global as plot_3d
@@ -22,30 +32,45 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # =========================
 # User-editable config area
 # =========================
-text = "A figure dances ballet elegantly"
-cfg_scale = 6  
+text = "A person swings a tennis racket"
+cfg_scale = 4
 threshold = 0.1
-retrieval_topk = 5
+retrieval_topk = 3
 max_length = 300
 fps = 30
 disable_rag = False
 seed = 123
 deterministic = True
-generative_head_type = "auto"  # auto|ddpm|rectified_flow
 num_flow_steps = 50
 flow_solver = "euler"
 rf_time_sampling = "uniform"
 rf_loss_type = "mse"
 
-# Fixed paths (as requested)
+# Use EMA weights at inference (recommended)
+use_ema = True
+
+# MCA-specific config (must match training run.log)
+ca_every_n_layers = 4       # every 4 layers → CA at [3, 7, 11] for 12-layer backbone
+ca_n_head = None            # None = auto (same as backbone)
+text_token_dim = 1024       # T5-xxl hidden dim
+ff_mult = 2                 # CA FFN expansion factor
+
+# Fixed paths
 resume_pth = "Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048/net_best_mpjpe.pth"
-resume_trans = "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_k5/latest.pth"
+resume_trans = (
+    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_mca_6layer_ddpm_scratch_Flamingo_gateclose_fix"
+    "/net_Iter100000.pth"
+)
 hcls_dir = "./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048"
 empty_text_path = "./humanml3d_272/text_latents_t5/empty_text_embedding.npy"
-reference_end_latent = "humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048/reference_end_latent_msa_vae_t2m_272.npy"
+reference_end_latent = (
+    "humanml3d_272/t2m_latents_msa_vae"
+    "/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048"
+    "/reference_end_latent_msa_vae_t2m_272.npy"
+)
 t5_model_path = "sentencet5-xxl/"
 
-# Additional defaults aligned with demo_msa_t2m_t5.py
+# Standard defaults (aligned with training scripts)
 unit_length = 4
 latent_dim = 16
 text_embed_dim = 768
@@ -66,10 +91,14 @@ trans_dropout = 0.1
 clip_dim = 768
 
 mean_path = "humanml3d_272/mean_std/Mean.npy"
-std_path = "humanml3d_272/mean_std/Std.npy"
+std_path  = "humanml3d_272/mean_std/Std.npy"
 
-output_dir = "demo_output/MSA-T2M"
+output_dir = "demo_output/MSA-T2M-MCA"
 
+
+# ---------------------------------------------------------------------------
+#  RAG retriever (identical to msa_gen_motion.py)
+# ---------------------------------------------------------------------------
 
 class RAGRetriever:
     """In-memory h_cls retrieval library for inference."""
@@ -89,7 +118,6 @@ class RAGRetriever:
                 vec = vec.mean(axis=0)
             else:
                 vec = vec.reshape(-1)
-
             if vec.shape[0] == self.embed_dim:
                 vectors.append(vec)
 
@@ -117,36 +145,57 @@ class RAGRetriever:
 
         if k < self.topk:
             pad_h = torch.zeros(
-                text_emb.shape[0],
-                self.topk - k,
-                self.embed_dim,
-                device=text_emb.device,
-                dtype=top_hcls.dtype,
+                text_emb.shape[0], self.topk - k, self.embed_dim,
+                device=text_emb.device, dtype=top_hcls.dtype,
             )
             pad_s = torch.full(
-                (text_emb.shape[0], self.topk - k),
-                -1e6,
-                device=text_emb.device,
-                dtype=top_scores.dtype,
+                (text_emb.shape[0], self.topk - k), -1e6,
+                device=text_emb.device, dtype=top_scores.dtype,
             )
-            top_hcls = torch.cat([top_hcls, pad_h], dim=1)
+            top_hcls  = torch.cat([top_hcls, pad_h], dim=1)
             top_scores = torch.cat([top_scores, pad_s], dim=1)
 
         return top_hcls, top_scores
 
 
+# ---------------------------------------------------------------------------
+#  Token-level T5 encoding for cross-attention
+# ---------------------------------------------------------------------------
+
+def encode_token_level(text_input, st_model, device):
+    """Encode one text string into per-token T5 embeddings.
+
+    Returns
+    -------
+    text_tokens : torch.Tensor  (1, S, text_token_dim)  float32  on `device`
+    text_token_lens : torch.Tensor  (1,)  int64  on `device`
+    """
+    transformer_module = st_model[0]   # SentenceTransformers Transformer wrapper
+    features = transformer_module.tokenize([text_input])
+    features = {k: v.to(device) for k, v in features.items()}
+    with torch.no_grad():
+        out = transformer_module.forward(features)
+    token_embs = out['token_embeddings'].float()        # (1, S, D)
+    attention_mask = features['attention_mask']         # (1, S)
+    valid_len = int(attention_mask[0].sum().item())
+    token_embs = token_embs[:, :valid_len, :]           # (1, valid_len, D)
+    text_token_lens = torch.tensor([valid_len], dtype=torch.long, device=device)
+    return token_embs, text_token_lens
+
+
+# ---------------------------------------------------------------------------
+#  Utility helpers
+# ---------------------------------------------------------------------------
+
 def set_reproducibility(seed_value, deterministic_mode=True):
     random.seed(seed_value)
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed_value)
         torch.cuda.manual_seed_all(seed_value)
-
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = bool(deterministic_mode)
-
     if deterministic_mode:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True)
@@ -155,30 +204,9 @@ def set_reproducibility(seed_value, deterministic_mode=True):
 def load_state_strip_module(state_dict):
     out = {}
     for key, value in state_dict.items():
-        if key.split(".")[0] == "module":
-            out[".".join(key.split(".")[1:])] = value
-        else:
-            out[key] = value
+        new_key = ".".join(key.split(".")[1:]) if key.split(".")[0] == "module" else key
+        out[new_key] = value
     return out
-
-
-def infer_head_type_from_ckpt(ckpt, user_choice="auto"):
-    valid = {"ddpm", "rectified_flow"}
-    user_norm = str(user_choice).strip().lower()
-
-    if user_norm == "auto":
-        ckpt_type = None
-        if isinstance(ckpt, dict):
-            ckpt_type = ckpt.get("generative_head_type", None)
-        ckpt_norm = str(ckpt_type).strip().lower() if ckpt_type is not None else None
-        return ckpt_norm if ckpt_norm in valid else "ddpm"
-
-    if user_norm in valid:
-        return user_norm
-
-    raise ValueError(
-        f"Invalid generative_head_type: {user_choice}. Expected one of auto|ddpm|rectified_flow"
-    )
 
 
 def sanitize_text_for_filename(raw_text):
@@ -186,31 +214,30 @@ def sanitize_text_for_filename(raw_text):
     cleaned = re.sub(r"\s+", "_", cleaned)
     cleaned = re.sub(r"[^\w\-]", "_", cleaned)
     cleaned = re.sub(r"_+", "_", cleaned).strip("_")
-    if not cleaned:
-        cleaned = "motion"
-    return cleaned[:120]
+    return (cleaned or "motion")[:120]
 
 
 def check_required_files():
-    required_files = [
-        ("resume_pth", resume_pth),
-        ("resume_trans", resume_trans),
-        ("empty_text_path", empty_text_path),
+    required = [
+        ("resume_pth",          resume_pth),
+        ("resume_trans",        resume_trans),
+        ("empty_text_path",     empty_text_path),
         ("reference_end_latent", reference_end_latent),
-        ("mean_path", mean_path),
-        ("std_path", std_path),
+        ("mean_path",           mean_path),
+        ("std_path",            std_path),
     ]
-
-    for name, path in required_files:
+    for name, path in required:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Required file missing: {name} -> {path}")
-
     if not disable_rag and not os.path.isdir(hcls_dir):
         raise FileNotFoundError(f"RAG retrieval directory missing: {hcls_dir}")
-
     if not os.path.isdir(t5_model_path):
         raise FileNotFoundError(f"T5 model path missing: {t5_model_path}")
 
+
+# ---------------------------------------------------------------------------
+#  Autoregressive sampling with MCA
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def sample_motion_latents_with_stop(
@@ -220,6 +247,8 @@ def sample_motion_latents_with_stop(
     input_text,
     empty_text_emb,
     reference_end,
+    text_tokens,          # (1, S, text_token_dim) — pre-computed
+    text_token_lens,      # (1,)                   — pre-computed
     disable_rag_flag=False,
     embed_dim=768,
     stop_threshold=0.1,
@@ -229,6 +258,7 @@ def sample_motion_latents_with_stop(
     token_latent_dim=16,
     device=torch.device("cuda"),
 ):
+    # Sentence-level text embedding (for RAG tokens)
     text_feat = text_encoder.encode([input_text])
     text_emb = torch.from_numpy(np.asarray(text_feat, dtype=np.float32)).to(device)
 
@@ -237,8 +267,7 @@ def sample_motion_latents_with_stop(
             f"text embedding dim mismatch: got {text_emb.shape[-1]}, expected {embed_dim}"
         )
 
-    top_hcls = None
-    top_scores = None
+    top_hcls = top_scores = None
     if not disable_rag_flag:
         top_hcls, top_scores = retriever.retrieve(text_emb)
 
@@ -253,10 +282,9 @@ def sample_motion_latents_with_stop(
 
     xs = None
     for _ in range(max_token_len):
-        if xs is None:
-            prefix = torch.zeros((1, 0, token_latent_dim), device=device, dtype=torch.float32)
-        else:
-            prefix = xs
+        prefix = xs if xs is not None else torch.zeros(
+            (1, 0, token_latent_dim), device=device, dtype=torch.float32
+        )
 
         next_token = rag_model.sample_next_with_cfg(
             motion_prefix=prefix,
@@ -266,6 +294,8 @@ def sample_motion_latents_with_stop(
             empty_text_emb=empty_text_emb,
             cfg_scale=cfg,
             temperature=1.0,
+            text_tokens=text_tokens,
+            text_token_lens=text_token_lens,
         )
 
         distance_l2 = torch.sqrt(torch.sum((next_token - reference_end) ** 2))
@@ -281,6 +311,10 @@ def sample_motion_latents_with_stop(
     return xs
 
 
+# ---------------------------------------------------------------------------
+#  Main
+# ---------------------------------------------------------------------------
+
 def main():
     try:
         check_required_files()
@@ -289,9 +323,12 @@ def main():
         set_reproducibility(seed, deterministic_mode=deterministic)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        print(f"Input text: {text}")
-        print(f"Device: {device}")
+        print(f"Input text  : {text}")
+        print(f"Device      : {device}")
+        print(f"Checkpoint  : {resume_trans}")
+        print(f"Use EMA     : {use_ema}")
 
+        # ── VAE ──────────────────────────────────────────────────────────
         clip_range = [-30, 20]
         net = msa_vae.MSA_HumanVAE(
             hidden_size=hidden_size,
@@ -317,15 +354,16 @@ def main():
         net.load_state_dict(state_vae, strict=True)
         net.eval()
 
-        print(f"Loading transformer checkpoint: {resume_trans}")
-        ckpt_rag = torch.load(resume_trans, map_location="cpu")
-        ckpt_head_type = ckpt_rag.get("generative_head_type", "missing") if isinstance(ckpt_rag, dict) else "missing"
-        resolved_head_type = infer_head_type_from_ckpt(ckpt_rag, generative_head_type)
-        print(f"[HeadType] checkpoint generative_head_type: {ckpt_head_type}")
-        print(f"[HeadType] resolved generative_head_type: {resolved_head_type}")
+        # ── MCA transformer ───────────────────────────────────────────────
+        print(f"Loading MCA checkpoint: {resume_trans}")
+        ckpt = torch.load(resume_trans, map_location="cpu")
+
+        resolved_head_type = ckpt.get("generative_head_type", "ddpm") if isinstance(ckpt, dict) else "ddpm"
+        print(f"[HeadType] generative_head_type: {resolved_head_type}")
 
         config = LLaMAHFConfig.from_name("Normal_size")
         config.block_size = 78
+
         base_model = LLaMAHF(
             config,
             num_diffusion_head_layers,
@@ -337,39 +375,53 @@ def main():
             rf_time_sampling=rf_time_sampling,
             rf_loss_type=rf_loss_type,
         )
-        rag_model = LLaMARAGWrapper(
+
+        rag_model = LLaMARAGMultiTextCAWrapper(
             base_model=base_model,
             model_dim=config.n_embd,
             disable_rag=disable_rag,
+            text_token_dim=text_token_dim,
+            ca_every_n_layers=ca_every_n_layers,
+            ca_n_head=ca_n_head,
+            ff_mult=ff_mult,
         ).to(device)
+        print(f"[MCA] {rag_model.extra_repr()}")
 
-        if "trans" not in ckpt_rag:
-            raise KeyError("Checkpoint must contain trans key.")
-        rag_model.base_model.load_state_dict(load_state_strip_module(ckpt_rag["trans"]), strict=False)
+        # Load weights (EMA preferred)
+        trans_key = "trans_ema" if (use_ema and "trans_ema" in ckpt) else "trans"
+        rag_key   = "rag_ema"   if (use_ema and "rag_ema"   in ckpt) else "rag"
+        if trans_key not in ckpt:
+            raise KeyError(f"Checkpoint missing '{trans_key}' key.")
+        if rag_key not in ckpt:
+            raise KeyError(f"Checkpoint missing '{rag_key}' key.")
 
-        if "rag" in ckpt_rag:
-            rag_model.load_state_dict(load_state_strip_module(ckpt_rag["rag"]), strict=False)
-        elif not disable_rag:
-            raise KeyError("RAG checkpoint must contain rag key when disable_rag=False.")
-
+        base_model.load_state_dict(load_state_strip_module(ckpt[trans_key]), strict=False)
+        rag_model.load_state_dict(load_state_strip_module(ckpt[rag_key]), strict=False)
+        print(f"[Checkpoint] loaded '{trans_key}' + '{rag_key}'")
         rag_model.eval()
 
+        # ── Text encoder ──────────────────────────────────────────────────
         try:
             from sentence_transformers import SentenceTransformer
         except Exception as exc:
-            raise ImportError(
-                "Failed to import sentence_transformers. Please ensure SentenceTransformer is installed."
-            ) from exc
+            raise ImportError("Failed to import sentence_transformers.") from exc
 
         text_encoder = SentenceTransformer(t5_model_path)
         text_encoder.eval()
 
-        empty_text_emb = torch.from_numpy(np.load(empty_text_path).astype(np.float32)).reshape(-1).to(device)
+        # ── Auxiliary tensors ─────────────────────────────────────────────
+        empty_text_emb = (
+            torch.from_numpy(np.load(empty_text_path).astype(np.float32))
+            .reshape(-1).to(device)
+        )
         if empty_text_emb.shape[0] != text_embed_dim:
             raise ValueError(
                 f"empty text embedding dim mismatch: got {empty_text_emb.shape[0]}, expected {text_embed_dim}"
             )
 
+        ref_end = torch.from_numpy(np.load(reference_end_latent).astype(np.float32)).to(device)
+
+        # ── RAG retriever ─────────────────────────────────────────────────
         retriever = None
         if not disable_rag:
             retriever = RAGRetriever(
@@ -379,10 +431,13 @@ def main():
                 device=device,
             )
         else:
-            print("No-RAG mode enabled: retrieval branch is bypassed.")
+            print("No-RAG mode: retrieval branch bypassed.")
 
-        ref_end = torch.from_numpy(np.load(reference_end_latent).astype(np.float32)).to(device)
+        # ── Token-level embeddings for cross-attention ────────────────────
+        text_tokens, text_token_lens = encode_token_level(text, text_encoder, device)
+        print(f"[TextTokens] shape={tuple(text_tokens.shape)}, len={text_token_lens[0].item()}")
 
+        # ── Autoregressive generation ─────────────────────────────────────
         motion_latents = sample_motion_latents_with_stop(
             rag_model=rag_model,
             text_encoder=text_encoder,
@@ -390,6 +445,8 @@ def main():
             input_text=text,
             empty_text_emb=empty_text_emb,
             reference_end=ref_end,
+            text_tokens=text_tokens,
+            text_token_lens=text_token_lens,
             disable_rag_flag=disable_rag,
             embed_dim=text_embed_dim,
             stop_threshold=threshold,
@@ -399,17 +456,19 @@ def main():
             token_latent_dim=latent_dim,
             device=device,
         )
+        print(f"[Generation] generated {motion_latents.shape[1]} tokens")
 
+        # ── Decode & visualize ────────────────────────────────────────────
         motion = net.forward_decoder(motion_latents).squeeze(0).detach().cpu().numpy().astype(np.float32)
 
         mean = np.load(mean_path)
-        std = np.load(std_path)
+        std  = np.load(std_path)
         pred_xyz = recover_from_local_position(motion * std + mean, 22)
         xyz = pred_xyz.reshape(1, -1, 22, 3)
 
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        text_token = sanitize_text_for_filename(text)
-        stem = f"MSA-T2M_{text_token}_{timestamp}"
+        timestamp   = time.strftime("%Y%m%d_%H%M%S")
+        text_token  = sanitize_text_for_filename(text)
+        stem        = f"MSA-T2M-MCA_{text_token}_{timestamp}"
 
         gif_path = os.path.join(output_dir, f"{stem}.gif")
         npy_path = os.path.join(output_dir, f"{stem}.npy")
@@ -417,8 +476,8 @@ def main():
         plot_3d.draw_to_batch(xyz, [text], [gif_path], fps=fps)
         np.save(npy_path, motion)
 
-        print(f"[OK] GIF saved: {gif_path}")
-        print(f"[OK] NPY saved: {npy_path}")
+        print(f"[OK] GIF saved : {gif_path}")
+        print(f"[OK] NPY saved : {npy_path}")
         print("The saved .npy is directly compatible with output_vis.py --input")
 
     except Exception as exc:

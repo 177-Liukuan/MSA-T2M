@@ -1,11 +1,25 @@
 import argparse
 
+
+def _str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def get_args_parser():
-    parser = argparse.ArgumentParser(description='options',
-                                     add_help=True,
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    
-    parser.add_argument('--dataname', type=str, default='t2m_272', help='dataset directory') 
+    parser = argparse.ArgumentParser(
+        description='options',
+        add_help=True,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument('--dataname', type=str, default='t2m_272', help='dataset directory')
     parser.add_argument('--seed', default=123, type=int, help='seed for initializing training. ')
     parser.add_argument('--batch_size', default=256, type=int, help='batch size for training. ')
     parser.add_argument('--latent_dir', type=str, default='latent/', help='latent directory')
@@ -24,10 +38,10 @@ def get_args_parser():
     parser.add_argument('--total_iter', type=int, default=100000, help='total iteration')
     parser.add_argument('--lr', default=1e-4, type=float, help='max learning rate')
     parser.add_argument('--gamma', default=0.05, type=float, help="learning rate decay")
-    
-    parser.add_argument('--decay-option',default='all', type=str, choices=['all'], help='weight decay option')
-    parser.add_argument('--weight-decay', default=1e-6, type=float, help='weight decay') 
-    parser.add_argument('--optimizer',default='adamw', type=str, choices=['adam', 'adamw'], help='optimizer')
+
+    parser.add_argument('--decay-option', default='all', type=str, choices=['all'], help='weight decay option')
+    parser.add_argument('--weight-decay', default=1e-6, type=float, help='weight decay')
+    parser.add_argument('--optimizer', default='adamw', type=str, choices=['adam', 'adamw'], help='optimizer')
 
     parser.add_argument('--num_gpus', default=1, type=int, help='number of GPUs')
     parser.add_argument('--total-iter', default=2000000, type=int, help='number of total iterations to run')
@@ -36,6 +50,49 @@ def get_args_parser():
     parser.add_argument('--text', type=str, default='A man is jogging around.')
     parser.add_argument('--mode', type=str, default='pos', choices=['pos', 'rot'], help='recover mode, pos: position, rot: rotation')
 
+    # model.generative_head_type
+    parser.add_argument(
+        '--generative_head_type',
+        type=str,
+        default='ddpm',
+        choices=['ddpm', 'rectified_flow'],
+        help='model.generative_head_type',
+    )
+    # training.rf_time_sampling
+    parser.add_argument(
+        '--rf_time_sampling',
+        type=str,
+        default='uniform',
+        choices=['uniform'],
+        help='training.rf_time_sampling',
+    )
+    # training.rf_loss_type
+    parser.add_argument(
+        '--rf_loss_type',
+        type=str,
+        default='mse',
+        choices=['mse'],
+        help='training.rf_loss_type',
+    )
+    # sampling.num_flow_steps
+    parser.add_argument('--num_flow_steps', type=int, default=20, help='sampling.num_flow_steps')
+    # sampling.flow_solver
+    parser.add_argument('--flow_solver', type=str, default='euler', choices=['euler'], help='sampling.flow_solver')
 
+    # Optional compatibility knobs.
+    parser.add_argument(
+        '--share_backbone_between_ddpm_and_rf',
+        type=_str2bool,
+        default=True,
+        help='model.share_backbone_between_ddpm_and_rf',
+    )
+    parser.add_argument('--end_latent_threshold_ddpm', type=float, default=0.1, help='inference.end_latent_threshold_ddpm')
+    parser.add_argument('--end_latent_threshold_rf', type=float, default=0.1, help='inference.end_latent_threshold_rf')
+    parser.add_argument(
+        '--use_two_forward_for_rf',
+        type=_str2bool,
+        default=True,
+        help='training.use_two_forward_for_rf',
+    )
 
     return parser.parse_args()

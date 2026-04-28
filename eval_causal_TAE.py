@@ -49,7 +49,13 @@ net = tae.Causal_HumanTAE(
 
 print ('loading checkpoint from {}'.format(args.resume_pth))
 ckpt = torch.load(args.resume_pth, map_location='cpu')
-net.load_state_dict(ckpt['net'], strict=False)
+state_dict = ckpt['net']
+# Handle TAEGANV1 checkpoint: keys are 'tae.tae.xxx' (TAEGANV1.tae = Causal_HumanTAE)
+# Original TAE checkpoint keys are 'tae.xxx' (Causal_HumanTAE.tae), no stripping needed
+if any(k.startswith('tae.tae.') for k in state_dict.keys()):
+    print('Detected TAEGANV1 checkpoint, extracting TAE weights (stripping outer "tae." prefix)...')
+    state_dict = {k[4:]: v for k, v in state_dict.items() if k.startswith('tae.')}
+net.load_state_dict(state_dict, strict=True)
 net.eval()
 net.to(comp_device)
 
@@ -66,9 +72,9 @@ textencoder = DistilbertActorAgnosticEncoder(modelpath, num_layers=4, latent_dim
 motionencoder = ActorAgnosticEncoder(nfeats=272, vae = True, num_layers=4, latent_dim=256, max_len=300)
 
 # 使用ms作者提供的已经训练好的评估器
-# ckpt = torch.load('epoch=99.ckpt')
+ckpt = torch.load('epoch=99.ckpt')
 # 使用我自己训练的评估器
-ckpt = torch.load('./experiments/temos/EXP1/checkpoints/epoch=99.ckpt')
+# ckpt = torch.load('./experiments/temos/EXP1/checkpoints/epoch=99.ckpt')
 
 
 # load textencoder

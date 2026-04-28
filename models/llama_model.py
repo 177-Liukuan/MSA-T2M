@@ -31,7 +31,7 @@ llama_configs = {
 
 
 class LLaMAHF(nn.Module):
-    def __init__(self, config: LLaMAHFConfig, num_diffusion_head_layers=9, input_token_dim=16, device=torch.device('cuda'), width=1792) -> None:
+    def __init__(self, config: LLaMAHFConfig, num_diffusion_head_layers=9, input_token_dim=16, device=torch.device('cuda'), width=1792, generative_head_type='ddpm', num_flow_steps=20, flow_solver='euler', rf_time_sampling='uniform', rf_loss_type='mse') -> None:
         super().__init__()
         assert config.block_size is not None
         self.config = config
@@ -49,6 +49,7 @@ class LLaMAHF(nn.Module):
         
         target_channels = input_token_dim
         from models.diffloss import DiffLoss
+        self.generative_head_type = str(generative_head_type).lower()
         self.diff_loss = DiffLoss(
                 target_channels=target_channels,
                 z_channels=config.n_embd,
@@ -56,6 +57,11 @@ class LLaMAHF(nn.Module):
                 depth=num_diffusion_head_layers,
                 num_sampling_steps='50',
                 grad_checkpointing=False,
+                flow_type=self.generative_head_type,
+                num_flow_steps=num_flow_steps,
+                flow_solver=flow_solver,
+                rf_time_sampling=rf_time_sampling,
+                rf_loss_type=rf_loss_type,
             )
         self.diff_loss = self.diff_loss.to(device)
         self.out_proj = nn.Linear(config.n_embd, config.n_embd)

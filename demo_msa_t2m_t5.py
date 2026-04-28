@@ -2,6 +2,7 @@ import os
 import glob
 import argparse
 import warnings
+import random
 import numpy as np
 import torch
 
@@ -13,6 +14,22 @@ import visualization.plot_3d_global as plot_3d
 
 warnings.filterwarnings('ignore')
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+
+def set_reproducibility(seed, deterministic=True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = bool(deterministic)
+
+    if deterministic:
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        torch.use_deterministic_algorithms(True)
 
 
 class RAGRetriever:
@@ -92,6 +109,7 @@ def sample_motion_latents_with_stop(
     text,
     empty_text_emb,
     reference_end_latent,
+    disable_rag=False,
     text_embed_dim=768,
     threshold=3.0,
     length=196,
@@ -99,7 +117,11 @@ def sample_motion_latents_with_stop(
     cfg_scale=4.0,
     latent_dim=16,
     device=torch.device('cuda'),
+    seed=None,
 ):
+    if seed is not None:
+        set_reproducibility(seed, deterministic=True)
+
     text_feat = text_encoder.encode([text])
     text_emb = torch.from_numpy(np.asarray(text_feat, dtype=np.float32)).to(device)
     if text_emb.shape[-1] != text_embed_dim:
@@ -107,7 +129,12 @@ def sample_motion_latents_with_stop(
             f'text embedding dim mismatch: got {text_emb.shape[-1]}, expected {text_embed_dim}'
         )
 
-    top_hcls, top_scores = retriever.retrieve(text_emb)
+    if disable_rag:
+        # Ablation branch: remove retrieval token and keep text-only conditioning.
+        top_hcls = None
+        top_scores = None
+    else:
+        top_hcls, top_scores = retriever.retrieve(text_emb)
 
     max_token_len = int(length) // unit_length
 
@@ -162,14 +189,18 @@ def parse_args():
 
     parser.add_argument('--length', type=int, default=300)
     parser.add_argument('--unit_length', type=int, default=4)
-    parser.add_argument('--cfg_scale', type=float, default=5.0)
+    parser.add_argument('--cfg_scale', type=float, default=4.0)
     parser.add_argument('--threshold', type=float, default=0.1)
+    parser.add_argument('--seed', type=int, default=123)
+    parser.add_argument('--deterministic', action='store_true', default=True)
+    parser.add_argument('--no_deterministic', dest='deterministic', action='store_false')
 
     parser.add_argument('--hcls_dir', type=str, default='./humanml3d_272/h_cls_latents_msa_vae/exp')
     parser.add_argument('--empty_text_path', type=str, default='./humanml3d_272/text_latents_t5/empty_text_embedding.npy')
-    parser.add_argument('--retrieval_topk', type=int, default=3)
+    parser.add_argument('--retrieval_topk', type=int, default=5)
     parser.add_argument('--t5_model_path', type=str, default='sentencet5-xxl/')
     parser.add_argument('--text_embed_dim', type=int, default=768)
+    parser.add_argument('--disable_rag', action='store_true', default=False, help='Ablation: disable retrieval token and use text-only conditioning.')
 
     parser.add_argument('--reference_end_latent', type=str,
                         default='./humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5/reference_end_latent_msa_vae_t2m_272.npy')
@@ -186,9 +217,9 @@ def parse_args():
 
     parser.add_argument('--trans_d_model', type=int, default=768)
     parser.add_argument('--trans_nhead', type=int, default=8)
-    parser.add_argument('--trans_enc_layers', type=int, default=4)
-    parser.add_argument('--trans_dec_layers', type=int, default=4)
-    parser.add_argument('--trans_ff_size', type=int, default=1024)
+    parser.add_argument('--trans_enc_layers', type=int, default=6)
+    parser.add_argument('--trans_dec_layers', type=int, default=6)
+    parser.add_argument('--trans_ff_size', type=int, default=2048)
     parser.add_argument('--trans_dropout', type=float, default=0.1)
     parser.add_argument('--clip_dim', type=int, default=768)
 
@@ -197,6 +228,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    set_reproducibility(args.seed, deterministic=args.deterministic)
     comp_device = torch.device('cuda')
 
     print(f'Input text: {args.text}')
@@ -229,15 +261,18 @@ def main():
     config = LLaMAHFConfig.from_name('Normal_size')
     config.block_size = 78
     base_model = LLaMAHF(config, args.num_diffusion_head_layers, args.latent_dim, comp_device)
-    rag_model = LLaMARAGWrapper(base_model=base_model, model_dim=config.n_embd).to(comp_device)
+    rag_model = LLaMARAGWrapper(base_model=base_model, model_dim=config.n_embd, disable_rag=args.disable_rag).to(comp_device)
 
     if args.resume_trans is not None:
         print('loading transformer checkpoint from {}'.format(args.resume_trans))
         ckpt_rag = torch.load(args.resume_trans, map_location='cpu')
-        if 'trans' not in ckpt_rag or 'rag' not in ckpt_rag:
-            raise KeyError('RAG checkpoint must contain both trans and rag keys.')
+        if 'trans' not in ckpt_rag:
+            raise KeyError('Checkpoint must contain trans key.')
         rag_model.base_model.load_state_dict(load_state_strip_module(ckpt_rag['trans']), strict=False)
-        rag_model.load_state_dict(load_state_strip_module(ckpt_rag['rag']), strict=False)
+        if 'rag' in ckpt_rag:
+            rag_model.load_state_dict(load_state_strip_module(ckpt_rag['rag']), strict=False)
+        elif not args.disable_rag:
+            raise KeyError('RAG checkpoint must contain rag key when disable_rag=False.')
     rag_model.eval()
 
     from sentence_transformers import SentenceTransformer
@@ -259,12 +294,16 @@ def main():
             f'empty text embedding dim mismatch: got {empty_text_emb.shape[0]}, expected {args.text_embed_dim}'
         )
 
-    retriever = RAGRetriever(
-        args.hcls_dir,
-        topk=args.retrieval_topk,
-        text_embed_dim=args.text_embed_dim,
-        device=comp_device,
-    )
+    retriever = None
+    if not args.disable_rag:
+        retriever = RAGRetriever(
+            args.hcls_dir,
+            topk=args.retrieval_topk,
+            text_embed_dim=args.text_embed_dim,
+            device=comp_device,
+        )
+    else:
+        print('No-RAG ablation enabled: retrieval library bypassed.')
 
     if not os.path.exists(args.reference_end_latent):
         raise FileNotFoundError(f'reference end latent not found: {args.reference_end_latent}')
@@ -276,6 +315,7 @@ def main():
         text_encoder=text_encoder,
         retriever=retriever,
         text=args.text,
+        disable_rag=args.disable_rag,
         empty_text_emb=empty_text_emb,
         reference_end_latent=reference_end_latent,
         text_embed_dim=args.text_embed_dim,
@@ -285,6 +325,7 @@ def main():
         cfg_scale=args.cfg_scale,
         latent_dim=args.latent_dim,
         device=comp_device,
+        seed=args.seed,
     )
 
     motion_seqs = net.forward_decoder(motion_latents)

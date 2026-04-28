@@ -1,3 +1,6 @@
+# eval_msa_t2m_rag_mca.py
+# Evaluation script for LLaMARAGMultiTextCAWrapper (MCA variant).
+# Extends eval_msa_t2m_rag_t5.py: passes word-level T5 tokens to sample_next_with_cfg.
 import os
 import sys
 import json
@@ -11,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models.llama_model import LLaMAHF, LLaMAHFConfig
 from models.llama_rag_model import LLaMARAGWrapper
+from models.llama_rag_model_mca import LLaMARAGMultiTextCAWrapper
 import models.msa_vae as msa_vae
 import options.option_transformer as option_trans
 import utils.utils_model as utils_model
@@ -214,6 +218,7 @@ class RAGEvalSampler:
         text_encoder=None,
         text_embed_dim=768,
         disable_rag=False,
+        text_token_dim=1024,
     ):
         self.rag_model = rag_model
         self.retriever = retriever
@@ -228,6 +233,7 @@ class RAGEvalSampler:
         self.stop_threshold = float(stop_threshold)
         self.enable_stopping = bool(enable_stopping)
         self.disable_rag = bool(disable_rag)
+        self.text_token_dim = int(text_token_dim)
 
     def eval(self):
         self.rag_model.eval()
@@ -257,12 +263,23 @@ class RAGEvalSampler:
             raise ValueError(f'text embedding dim mismatch: got {text_emb.shape[-1]}, expected {self.text_embed_dim}')
 
         if self.disable_rag:
-            # Ablation branch: remove retrieval token while keeping the rest of the pipeline unchanged.
+            # Ablation branch: remove retrieval token AND word-level MCA tokens,
+            # leaving only the sentence-level text prefix for conditioning.
             top_hcls = None
             top_scores = None
         else:
             top_hcls, top_scores = self.retriever.retrieve(text_emb)
 
+        # --- MCA: online word-level token encoding via T5 (no mean-pool) ---
+        text_tokens_batch = None
+        text_token_lens_batch = None
+        if self.text_encoder is not None and not self.disable_rag:
+            transformer_module = self.text_encoder[0]
+            features = transformer_module.tokenize(text_list)
+            features = {k: v.to(self.device) for k, v in features.items()}
+            out = transformer_module.forward(features)  # @torch.no_grad() already active on this method
+            text_tokens_batch = out['token_embeddings'].float()   # (B, S, D)
+            text_token_lens_batch = features['attention_mask'].sum(dim=1).long()  # (B,)
         max_token_len = max(1, int(length) // unit_length)
         xs = None
         bsz = text_emb.shape[0]
@@ -282,6 +299,8 @@ class RAGEvalSampler:
                 empty_text_emb=self.empty_text_emb,
                 cfg_scale=cfg,
                 temperature=1.0,
+                text_tokens=text_tokens_batch,
+                text_token_lens=text_token_lens_batch,
             )
 
             next_token = next_token.unsqueeze(1)
@@ -313,6 +332,15 @@ def parse_args():
     extra_parser.add_argument('--t5_model_path', type=str, default='sentencet5-xxl/')
     extra_parser.add_argument('--disable_rag', action='store_true', default=False, help='Ablation: disable retrieval token and use text-only conditioning.')
     extra_parser.add_argument('--disable_ema', action='store_true', default=False, help='Do not use EMA weights even if present in checkpoint.')
+    extra_parser.add_argument('--text_token_dim', type=int, default=1024,
+                        help='Dim of word-level T5 token embeddings (1024 for sentence-t5-xxl).')
+    extra_parser.add_argument('--ca_n_layers', type=int, default=6,
+                        help='Number of CA layers used during training (must match checkpoint).')
+    extra_parser.add_argument('--ca_n_head', type=int, default=0,
+                        help='Number of CA heads (0=auto, same as backbone).')
+    extra_parser.add_argument('--ca_every_n_layers', type=int, default=0,
+                        help='CA block insertion interval used during training (0=derive from ca_n_layers). '
+                             'Must match training config. E.g. 4 inserts at layers [3,7,11] for 12-layer backbone.')
 
     # MSA-VAE architecture args
     extra_parser.add_argument('--trans_d_model', type=int, default=768)
@@ -349,6 +377,10 @@ def parse_args():
     args.t5_model_path = custom_args.t5_model_path
     args.disable_rag = custom_args.disable_rag
     args.use_ema = not custom_args.disable_ema
+    args.text_token_dim = custom_args.text_token_dim
+    args.ca_n_layers = custom_args.ca_n_layers
+    args.ca_n_head = custom_args.ca_n_head
+    args.ca_every_n_layers = custom_args.ca_every_n_layers
 
     args.trans_d_model = custom_args.trans_d_model
     args.trans_nhead = custom_args.trans_nhead
@@ -469,7 +501,16 @@ def main():
     config = LLaMAHFConfig.from_name('Normal_size')
     config.block_size = 78
     base_model = LLaMAHF(config, args.num_diffusion_head_layers, args.latent_dim, comp_device)
-    rag_model = LLaMARAGWrapper(base_model=base_model, model_dim=config.n_embd, disable_rag=args.disable_rag)
+    ca_n_head = getattr(args, 'ca_n_head', 0)
+    rag_model = LLaMARAGMultiTextCAWrapper(
+        base_model=base_model,
+        model_dim=config.n_embd,
+        disable_rag=args.disable_rag,
+        text_token_dim=getattr(args, 'text_token_dim', 1024),
+        ca_n_layers=getattr(args, 'ca_n_layers', 6),
+        ca_every_n_layers=getattr(args, 'ca_every_n_layers', 0) or None,
+        ca_n_head=ca_n_head if ca_n_head > 0 else None,
+    )
 
     if args.resume_trans is None:
         raise ValueError('Please provide --resume-trans for RAG checkpoint.')
@@ -478,6 +519,29 @@ def main():
 
     trans_key = 'trans_ema' if args.use_ema and ('trans_ema' in ckpt) else 'trans'
     rag_key = 'rag_ema' if args.use_ema and ('rag_ema' in ckpt) else 'rag'
+
+    # Auto-detect ff_mult from checkpoint to handle old (ff_mult=4) and new
+    # (ff_mult=2) checkpoints transparently.  Rebuild model if shape mismatches.
+    _rag_sd = load_state_strip_module(ckpt[rag_key]) if rag_key in ckpt else {}
+    _ff_key = next((k for k in _rag_sd if 'ca_blocks' in k and 'ff_in_proj.weight' in k), None)
+    if _ff_key is not None:
+        _ckpt_inner_dim = _rag_sd[_ff_key].shape[0]   # e.g. 3072 (ff_mult=4) or 1536 (ff_mult=2)
+        _model_inner_dim = rag_model.ca_blocks[0].ff_in_proj.weight.shape[0]
+        if _ckpt_inner_dim != _model_inner_dim:
+            _detected_ff_mult = _ckpt_inner_dim // config.n_embd
+            print(f'[INFO] Checkpoint ff_mult={_detected_ff_mult} (inner_dim={_ckpt_inner_dim}) '
+                  f'differs from model default (inner_dim={_model_inner_dim}). '
+                  f'Rebuilding model with ff_mult={_detected_ff_mult}.')
+            rag_model = LLaMARAGMultiTextCAWrapper(
+                base_model=base_model,
+                model_dim=config.n_embd,
+                disable_rag=args.disable_rag,
+                text_token_dim=getattr(args, 'text_token_dim', 1024),
+                ca_n_layers=getattr(args, 'ca_n_layers', 6),
+                ca_every_n_layers=getattr(args, 'ca_every_n_layers', 0) or None,
+                ca_n_head=ca_n_head if ca_n_head > 0 else None,
+                ff_mult=_detected_ff_mult,
+            )
 
     if trans_key in ckpt:
         rag_model.base_model.load_state_dict(load_state_strip_module(ckpt[trans_key]), strict=False)
@@ -524,6 +588,7 @@ def main():
     if args.text_source == 'online_t5':
         from sentence_transformers import SentenceTransformer
         text_encoder = SentenceTransformer(args.t5_model_path)
+        text_encoder = text_encoder.to(comp_device)  # fix: explicit device placement to match features tensors
         text_encoder.eval()
         logger.info(f'Text source: online_t5, model={args.t5_model_path}')
     else:
@@ -582,6 +647,7 @@ def main():
         text_encoder=text_encoder,
         text_embed_dim=args.text_embed_dim,
         disable_rag=args.disable_rag,
+        text_token_dim=getattr(args, 'text_token_dim', 1024),
     )
 
     # Load evaluator (same metric pipeline as eval_t2m.py)

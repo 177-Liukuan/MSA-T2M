@@ -100,9 +100,9 @@ def parse_args():
     # 修复：补齐 VAE 训练时的架构参数，防止实例化报错
     extra_parser.add_argument("--trans_d_model", type=int, default=768)
     extra_parser.add_argument("--trans_nhead", type=int, default=8)
-    extra_parser.add_argument("--trans_enc_layers", type=int, default=4)
-    extra_parser.add_argument("--trans_dec_layers", type=int, default=4)
-    extra_parser.add_argument("--trans_ff_size", type=int, default=1024)
+    extra_parser.add_argument("--trans_enc_layers", type=int, default=6)
+    extra_parser.add_argument("--trans_dec_layers", type=int, default=6)
+    extra_parser.add_argument("--trans_ff_size", type=int, default=2048)
     extra_parser.add_argument("--trans_dropout", type=float, default=0.1)
     extra_parser.add_argument("--clip_dim", type=int, default=768)
 

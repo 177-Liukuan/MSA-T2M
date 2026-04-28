@@ -303,7 +303,7 @@ if __name__ == "__main__":
 
     # 地板自适应参数
     parser.add_argument("--floor_margin", type=float, default=1.5, help="地板相对轨迹的留白比例")
-    parser.add_argument("--floor_min_size", type=float, default=8, help="地板最小边长")
+    parser.add_argument("--floor_min_size", type=float, default=1, help="地板最小边长")
 
     args = parser.parse_args()
 

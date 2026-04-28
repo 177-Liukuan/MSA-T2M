@@ -71,6 +71,7 @@ comp_device = accelerator.device
 logger = utils_model.get_logger(args.out_dir)
 writer = SummaryWriter(args.out_dir)
 logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
+logger.info(f'Generative head type: {args.generative_head_type}')
 
 
 ##### ---- Dataloader ---- #####
@@ -87,7 +88,17 @@ for p in t5_model.parameters():
 
 config = LLaMAHFConfig.from_name('Normal_size')
 config.block_size = 78
-trans_encoder = LLaMAHF(config, args.num_diffusion_head_layers, args.latent_dim, comp_device)
+trans_encoder = LLaMAHF(
+    config,
+    args.num_diffusion_head_layers,
+    args.latent_dim,
+    comp_device,
+    generative_head_type=args.generative_head_type,
+    num_flow_steps=args.num_flow_steps,
+    flow_solver=args.flow_solver,
+    rf_time_sampling=args.rf_time_sampling,
+    rf_loss_type=args.rf_loss_type,
+)
 
 if args.resume_trans is not None:
     print('loading transformer checkpoint from {}'.format(args.resume_trans))
@@ -188,7 +199,6 @@ def forward_loss_withmask_2_forward(latents, trans, m_lens, feat_text, step, tot
     updated_target = latents.clone().detach()       
 
     updated_target = updated_target.reshape(b * l, -1).repeat(diffmlps_batch_mul, 1)    
-    updated_z = updated_z.reshape(b * l, -1).repeat(diffmlps_batch_mul, 1)            
 
     updated_target = updated_target[mask]                   
     updated_z = updated_z[mask]                            
@@ -199,8 +209,7 @@ def forward_loss_withmask_2_forward(latents, trans, m_lens, feat_text, step, tot
 #-------------------
 
 ##### ---- Training Loop ---- #####
-nb_iter, avg_loss = 0, 0.
-
+nb_iter, avg_loss, avg_loss_ddpm, avg_loss_rf = 0, 0., 0., 0.
 while nb_iter <= args.total_iter:
     batch = next(train_loader_iter)
     text, m_tokens, m_tokens_len = batch
@@ -234,16 +243,28 @@ while nb_iter <= args.total_iter:
 
     avg_loss = avg_loss + loss.item()
 
+    if args.generative_head_type == 'ddpm':
+        avg_loss_ddpm += loss.item()
+    else:
+        avg_loss_rf += loss.item()
+
     nb_iter += 1
     args.print_iter = 100
     if nb_iter % args.print_iter ==  0 :
         if accelerator.is_main_process:
             avg_loss = avg_loss / args.print_iter
+            avg_loss_ddpm = avg_loss_ddpm / args.print_iter
+            avg_loss_rf = avg_loss_rf / args.print_iter
+            writer.add_scalar('./Loss/total', avg_loss, nb_iter)
+            writer.add_scalar('./Loss/ddpm', avg_loss_ddpm, nb_iter)
+            writer.add_scalar('./Loss/rf', avg_loss_rf, nb_iter)
             writer.add_scalar('./Loss/train', avg_loss, nb_iter)
             writer.add_scalar('./LR/train', optimizer.param_groups[0]['lr'], nb_iter)
-            msg = f"Train. Iter {nb_iter} : Loss. {avg_loss:.5f}"
+            msg = f"Train. Iter {nb_iter} : loss_total {avg_loss:.5f} | loss_ddpm {avg_loss_ddpm:.5f} | loss_rf {avg_loss_rf:.5f}"
             logger.info(msg)
         avg_loss = 0.
+        avg_loss_ddpm = 0.
+        avg_loss_rf = 0.
 
 
     args.save_iter = 10000
@@ -253,7 +274,8 @@ while nb_iter <= args.total_iter:
             torch.save({
                 'trans': trans_encoder.state_dict(),
                 'scheduler': scheduler.state_dict(),
-                'optimizer': optimizer.state_dict()
+                'optimizer': optimizer.state_dict(),
+                'generative_head_type': args.generative_head_type
             }, os.path.join(args.out_dir, f'latest.pth'))
 
                     

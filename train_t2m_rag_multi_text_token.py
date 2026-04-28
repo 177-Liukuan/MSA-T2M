@@ -1,10 +1,15 @@
-"""Train MotionStreamer stage-2 with RAG-guided conditioning.
+"""Train MotionStreamer stage-2 with RAG + Multi-Text Cross-Attention (MCA).
 
-Core design:
-1. Offline-only features (numpy.load): text_emb + h_cls + motion_latents
-2. Retrieval fusion: Top-3 h_cls -> weighted single retrieval token
-3. Joint CFG dropout (text + retrieval) with null retrieval parameter
-4. Keep original Two-Forward diffusion training strategy
+Extends train_t2m_rag.py to additionally inject word-level T5 token
+embeddings into the LLaMA backbone via cross-attention.
+
+Differences from train_t2m_rag.py
+----------------------------------
+1. Uses LLaMARAGMultiTextCAWrapper instead of LLaMARAGWrapper.
+2. Uses dataset_msa_rag_mca.DATALoader (adds token-level text embeddings).
+3. Passes text_tokens / text_token_lens through the two-forward training.
+4. New args: --text_token_latent_dir, --ca_every_n_layers, --ca_n_head.
+5. ALL original files (train_t2m_rag.py, llama_rag_model.py …) unchanged.
 """
 
 import os
@@ -20,7 +25,9 @@ from accelerate import Accelerator
 
 from models.llama_model import LLaMAHF, LLaMAHFConfig
 from models.llama_rag_model import LLaMARAGWrapper
+from models.llama_rag_model_mca import LLaMARAGMultiTextCAWrapper, LLaMARAGMultiTextCAGatedWrapper
 from humanml3d_272 import dataset_msa_rag
+from humanml3d_272 import dataset_msa_rag_mca
 import options.option_transformer as option_trans
 import utils.utils_model as utils_model
 
@@ -76,9 +83,23 @@ def parse_args():
     extra_parser.add_argument('--num_workers', type=int, default=0)
     extra_parser.add_argument('--text_embed_dim', type=int, default=768)
     extra_parser.add_argument('--disable_rag', action='store_true', default=False, help='Ablation: disable retrieval token and use text-only conditioning.')
+    extra_parser.add_argument('--text_token_latent_dir', type=str, default=None,
+                        help='Dir of .npz word-level T5 token embeddings (from get_text_token_latent_t5.py). None disables MCA.')
+    extra_parser.add_argument('--ca_every_n_layers', type=int, default=4,
+                        help='Insert one cross-attention block every N transformer layers. '
+                             'E.g. 4 inserts at layers [3,7,11] for a 12-layer backbone.')
+    extra_parser.add_argument('--ca_n_head', type=int, default=0,
+                        help='Number of CA heads; 0 = same as backbone (default).')
+    extra_parser.add_argument('--text_token_dim', type=int, default=1024,
+                        help='Dim of word-level T5 token embeddings (1024 for sentence-t5-xxl encoder).')
     extra_parser.add_argument('--ema_decay', type=float, default=0.9999)
     extra_parser.add_argument('--ema_update_every', type=int, default=1)
     extra_parser.add_argument('--disable_ema', action='store_true', default=False)
+    extra_parser.add_argument('--freeze-backbone', dest='freeze_backbone', action='store_true', default=False,
+                        help='Freeze LLaMA transformer blocks (Flamingo-style). Only CA blocks + proj layers are trained.')
+    extra_parser.add_argument('--use_gated_ca', action='store_true', default=False,
+                        help='Branch B: use Flamingo-style GatedCrossAttentionBlock (tanh gates). '
+                             'Default (off) uses Branch A: gate-free TextCrossAttentionBlock with zero-init out_proj.')
 
     custom_args, remaining = extra_parser.parse_known_args()
 
@@ -97,9 +118,15 @@ def parse_args():
     args.num_workers = custom_args.num_workers
     args.text_embed_dim = custom_args.text_embed_dim
     args.disable_rag = custom_args.disable_rag
+    args.text_token_latent_dir = custom_args.text_token_latent_dir
+    args.ca_every_n_layers = custom_args.ca_every_n_layers
+    args.ca_n_head = custom_args.ca_n_head
+    args.text_token_dim = custom_args.text_token_dim
     args.ema_decay = custom_args.ema_decay
     args.ema_update_every = custom_args.ema_update_every
     args.use_ema = not custom_args.disable_ema
+    args.freeze_backbone = custom_args.freeze_backbone
+    args.use_gated_ca = custom_args.use_gated_ca
 
     return args
 
@@ -179,6 +206,8 @@ def forward_loss_withmask_2_forward(
     cfg_drop_mask,
     empty_text_emb,
     diffmlps_batch_mul=4,
+    text_tokens=None,
+    text_token_lens=None,
 ):
     """Two-forward training with RAG condition and diffusion denoising loss."""
     core_model = get_core_model(rag_model)
@@ -196,6 +225,8 @@ def forward_loss_withmask_2_forward(
             top3_sim_scores=top3_sim_scores,
             cfg_drop_mask=cfg_drop_mask,
             empty_text_emb=empty_text_emb,
+            text_tokens=text_tokens,
+            text_token_lens=text_token_lens,
         )
 
         # 关键对齐：双条件 token 时，motion[0] 对应 hidden index=1。
@@ -215,6 +246,8 @@ def forward_loss_withmask_2_forward(
         top3_sim_scores=top3_sim_scores,
         cfg_drop_mask=cfg_drop_mask,
         empty_text_emb=empty_text_emb,
+        text_tokens=text_tokens,
+        text_token_lens=text_token_lens,
     )
     updated_z = core_model.motion_condition_slice(updated_conditions, seq_len)
 
@@ -244,13 +277,14 @@ def main():
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
     logger.info(f'Generative head type: {args.generative_head_type}')
 
-    train_loader = dataset_msa_rag.DATALoader(
+    train_loader = dataset_msa_rag_mca.DATALoader(
         args.dataname,
         is_test=False,
         batch_size=args.batch_size,
         motion_latent_dir=args.latent_dir,
         text_latent_dir=args.text_latent_dir,
         hcls_dir=args.hcls_dir,
+        text_token_latent_dir=getattr(args, 'text_token_latent_dir', None),
         topk=args.retrieval_topk,
         num_workers=args.num_workers,
         text_embed_dim=args.text_embed_dim,
@@ -294,7 +328,16 @@ def main():
         rf_time_sampling=args.rf_time_sampling,
         rf_loss_type=args.rf_loss_type,
     )
-    rag_model = LLaMARAGWrapper(base_model=base_model, model_dim=config.n_embd, disable_rag=args.disable_rag)
+    ca_n_head = getattr(args, 'ca_n_head', 0)
+    _WrapperCls = LLaMARAGMultiTextCAGatedWrapper if getattr(args, 'use_gated_ca', False) else LLaMARAGMultiTextCAWrapper
+    rag_model = _WrapperCls(
+        base_model=base_model,
+        model_dim=config.n_embd,
+        disable_rag=args.disable_rag,
+        text_token_dim=getattr(args, 'text_token_dim', 1024),
+        ca_every_n_layers=max(1, getattr(args, 'ca_every_n_layers', 4)),
+        ca_n_head=ca_n_head if ca_n_head > 0 else None,
+    )
 
     # attn.scale is used via .item() in attention; it will not receive gradients.
     # Freeze it explicitly to avoid DDP unused-parameter reduction errors.
@@ -305,6 +348,22 @@ def main():
             frozen_scale_params += 1
     if frozen_scale_params > 0:
         logger.info(f'Frozen non-trainable attention scale params: {frozen_scale_params}')
+
+    # Flamingo-style backbone freezing: freeze LLaMA transformer blocks,
+    # only train CA blocks + projection layers (text_token_proj, null_text_kv).
+    if getattr(args, 'freeze_backbone', False):
+        frozen_backbone_params = 0
+        for n, p in rag_model.named_parameters():
+            if ('base_model.transformer.h.' in n or
+                    'base_model.transformer.wte.' in n or
+                    'base_model.transformer.ln_f.' in n):
+                p.requires_grad = False
+                frozen_backbone_params += 1
+        trainable_names = [n for n, p in rag_model.named_parameters() if p.requires_grad]
+        logger.info(f'[Flamingo-style] Frozen {frozen_backbone_params} backbone param tensors. '
+                    f'Trainable param count: {len(trainable_names)}')
+        logger.info(f'Trainable top-level modules: '
+                    f'{sorted(set(".".join(n.split(".")[:2]) for n in trainable_names))}')
 
     ema_base_state = None
     ema_rag_state = None
@@ -353,7 +412,7 @@ def main():
     scheduler = WarmupCosineDecayScheduler(optimizer, args.total_iter // 10, args.total_iter)
 
     rag_model, optimizer, train_loader = accelerator.prepare(rag_model, optimizer, train_loader)
-    train_loader_iter = dataset_msa_rag.cycle(train_loader)
+    train_loader_iter = dataset_msa_rag.cycle(train_loader)  # cycle from base RAG dataset
 
     ema_enabled = bool(args.use_ema)
     unwrapped_model = accelerator.unwrap_model(rag_model)
@@ -378,7 +437,11 @@ def main():
     logger.info('Start training no-RAG ablation MotionStreamer...' if args.disable_rag else 'Start training RAG-guided MotionStreamer...')
 
     while nb_iter <= args.total_iter:
-        text_emb, top3_h_cls, top3_sim_scores, m_tokens = next(train_loader_iter)
+        batch = next(train_loader_iter)
+        # MCA dataloader returns 6 items; last two are token embeddings
+        text_emb, top3_h_cls, top3_sim_scores, m_tokens = batch[0], batch[1], batch[2], batch[3]
+        batch_text_tokens = batch[4] if len(batch) > 4 else None   # (B,S,D) or None
+        batch_token_lens = batch[5] if len(batch) > 5 else None    # (B,)
 
         text_emb = text_emb.to(comp_device)
         top3_h_cls = top3_h_cls.to(comp_device)
@@ -388,6 +451,10 @@ def main():
             raise ValueError(f'top3_h_cls dim mismatch: got {top3_h_cls.shape[-1]}, expected {args.text_embed_dim}')
         top3_sim_scores = top3_sim_scores.to(comp_device)
         m_tokens = m_tokens.to(comp_device)
+        if batch_text_tokens is not None:
+            batch_text_tokens = batch_text_tokens.to(comp_device)
+        if batch_token_lens is not None:
+            batch_token_lens = batch_token_lens.to(comp_device)
 
         # Estimate valid lengths from zero padding, then align with input_latent = m_tokens[:, :-1].
         m_tokens_len = estimate_lengths_from_padded_latents(m_tokens)
@@ -409,10 +476,13 @@ def main():
             cfg_drop_mask=cfg_drop_mask,
             empty_text_emb=empty_text_emb,
             diffmlps_batch_mul=4,
+            text_tokens=batch_text_tokens,
+            text_token_lens=batch_token_lens,
         )
 
         optimizer.zero_grad()
         accelerator.backward(loss)
+        accelerator.clip_grad_norm_(rag_model.parameters(), 1.0)
         optimizer.step()
         scheduler.step(nb_iter)
 
