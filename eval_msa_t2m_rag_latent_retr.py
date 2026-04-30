@@ -346,6 +346,7 @@ class RAGEvalSampler:
         text_embed_dim=768,
         disable_rag=False,
         disable_latent_retr=False,
+        cfg_scale_retr=1.0,
     ):
         self.rag_model = rag_model
         self.retriever = retriever                # global h_cls retriever (RAGRetriever)
@@ -362,6 +363,7 @@ class RAGEvalSampler:
         self.enable_stopping = bool(enable_stopping)
         self.disable_rag = bool(disable_rag)
         self.disable_latent_retr = bool(disable_latent_retr)
+        self.cfg_scale_retr = float(cfg_scale_retr)
 
     def eval(self):
         self.rag_model.eval()
@@ -418,23 +420,47 @@ class RAGEvalSampler:
         bsz = text_emb.shape[0]
         finished = torch.zeros(bsz, dtype=torch.bool, device=self.device)
 
+        # Proper 2-forward velocity-space CFG (joint dropout mode).
+        # z_cond  = forward(real_text, real_retr)   — always in training distribution
+        # z_uncond = forward(null_text, null_retr)  — always in training distribution
+        # CFG scaling done in velocity space inside diff_loss.sample(cfg=cfg).
+        # 3-forward pre-mixed hidden-space CFG is NOT used because
+        # z_guided = s*z_both - (s-1)*z_retr is an OOD extrapolation for the
+        # diffusion head, causing flying/physically-invalid motions.
+        cond_mask_eval   = torch.zeros(bsz, dtype=torch.bool, device=self.device)
+        uncond_mask_eval = torch.ones(bsz,  dtype=torch.bool, device=self.device)
+
         for _k in range(max_token_len):
             if xs is None:
                 prefix = torch.zeros((bsz, 0, self.latent_dim), device=self.device, dtype=torch.float32)
             else:
                 prefix = xs
 
-            next_token = self.rag_model.sample_next_with_cfg(
-                motion_prefix=prefix,
-                text_emb=text_emb,
-                top3_h_cls=top_hcls,
-                top3_sim_scores=top_scores,
+            # Forward 1: (real_text, real_retr)
+            z_cond = self.rag_model.forward(
+                prefix, text_emb, top_hcls, top_scores,
+                cfg_drop_mask=cond_mask_eval,
                 empty_text_emb=self.empty_text_emb,
-                cfg_scale=cfg,
-                temperature=1.0,
                 retr_latents=retr_latents_batch,
                 retr_latent_lens=retr_latent_lens_batch,
+                retr_cfg_drop_mask=None,   # fallback → keep retr (joint dropout)
+            )[:, -1, :]
+
+            # Forward 2: (null_text, null_retr)
+            z_uncond = self.rag_model.forward(
+                prefix, text_emb, top_hcls, top_scores,
+                cfg_drop_mask=uncond_mask_eval,
+                empty_text_emb=self.empty_text_emb,
+                retr_latents=retr_latents_batch,
+                retr_latent_lens=retr_latent_lens_batch,
+                retr_cfg_drop_mask=None,   # fallback → null retr (joint dropout)
+            )[:, -1, :]
+
+            mix_hidden = torch.cat([z_cond, z_uncond], dim=0)  # (2*bsz, D)
+            sampled = self.rag_model.base_model.diff_loss.sample(
+                mix_hidden, temperature=1.0, cfg=cfg
             )
+            next_token = sampled.chunk(2, dim=0)[0]  # (bsz, latent_dim)
 
             next_token = next_token.unsqueeze(1)
             xs = next_token if xs is None else torch.cat([xs, next_token], dim=1)
@@ -478,6 +504,10 @@ def parse_args():
                               help='Motion latent dimension (must match checkpoint).')
     # CFG / text
     extra_parser.add_argument('--cfg_scale', type=float, default=4.0)
+    extra_parser.add_argument('--cfg_scale_retr', type=float, default=1.0,
+                              help='Retrieval CFG scale for dual-CFG 3-forward inference. '
+                                   '1.0=mild retrieval prior; 0.0=text-only CFG given retr; '
+                                   '>1.0=stronger retrieval amplification.')
     extra_parser.add_argument('--text_embed_dim', type=int, default=768)
     extra_parser.add_argument('--eval_split', type=str, default='test',
                               choices=['test', 'val'])
@@ -492,13 +522,11 @@ def parse_args():
     extra_parser.add_argument('--disable_ema', action='store_true', default=False,
                               help='Do not use EMA weights even if present in checkpoint.')
     # CA architecture (must match training)
-    extra_parser.add_argument('--ca_n_layers', type=int, default=6,
-                              help='Number of CA layers used during training.')
     extra_parser.add_argument('--ca_n_head', type=int, default=0,
                               help='Number of CA heads (0=auto, same as backbone).')
-    extra_parser.add_argument('--ca_every_n_layers', type=int, default=0,
+    extra_parser.add_argument('--ca_every_n_layers', type=int, default=1,
                               help='CA block insertion interval used during training '
-                                   '(0=derive from ca_n_layers).')
+                                   '(e.g. 1=every layer, 2=every 2 layers).')
     # MSA-VAE architecture
     extra_parser.add_argument('--trans_d_model', type=int, default=768)
     extra_parser.add_argument('--trans_nhead', type=int, default=8)
@@ -532,6 +560,7 @@ def parse_args():
     args.latent_retr_topk = custom_args.latent_retr_topk
     args.latent_dim_retr = custom_args.latent_dim  # separate from args.latent_dim (VAE)
     args.cfg_scale = custom_args.cfg_scale
+    args.cfg_scale_retr = custom_args.cfg_scale_retr
     args.text_embed_dim = custom_args.text_embed_dim
     args.eval_split = custom_args.eval_split
     args.text_source = custom_args.text_source
@@ -539,7 +568,6 @@ def parse_args():
     args.disable_rag = custom_args.disable_rag
     args.disable_latent_retr = custom_args.disable_latent_retr
     args.use_ema = not custom_args.disable_ema
-    args.ca_n_layers = custom_args.ca_n_layers
     args.ca_n_head = custom_args.ca_n_head
     args.ca_every_n_layers = custom_args.ca_every_n_layers
     args.trans_d_model = custom_args.trans_d_model
@@ -675,8 +703,7 @@ def main():
         model_dim=config.n_embd,
         disable_rag=args.disable_rag,
         latent_dim=latent_dim_retr,
-        ca_n_layers=getattr(args, 'ca_n_layers', 6),
-        ca_every_n_layers=getattr(args, 'ca_every_n_layers', 0) or None,
+        ca_every_n_layers=max(1, getattr(args, 'ca_every_n_layers', 1)),
         ca_n_head=ca_n_head if ca_n_head > 0 else None,
         disable_latent_retr=args.disable_latent_retr,
     )
@@ -707,8 +734,7 @@ def main():
                 model_dim=config.n_embd,
                 disable_rag=args.disable_rag,
                 latent_dim=latent_dim_retr,
-                ca_n_layers=getattr(args, 'ca_n_layers', 6),
-                ca_every_n_layers=getattr(args, 'ca_every_n_layers', 0) or None,
+                ca_every_n_layers=max(1, getattr(args, 'ca_every_n_layers', 1)),
                 ca_n_head=ca_n_head if ca_n_head > 0 else None,
                 ff_mult=_detected_ff_mult,
                 disable_latent_retr=args.disable_latent_retr,
@@ -837,6 +863,7 @@ def main():
         text_embed_dim=args.text_embed_dim,
         disable_rag=args.disable_rag,
         disable_latent_retr=args.disable_latent_retr,
+        cfg_scale_retr=args.cfg_scale_retr,
     )
 
     # ── Load evaluator ───────────────────────────────────────────────────────

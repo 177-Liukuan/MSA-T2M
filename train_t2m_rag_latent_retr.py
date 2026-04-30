@@ -87,6 +87,10 @@ def parse_args():
     extra_parser.add_argument('--latent_dim', type=int, default=16,
                               help='Motion latent dim for latent_retr_proj.')
     extra_parser.add_argument('--cfg_dropout_prob', type=float, default=0.1)
+    extra_parser.add_argument('--retr_cfg_drop_prob', type=float, default=0.1,
+                              help='Independent dropout prob for retrieved motion latents. '
+                                   'Decoupled from text CFG dropout so the model learns '
+                                   'to use each condition independently.')
     extra_parser.add_argument('--num_workers', type=int, default=0)
     extra_parser.add_argument('--text_embed_dim', type=int, default=768)
     extra_parser.add_argument('--disable_rag', action='store_true', default=False,
@@ -132,6 +136,7 @@ def parse_args():
     args.latent_retr_topk   = custom_args.latent_retr_topk
     args.latent_dim         = custom_args.latent_dim
     args.cfg_dropout_prob   = custom_args.cfg_dropout_prob
+    args.retr_cfg_drop_prob = custom_args.retr_cfg_drop_prob
     args.num_workers        = custom_args.num_workers
     args.text_embed_dim     = custom_args.text_embed_dim
     args.disable_rag        = custom_args.disable_rag
@@ -216,6 +221,7 @@ def forward_loss_withmask_2_forward(
     diffmlps_batch_mul=4,
     retr_latents=None,
     retr_latent_lens=None,
+    retr_cfg_drop_mask=None,   # independent retrieval dropout mask
 ):
     core_model = get_core_model(rag_model)
     bsz, seq_len, _ = latents.shape
@@ -233,6 +239,7 @@ def forward_loss_withmask_2_forward(
             empty_text_emb=empty_text_emb,
             retr_latents=retr_latents,
             retr_latent_lens=retr_latent_lens,
+            retr_cfg_drop_mask=retr_cfg_drop_mask,
         )
         z = core_model.motion_condition_slice(conditions, seq_len)
         target = latents.clone().detach().reshape(bsz * seq_len, -1)
@@ -251,6 +258,7 @@ def forward_loss_withmask_2_forward(
         empty_text_emb=empty_text_emb,
         retr_latents=retr_latents,
         retr_latent_lens=retr_latent_lens,
+        retr_cfg_drop_mask=retr_cfg_drop_mask,
     )
     updated_z = core_model.motion_condition_slice(updated_conditions, seq_len)
 
@@ -449,6 +457,9 @@ def main():
 
         cfg_drop_mask = (torch.rand(text_emb.shape[0], device=comp_device)
                          < args.cfg_dropout_prob)
+        # Independent retrieval dropout: model learns each condition separately
+        retr_cfg_drop_mask = (torch.rand(text_emb.shape[0], device=comp_device)
+                              < getattr(args, 'retr_cfg_drop_prob', 0.1))
 
         loss = forward_loss_withmask_2_forward(
             latents=input_latent,
@@ -464,6 +475,7 @@ def main():
             diffmlps_batch_mul=4,
             retr_latents=retr_latents,
             retr_latent_lens=retr_latent_lens,
+            retr_cfg_drop_mask=retr_cfg_drop_mask,
         )
 
         optimizer.zero_grad()
