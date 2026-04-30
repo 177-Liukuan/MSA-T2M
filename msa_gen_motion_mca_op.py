@@ -63,8 +63,8 @@ resume_trans = RESUME_TRANS_A
 #   cfg_scale_retr controls retrieval contribution (1.0 = mild, 2.0 = stronger).
 # For model B (trained with JOINT CFG dropout): use_joint_cfg=True.
 #   This uses standard proper 2-forward CFG matching training distribution.
-cfg_scale      = 5.5   # text CFG strength
-cfg_scale_retr = 1.0   # retrieval CFG strength (only used when use_joint_cfg=False)
+cfg_scale      = 6.0   # text CFG strength
+cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=False)
 
 # CFG mode flag  ← use True for ALL models (OLD and NEW alike)
 #
@@ -82,7 +82,7 @@ cfg_scale_retr = 1.0   # retrieval CFG strength (only used when use_joint_cfg=Fa
 #   is an out-of-distribution extrapolation the diffusion head has never seen.
 #   For a 12-CA-block model the difference (z_both - z_retr) is huge, so the
 #   4x amplification pushes z_guided far outside the training manifold.
-use_joint_cfg = True    # True for ALL models — see explanation above
+use_joint_cfg = False    # True for ALL models — see explanation above
 
 # Stop token threshold (L2 distance from generated token to reference_end_latent).
 # Data calibration:
@@ -410,6 +410,57 @@ def _sample_2forward_joint(
     return sampled_cond
 
 
+
+def _sample_3forward_additive(
+    rag_model, prefix, text_emb, empty_text_emb,
+    top_hcls, top_scores, s_t, s_r,
+    retr_latents, retr_latent_lens, device,
+):
+    """3-forward additive velocity-space CFG for NEW model (independent dropout).
+
+    v_guided = v_nn + s_t*(v_tn - v_nn) + s_r*(v_tr - v_tn)
+
+    All 3 z vectors are in-distribution (seen during training):
+      z_nn => (null_text, null_retr)  ~1%  training distribution
+      z_tn => (real_text, null_retr)  ~9%  training distribution
+      z_tr => (real_text, real_retr)  ~81% training distribution
+    """
+    bsz = text_emb.shape[0]
+    all_false = torch.zeros(bsz, dtype=torch.bool, device=device)
+    all_true  = torch.ones( bsz, dtype=torch.bool, device=device)
+
+    # Forward 1: null text, null retr → z_nn
+    z_nn = rag_model.forward(
+        prefix, text_emb, top_hcls, top_scores,
+        cfg_drop_mask=all_true, empty_text_emb=empty_text_emb,
+        retr_latents=retr_latents, retr_latent_lens=retr_latent_lens,
+        retr_cfg_drop_mask=all_true,
+    )[:, -1, :]   # (bsz, D)
+
+    # Forward 2: real text, null retr → z_tn
+    z_tn = rag_model.forward(
+        prefix, text_emb, top_hcls, top_scores,
+        cfg_drop_mask=all_false, empty_text_emb=empty_text_emb,
+        retr_latents=retr_latents, retr_latent_lens=retr_latent_lens,
+        retr_cfg_drop_mask=all_true,
+    )[:, -1, :]   # (bsz, D)
+
+    # Forward 3: real text, real retr → z_tr
+    z_tr = rag_model.forward(
+        prefix, text_emb, top_hcls, top_scores,
+        cfg_drop_mask=all_false, empty_text_emb=empty_text_emb,
+        retr_latents=retr_latents, retr_latent_lens=retr_latent_lens,
+        retr_cfg_drop_mask=all_false,
+    )[:, -1, :]   # (bsz, D)
+
+    # Additive CFG in velocity/noise space — no OOD hidden extrapolation
+    sampled = rag_model.base_model.diff_loss.sample_additive_cfg(
+        z_nn=z_nn, z_tn=z_tn, z_tr=z_tr,
+        s_t=s_t, s_r=s_r, temperature=1.0,
+    )  # (bsz, latent_dim)
+    return sampled
+
+
 @torch.no_grad()
 def sample_motion_latents(
     rag_model,
@@ -454,18 +505,15 @@ def sample_motion_latents(
                 retr_latents, retr_latent_lens, device,
             )
         else:
-            # ── NEW model: 3-forward dual-CFG via model method ──
-            next_tok = rag_model.sample_next_with_cfg(
-                motion_prefix    = prefix,
-                text_emb         = text_emb,
-                empty_text_emb   = empty_text_emb,
-                top3_h_cls       = top_hcls,
-                top3_sim_scores  = top_scores,
-                cfg_scale        = cfg,
-                cfg_scale_retr   = cfg_retr,
-                temperature      = 1.0,
-                retr_latents     = retr_latents,
-                retr_latent_lens = retr_latent_lens,
+            # ── NEW model: 3-forward additive velocity-space CFG ──
+            next_tok = _sample_3forward_additive(
+                rag_model, prefix, text_emb, empty_text_emb,
+                top_hcls, top_scores,
+                s_t=cfg,      # text guidance scale
+                s_r=cfg_retr, # retrieval guidance scale
+                retr_latents=retr_latents,
+                retr_latent_lens=retr_latent_lens,
+                device=device,
             )
         # next_tok: (1, latent_dim)
 
