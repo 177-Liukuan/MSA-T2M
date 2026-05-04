@@ -31,7 +31,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # User Config  (edit here)
 # =============================================================================
 
-text = "the person rises from a laying position and walks in a clockwise circle, and then lays back down the ground"
+text = "A person gracefully dancing ballet"
 topk = 5                  # number of retrieved h_cls tokens to decode
 fps = 30
 output_dir = "demo_output/RAG2Motion"

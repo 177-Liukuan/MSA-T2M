@@ -86,6 +86,38 @@ class DDPMHead(BaseGenerativeHead):
 
         return sampled_token_latent
 
+    def sample_additive_cfg(self, z_nn, z_tn, z_tr, s_t=6.0, s_r=2.0, temperature=1.0):
+        """3-forward additive noise-space CFG for DDPM.
+
+        All 3 condition vectors are in-distribution:
+          z_nn: forward(null_text, null_retr)  -- ~1%  of training steps
+          z_tn: forward(real_text, null_retr)  -- ~9%  of training steps
+          z_tr: forward(real_text, real_retr)  -- ~81% of training steps
+
+        Guided noise estimate:
+          eps_guided = eps_nn + s_t*(eps_tn - eps_nn) + s_r*(eps_tr - eps_tn)
+        """
+        B = z_nn.shape[0]
+        device = z_nn.device
+        z_triple = torch.cat([z_nn, z_tn, z_tr], dim=0)  # (3B, D)
+
+        _B, _s_t, _s_r = B, float(s_t), float(s_r)
+
+        def _model_additive(x, t, c):
+            x3 = x.repeat(3, 1)
+            t3 = t.repeat(3)
+            eps3 = self.net(x3, t3, c)
+            eps_nn_b, eps_tn_b, eps_tr_b = torch.split(eps3, _B, dim=0)
+            return eps_nn_b + _s_t * (eps_tn_b - eps_nn_b) + _s_r * (eps_tr_b - eps_tn_b)
+
+        noise = torch.randn(B, self.in_channels, device=device) * float(temperature)
+        model_kwargs = dict(c=z_triple)
+        return self.gen_diffusion.p_sample_loop(
+            _model_additive, noise.shape, noise,
+            clip_denoised=False, model_kwargs=model_kwargs,
+            progress=False, temperature=temperature,
+        )
+
 
 class RectifiedFlowHead(BaseGenerativeHead):
     """Rectified Flow head using velocity prediction in latent space.
@@ -201,6 +233,36 @@ class RectifiedFlowHead(BaseGenerativeHead):
             x = self._euler_step(x=x, z_cond=z, t_scalar=t_now, dt=dt)
         return x
 
+    def sample_additive_cfg(self, z_nn, z_tn, z_tr, s_t=6.0, s_r=2.0, temperature=1.0):
+        """3-forward additive velocity-space CFG for Rectified Flow.
+
+        All 3 condition vectors are in-distribution:
+          z_nn: forward(null_text, null_retr)  -- ~1%  of training steps
+          z_tn: forward(real_text, null_retr)  -- ~9%  of training steps
+          z_tr: forward(real_text, real_retr)  -- ~81% of training steps
+
+        Guided velocity:
+          v_guided = v_nn + s_t*(v_tn - v_nn) + s_r*(v_tr - v_tn)
+        """
+        if self.flow_solver != "euler":
+            raise ValueError("Only euler solver supported for sample_additive_cfg.")
+
+        steps = max(1, int(self.num_flow_steps))
+        dt = -1.0 / float(steps)
+        B = z_nn.shape[0]
+        z_triple = torch.cat([z_nn, z_tn, z_tr], dim=0)  # (3B, D)
+
+        x = torch.randn(B, self.in_channels, device=z_nn.device, dtype=z_nn.dtype) * float(temperature)
+        for i in range(steps):
+            t_now = 1.0 - float(i) / float(steps)
+            x3 = x.repeat(3, 1)
+            t3 = torch.full((3 * B,), t_now, device=x.device, dtype=x.dtype)
+            v3 = self.net(x3, t3, z_triple)
+            v_nn, v_tn, v_tr = torch.split(v3, B, dim=0)
+            v_guided = v_nn + float(s_t) * (v_tn - v_nn) + float(s_r) * (v_tr - v_tn)
+            x = x + dt * v_guided
+        return x
+
 
 class DiffLoss(nn.Module):
     """Compatibility wrapper for DDPM and Rectified Flow generative heads."""
@@ -260,6 +322,23 @@ class DiffLoss(nn.Module):
 
     def sample(self, z, temperature=1.0, cfg=1.0):
         return self.head.sample(z=z, temperature=temperature, cfg=cfg)
+
+    def sample_additive_cfg(self, z_nn, z_tn, z_tr, s_t=6.0, s_r=2.0, temperature=1.0):
+        """Delegate 3-forward additive CFG to the active head.
+
+        Args:
+            z_nn: condition (null_text, null_retr)  shape (B, D)
+            z_tn: condition (real_text, null_retr)  shape (B, D)
+            z_tr: condition (real_text, real_retr)  shape (B, D)
+            s_t:  text guidance scale      (recommended 5-7)
+            s_r:  retrieval guidance scale (recommended 1.5-2.5)
+        Returns:
+            sampled latent of shape (B, target_channels)
+        """
+        return self.head.sample_additive_cfg(
+            z_nn=z_nn, z_tn=z_tn, z_tr=z_tr,
+            s_t=s_t, s_r=s_r, temperature=temperature,
+        )
 
 
 

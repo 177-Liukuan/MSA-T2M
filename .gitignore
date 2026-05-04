@@ -39,8 +39,20 @@ Evaluator_272/datasets/humanml3d_272
 *.ckpt
 *.pth
 *.pt
+*.npz
 Evaluator_272/epoch=99.ckpt
 
+# ========================
+# Video & Animation
+# ========================
+*.mp4
+*.gif
+
+# ========================
+# TensorBoard Logs
+# ========================
+events.out.tfevents.*
+*.log
 # ========================
 # External Dependencies
 # ========================

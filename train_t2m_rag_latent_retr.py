@@ -102,6 +102,13 @@ def parse_args():
                                    'E.g. 4 inserts at layers [3,7,11] for a 12-layer backbone.')
     extra_parser.add_argument('--ca_n_head', type=int, default=0,
                               help='CA heads (0 = same as backbone).')
+    extra_parser.add_argument('--ca_insertion_mode', type=str, default='before_sa',
+                              choices=['before_sa', 'after_sa', 'late_after_sa'],
+                              help='CA insertion order relative to SA block. '
+                                   'before_sa (A, default): CA→SA (original Flamingo). '
+                                   'after_sa  (B): SA→CA across all layers. '
+                                   'late_after_sa (C): first n//2 layers pure SA, '
+                                   'then SA→CA every ca_every_n_layers.')
     extra_parser.add_argument('--ema_decay', type=float, default=0.9999)
     extra_parser.add_argument('--ema_update_every', type=int, default=1)
     extra_parser.add_argument('--disable_ema', action='store_true', default=False)
@@ -143,6 +150,7 @@ def parse_args():
     args.disable_latent_retr = custom_args.disable_latent_retr
     args.ca_every_n_layers  = custom_args.ca_every_n_layers
     args.ca_n_head          = custom_args.ca_n_head
+    args.ca_insertion_mode  = custom_args.ca_insertion_mode
     args.ema_decay          = custom_args.ema_decay
     args.ema_update_every   = custom_args.ema_update_every
     args.use_ema            = not custom_args.disable_ema
@@ -353,6 +361,7 @@ def main():
         ca_every_n_layers=max(1, getattr(args, 'ca_every_n_layers', 4)),
         ca_n_head=ca_n_head,
         disable_latent_retr=getattr(args, 'disable_latent_retr', False),
+        ca_insertion_mode=getattr(args, 'ca_insertion_mode', 'before_sa'),
     )
 
     # Freeze non-trainable attention scale params (avoids DDP unused-param error)

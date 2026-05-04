@@ -347,6 +347,7 @@ class RAGEvalSampler:
         disable_rag=False,
         disable_latent_retr=False,
         cfg_scale_retr=1.0,
+        use_random_topk_inference=False,
     ):
         self.rag_model = rag_model
         self.retriever = retriever                # global h_cls retriever (RAGRetriever)
@@ -364,6 +365,7 @@ class RAGEvalSampler:
         self.disable_rag = bool(disable_rag)
         self.disable_latent_retr = bool(disable_latent_retr)
         self.cfg_scale_retr = float(cfg_scale_retr)
+        self.use_random_topk_inference = bool(use_random_topk_inference)
 
     def eval(self):
         self.rag_model.eval()
@@ -402,6 +404,11 @@ class RAGEvalSampler:
             top_scores = None
         else:
             top_hcls, top_scores = self.retriever.retrieve(text_emb)
+            if self.use_random_topk_inference and top_hcls.shape[1] > 1:
+                B, K, D = top_hcls.shape
+                rand_ks = torch.randint(0, K, (B,), device=top_hcls.device)
+                top_hcls = top_hcls[torch.arange(B, device=top_hcls.device), rand_ks].unsqueeze(1)
+                top_scores = top_scores[torch.arange(B, device=top_scores.device), rand_ks].unsqueeze(1)
 
         # ── local motion latent retrieval ────────────────────────────────────
         retr_latents_batch = None
@@ -521,12 +528,18 @@ def parse_args():
                               help='Ablation: disable local latent CA retrieval.')
     extra_parser.add_argument('--disable_ema', action='store_true', default=False,
                               help='Do not use EMA weights even if present in checkpoint.')
+    extra_parser.add_argument('--use_random_topk_inference', action='store_true', default=False,
+                              help='Inference diversity: randomly pick one h_cls from top-K instead of weighted pooling.')
     # CA architecture (must match training)
     extra_parser.add_argument('--ca_n_head', type=int, default=0,
                               help='Number of CA heads (0=auto, same as backbone).')
     extra_parser.add_argument('--ca_every_n_layers', type=int, default=1,
                               help='CA block insertion interval used during training '
                                    '(e.g. 1=every layer, 2=every 2 layers).')
+    extra_parser.add_argument('--ca_insertion_mode', type=str, default='before_sa',
+                              choices=['before_sa', 'after_sa', 'late_after_sa'],
+                              help='Must match training config. '
+                                   'before_sa=A (default), after_sa=B, late_after_sa=C.')
     # MSA-VAE architecture
     extra_parser.add_argument('--trans_d_model', type=int, default=768)
     extra_parser.add_argument('--trans_nhead', type=int, default=8)
@@ -568,8 +581,10 @@ def parse_args():
     args.disable_rag = custom_args.disable_rag
     args.disable_latent_retr = custom_args.disable_latent_retr
     args.use_ema = not custom_args.disable_ema
+    args.use_random_topk_inference = custom_args.use_random_topk_inference
     args.ca_n_head = custom_args.ca_n_head
     args.ca_every_n_layers = custom_args.ca_every_n_layers
+    args.ca_insertion_mode = custom_args.ca_insertion_mode
     args.trans_d_model = custom_args.trans_d_model
     args.trans_nhead = custom_args.trans_nhead
     args.trans_enc_layers = custom_args.trans_enc_layers
@@ -698,16 +713,6 @@ def main():
     base_model = LLaMAHF(config, args.num_diffusion_head_layers, args.latent_dim, comp_device)
     ca_n_head = getattr(args, 'ca_n_head', 0)
 
-    rag_model = LLaMARAGLatentRetrWrapper(
-        base_model=base_model,
-        model_dim=config.n_embd,
-        disable_rag=args.disable_rag,
-        latent_dim=latent_dim_retr,
-        ca_every_n_layers=max(1, getattr(args, 'ca_every_n_layers', 1)),
-        ca_n_head=ca_n_head if ca_n_head > 0 else None,
-        disable_latent_retr=args.disable_latent_retr,
-    )
-
     if args.resume_trans is None:
         raise ValueError('Please provide --resume-trans for RAG checkpoint.')
     print(f'Loading RAG checkpoint from {args.resume_trans}')
@@ -716,8 +721,44 @@ def main():
     trans_key = 'trans_ema' if args.use_ema and ('trans_ema' in ckpt) else 'trans'
     rag_key   = 'rag_ema'   if args.use_ema and ('rag_ema'   in ckpt) else 'rag'
 
-    # Auto-detect ff_mult from checkpoint shape to handle mismatches gracefully
+    # Auto-detect ca_every_n_layers from checkpoint (count CA blocks)
+    # Must happen BEFORE model construction to ensure correct number of CA blocks.
     _rag_sd = load_state_strip_module(ckpt[rag_key]) if rag_key in ckpt else {}
+    _detected_ca_every = getattr(args, 'ca_every_n_layers', 1)
+    _n_ca_ckpt = sum(1 for k in _rag_sd if k.startswith('ca_blocks.') and k.endswith('.norm1.weight'))
+    if _n_ca_ckpt > 0:
+        ca_mode = getattr(args, 'ca_insertion_mode', 'before_sa')
+        if ca_mode == 'late_after_sa':
+            # CA blocks are packed into the second half of layers only
+            second_half = config.n_layer - (config.n_layer // 2)
+            _detected_ca_every = max(1, second_half // _n_ca_ckpt)
+        else:
+            # Uniform distribution across all layers
+            for n in range(1, config.n_layer + 1):
+                if config.n_layer // n == _n_ca_ckpt:
+                    _detected_ca_every = n
+                    break
+        if _detected_ca_every != getattr(args, 'ca_every_n_layers', 1):
+            print(
+                f'[INFO] Checkpoint has {_n_ca_ckpt} CA blocks → '
+                f'ca_every_n_layers auto-detected as {_detected_ca_every} '
+                f'(args had {args.ca_every_n_layers}). Using detected value.'
+            )
+
+    # Build model with default ff_mult=2; auto-detect and rebuild if checkpoint differs
+    rag_model = LLaMARAGLatentRetrWrapper(
+        base_model=base_model,
+        model_dim=config.n_embd,
+        disable_rag=args.disable_rag,
+        latent_dim=latent_dim_retr,
+        ca_every_n_layers=max(1, _detected_ca_every),
+        ca_n_head=ca_n_head if ca_n_head > 0 else None,
+        ff_mult=2,
+        disable_latent_retr=args.disable_latent_retr,
+        ca_insertion_mode=getattr(args, 'ca_insertion_mode', 'before_sa'),
+    )
+
+    # Auto-detect ff_mult from checkpoint shape to handle mismatches gracefully
     _ff_key = next((k for k in _rag_sd if 'ca_blocks' in k and 'ff_in_proj.weight' in k), None)
     if _ff_key is not None:
         _ckpt_inner_dim = _rag_sd[_ff_key].shape[0]
@@ -734,10 +775,11 @@ def main():
                 model_dim=config.n_embd,
                 disable_rag=args.disable_rag,
                 latent_dim=latent_dim_retr,
-                ca_every_n_layers=max(1, getattr(args, 'ca_every_n_layers', 1)),
+                ca_every_n_layers=max(1, _detected_ca_every),
                 ca_n_head=ca_n_head if ca_n_head > 0 else None,
                 ff_mult=_detected_ff_mult,
                 disable_latent_retr=args.disable_latent_retr,
+                ca_insertion_mode=getattr(args, 'ca_insertion_mode', 'before_sa'),
             )
 
     if trans_key in ckpt:
@@ -864,6 +906,7 @@ def main():
         disable_rag=args.disable_rag,
         disable_latent_retr=args.disable_latent_retr,
         cfg_scale_retr=args.cfg_scale_retr,
+        use_random_topk_inference=getattr(args, "use_random_topk_inference", False),
     )
 
     # ── Load evaluator ───────────────────────────────────────────────────────

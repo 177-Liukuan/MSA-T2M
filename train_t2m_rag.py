@@ -73,7 +73,7 @@ def parse_args():
     extra_parser.add_argument('--empty_text_path', type=str, default='./humanml3d_272/text_latents_t5/empty_text_embedding.npy')
     extra_parser.add_argument('--retrieval_topk', type=int, default=3)
     extra_parser.add_argument('--cfg_dropout_prob', type=float, default=0.1)
-    extra_parser.add_argument('--num_workers', type=int, default=0)
+    extra_parser.add_argument('--num_workers', type=int, default=4)
     extra_parser.add_argument('--text_embed_dim', type=int, default=768)
     extra_parser.add_argument('--disable_rag', action='store_true', default=False, help='Ablation: disable retrieval token and use text-only conditioning.')
     extra_parser.add_argument('--ema_decay', type=float, default=0.9999)

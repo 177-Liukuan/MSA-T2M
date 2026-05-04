@@ -214,6 +214,7 @@ class RAGEvalSampler:
         text_encoder=None,
         text_embed_dim=768,
         disable_rag=False,
+        use_random_topk_inference=False,
     ):
         self.rag_model = rag_model
         self.retriever = retriever
@@ -228,6 +229,7 @@ class RAGEvalSampler:
         self.stop_threshold = float(stop_threshold)
         self.enable_stopping = bool(enable_stopping)
         self.disable_rag = bool(disable_rag)
+        self.use_random_topk_inference = bool(use_random_topk_inference)
 
     def eval(self):
         self.rag_model.eval()
@@ -262,6 +264,13 @@ class RAGEvalSampler:
             top_scores = None
         else:
             top_hcls, top_scores = self.retriever.retrieve(text_emb)
+            if self.use_random_topk_inference and top_hcls.shape[1] > 1:
+                # Per-sample random pick from top-K: each query in the batch
+                # independently draws one retrieved prior, increasing diversity.
+                B, K, D = top_hcls.shape
+                rand_ks = torch.randint(0, K, (B,), device=top_hcls.device)
+                top_hcls = top_hcls[torch.arange(B, device=top_hcls.device), rand_ks].unsqueeze(1)   # [B,1,D]
+                top_scores = top_scores[torch.arange(B, device=top_scores.device), rand_ks].unsqueeze(1)  # [B,1]
 
         max_token_len = max(1, int(length) // unit_length)
         xs = None
@@ -313,6 +322,8 @@ def parse_args():
     extra_parser.add_argument('--t5_model_path', type=str, default='sentencet5-xxl/')
     extra_parser.add_argument('--disable_rag', action='store_true', default=False, help='Ablation: disable retrieval token and use text-only conditioning.')
     extra_parser.add_argument('--disable_ema', action='store_true', default=False, help='Do not use EMA weights even if present in checkpoint.')
+    extra_parser.add_argument('--use_random_topk_inference', action='store_true', default=False,
+                              help='Inference diversity: randomly pick one h_cls from top-K instead of weighted pooling.')
 
     # MSA-VAE architecture args
     extra_parser.add_argument('--trans_d_model', type=int, default=768)
@@ -349,6 +360,7 @@ def parse_args():
     args.t5_model_path = custom_args.t5_model_path
     args.disable_rag = custom_args.disable_rag
     args.use_ema = not custom_args.disable_ema
+    args.use_random_topk_inference = custom_args.use_random_topk_inference
 
     args.trans_d_model = custom_args.trans_d_model
     args.trans_nhead = custom_args.trans_nhead
@@ -582,6 +594,7 @@ def main():
         text_encoder=text_encoder,
         text_embed_dim=args.text_embed_dim,
         disable_rag=args.disable_rag,
+        use_random_topk_inference=getattr(args, "use_random_topk_inference", False),
     )
 
     # Load evaluator (same metric pipeline as eval_t2m.py)

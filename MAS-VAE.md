@@ -19,7 +19,7 @@ MSA-VAE 采用分层解耦的设计，由底层的 Causal CNN VAE 和顶层的 T
 
 ### 2.2 顶层：全局上下文聚合 (Transformer AE)
 
-* **网络结构：** 在底层 CNN 提取的局部潜变量序列之上，附加位置编码（Positional Encoding），输入到无掩码的确定性 Transformer 编码器中。
+* **网络结构：** 在底层 CNN 提取的局部潜变量序列之上，附加位置编码（Positional Encoding），输入到无掩码的确定性 Transformer 编码器(和MotionCLIP保持一致)中。
 * **全局信息压缩：** 引入一个可学习的 `[CLS]` Token 放置于序列首部。利用 Transformer 强大的自注意力机制，`[CLS]` Token 能够纵览整个时序序列，将整段动作的时空动态信息聚合为一个单一的高维特征向量。
 
 ## 3. 多尺度跨模态语义对齐策略 (Multi-Scale Cross-Modal Alignment)

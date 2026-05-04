@@ -23,7 +23,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # User-editable config area
 # =========================
 text = "A figure dances ballet elegantly"
-cfg_scale = 6  
+cfg_scale = 4  
 threshold = 0.1
 retrieval_topk = 5
 max_length = 300
@@ -38,11 +38,11 @@ rf_time_sampling = "uniform"
 rf_loss_type = "mse"
 
 # Fixed paths (as requested)
-resume_pth = "Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048/net_best_mpjpe.pth"
-resume_trans = "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_k5/latest.pth"
-hcls_dir = "./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048"
+resume_pth = "Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/net_best_mpjpe.pth"
+resume_trans = "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb_k5/net_Iter100000.pth"
+hcls_dir = "./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right"
 empty_text_path = "./humanml3d_272/text_latents_t5/empty_text_embedding.npy"
-reference_end_latent = "humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048/reference_end_latent_msa_vae_t2m_272.npy"
+reference_end_latent = "humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/reference_end_latent_msa_vae_t2m_272.npy"
 t5_model_path = "sentencet5-xxl/"
 
 # Additional defaults aligned with demo_msa_t2m_t5.py
@@ -69,6 +69,12 @@ mean_path = "humanml3d_272/mean_std/Mean.npy"
 std_path = "humanml3d_272/mean_std/Std.npy"
 
 output_dir = "demo_output/MSA-T2M"
+
+# Inference diversity: randomly pick one from top-K retrieved h_cls vectors
+# instead of the weighted-pool used during training.
+# True  => each generation draws a different retrieved prior -> more diverse output
+# False => weighted pooling (deterministic, same as training distribution)
+use_random_topk_inference = True
 
 
 class RAGRetriever:
@@ -228,6 +234,7 @@ def sample_motion_latents_with_stop(
     cfg=4.0,
     token_latent_dim=16,
     device=torch.device("cuda"),
+    use_random_topk=False,
 ):
     text_feat = text_encoder.encode([input_text])
     text_emb = torch.from_numpy(np.asarray(text_feat, dtype=np.float32)).to(device)
@@ -241,6 +248,12 @@ def sample_motion_latents_with_stop(
     top_scores = None
     if not disable_rag_flag:
         top_hcls, top_scores = retriever.retrieve(text_emb)
+        if use_random_topk and top_hcls.shape[1] > 1:
+            # Randomly pick one from top-K for this generation.
+            # Softmax of a single score = 1.0, so the model uses it fully.
+            rand_k = torch.randint(0, top_hcls.shape[1], (1,)).item()
+            top_hcls = top_hcls[:, rand_k : rand_k + 1, :]
+            top_scores = top_scores[:, rand_k : rand_k + 1]
 
     max_token_len = int(length) // int(unit_len)
 
@@ -398,6 +411,7 @@ def main():
             cfg=cfg_scale,
             token_latent_dim=latent_dim,
             device=device,
+            use_random_topk=use_random_topk_inference,
         )
 
         motion = net.forward_decoder(motion_latents).squeeze(0).detach().cpu().numpy().astype(np.float32)

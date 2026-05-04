@@ -231,6 +231,10 @@ def parse_args():
     # CA arch
     extra_parser.add_argument('--ca_n_head', type=int, default=0)
     extra_parser.add_argument('--ca_every_n_layers', type=int, default=1)
+    extra_parser.add_argument('--ca_insertion_mode', type=str, default='before_sa',
+                              choices=['before_sa', 'after_sa', 'late_after_sa'],
+                              help='Must match training config. '
+                                   'before_sa=A (default), after_sa=B, late_after_sa=C.')
     # MSA-VAE arch
     extra_parser.add_argument('--trans_d_model', type=int, default=768)
     extra_parser.add_argument('--trans_nhead', type=int, default=8)
@@ -279,6 +283,7 @@ def parse_args():
     args.use_ema = not custom_args.disable_ema
     args.ca_n_head = custom_args.ca_n_head
     args.ca_every_n_layers = custom_args.ca_every_n_layers
+    args.ca_insertion_mode = custom_args.ca_insertion_mode
     args.trans_d_model = custom_args.trans_d_model
     args.trans_nhead = custom_args.trans_nhead
     args.trans_enc_layers = custom_args.trans_enc_layers
@@ -364,25 +369,25 @@ def main():
     trans_key = 'trans_ema' if (args.use_ema and 'trans_ema' in ckpt) else 'trans'
     rag_key   = 'rag_ema'   if (args.use_ema and 'rag_ema'   in ckpt) else 'rag'
 
-    # Auto-detect CA architecture from checkpoint
-    _detected_ff_mult = 4
-    if rag_key in ckpt:
-        for k in load_state_strip_module(ckpt[rag_key]).keys():
-            if 'ca_blocks' in k and 'ff.net.0.weight' in k:
-                _w = load_state_strip_module(ckpt[rag_key])[k]
-                _detected_ff_mult = _w.shape[0] // config.n_embd
-                break
-
+    # Auto-detect ca_every_n_layers from checkpoint (count CA blocks)
     _detected_ca_every = getattr(args, 'ca_every_n_layers', 1)
     if rag_key in ckpt:
-        n_ca = sum(1 for k in load_state_strip_module(ckpt[rag_key]).keys()
-                   if k.startswith('ca_blocks.') and k.endswith('.norm1.weight'))
+        _rag_sd_tmp = load_state_strip_module(ckpt[rag_key])
+        n_ca = sum(1 for k in _rag_sd_tmp if k.startswith('ca_blocks.') and k.endswith('.norm1.weight'))
         if n_ca > 0:
-            for n in range(1, config.n_layer + 1):
-                if config.n_layer // n == n_ca:
-                    _detected_ca_every = n
-                    break
+            ca_mode = getattr(args, 'ca_insertion_mode', 'before_sa')
+            if ca_mode == 'late_after_sa':
+                # CA blocks are packed into the second half of layers only
+                second_half = config.n_layer - (config.n_layer // 2)
+                _detected_ca_every = max(1, second_half // n_ca)
+            else:
+                # Uniform distribution across all layers
+                for n in range(1, config.n_layer + 1):
+                    if config.n_layer // n == n_ca:
+                        _detected_ca_every = n
+                        break
 
+    # Build model with default ff_mult=2; auto-detect and rebuild if checkpoint differs
     rag_model = LLaMARAGLatentRetrWrapper(
         base_model=base_model,
         model_dim=config.n_embd,
@@ -390,9 +395,35 @@ def main():
         latent_dim=latent_dim_retr,
         ca_every_n_layers=max(1, _detected_ca_every),
         ca_n_head=ca_n_head if ca_n_head > 0 else None,
-        ff_mult=_detected_ff_mult,
+        ff_mult=2,
         disable_latent_retr=args.disable_latent_retr,
+        ca_insertion_mode=getattr(args, 'ca_insertion_mode', 'before_sa'),
     )
+
+    # Auto-detect ff_mult from checkpoint shape and rebuild if mismatched
+    _rag_sd = load_state_strip_module(ckpt[rag_key]) if rag_key in ckpt else {}
+    _ff_key = next((k for k in _rag_sd if 'ca_blocks' in k and 'ff_in_proj.weight' in k), None)
+    if _ff_key is not None:
+        _ckpt_inner_dim = _rag_sd[_ff_key].shape[0]
+        _model_inner_dim = rag_model.ca_blocks[0].ff_in_proj.weight.shape[0]
+        if _ckpt_inner_dim != _model_inner_dim:
+            _detected_ff_mult = _ckpt_inner_dim // config.n_embd
+            print(
+                f'[INFO] Checkpoint ff_mult={_detected_ff_mult} (inner_dim={_ckpt_inner_dim}) '
+                f'differs from model default (inner_dim={_model_inner_dim}). '
+                f'Rebuilding model with ff_mult={_detected_ff_mult}.'
+            )
+            rag_model = LLaMARAGLatentRetrWrapper(
+                base_model=base_model,
+                model_dim=config.n_embd,
+                disable_rag=args.disable_rag,
+                latent_dim=latent_dim_retr,
+                ca_every_n_layers=max(1, _detected_ca_every),
+                ca_n_head=ca_n_head if ca_n_head > 0 else None,
+                ff_mult=_detected_ff_mult,
+                disable_latent_retr=args.disable_latent_retr,
+                ca_insertion_mode=getattr(args, 'ca_insertion_mode', 'before_sa'),
+            )
 
     if trans_key in ckpt:
         rag_model.base_model.load_state_dict(

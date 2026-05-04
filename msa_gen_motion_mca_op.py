@@ -42,13 +42,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # User config  (edit here)
 # ===========================================================================
 
-text = "A figure dances ballet elegantly"
+# text = "A person walks forward, turns around, then sits down"
+
+text = "A man is walking forward while he is punching"
 
 # ------ Choose ONE of the two models ------
 # Model A: optimised (dual CFG training, ca_every_n_layers=4)
 RESUME_TRANS_A = (
-    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
-    "_every4layer_top3_ddpm_cfg/net_Iter100000.pth"
+    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr_after_sa_every1layer_top3_ddpm_cfg_saca_dropout01/net_Iter100000.pth"
 )
 # Model B: original (joint CFG training, ca_every_n_layers=4 as well)
 RESUME_TRANS_B = (
@@ -59,11 +60,28 @@ RESUME_TRANS_B = (
 # Active checkpoint  ← switch between A and B here
 resume_trans = RESUME_TRANS_A
 
+# CA insertion mode — MUST match the training config of resume_trans.
+# Cannot be auto-detected from checkpoint weights alone.
+#
+#   'before_sa'     (A, default) — CA BEFORE SA  (original Flamingo order)
+#                   e.g. every2layer_top3_ddpm_cfg (baseline)
+#   'after_sa'      (B)          — CA AFTER  SA  (all layers, uniform)
+#                   e.g. after_sa_every2layer_top3_ddpm_cfg_saca
+#   'late_after_sa' (C)          — CA AFTER  SA, second-half layers only
+#                   e.g. late_after_sa_every1layer_top3_ddpm_cfg_saca
+ca_insertion_mode = 'after_sa'   # ← change this when switching checkpoints
+
+# CA insertion interval — MUST match training config.
+# For 'late_after_sa', this is the stride within the second-half layers only.
+# For 'before_sa' / 'after_sa', this is the global stride across all layers.
+# Set to None to auto-detect (reliable for before_sa/after_sa; NOT for late_after_sa).
+ca_every_n_layers_override = 2   # ← set to None to auto-detect
+
 # For model A (trained with independent retrieval CFG): use dual-CFG (3-forward).
 #   cfg_scale_retr controls retrieval contribution (1.0 = mild, 2.0 = stronger).
 # For model B (trained with JOINT CFG dropout): use_joint_cfg=True.
 #   This uses standard proper 2-forward CFG matching training distribution.
-cfg_scale      = 6.0   # text CFG strength
+cfg_scale      = 7.0   # text CFG strength
 cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=False)
 
 # CFG mode flag  ← use True for ALL models (OLD and NEW alike)
@@ -573,19 +591,38 @@ def main():
                      if isinstance(ckpt, dict) else "ddpm")
     print(f"  generative_head_type: {resolved_head}")
 
-    # --- AUTO-DETECT ca_every_n_layers from checkpoint ---
+    # --- Detect checkpoint architecture ---
     use_ema_actual = use_ema and ("trans_ema" in ckpt)
     n_ca_blocks, ff_mult_ckpt, ff_inner = inspect_rag_checkpoint(ckpt, use_ema_actual)
     n_total_layers  = detect_n_transformer_layers(ckpt, use_ema_actual)
-    ca_every_n_auto = n_total_layers // n_ca_blocks if n_ca_blocks > 0 else 4
 
-    print(f"  [AutoDetect] n_total_layers={n_total_layers}, "
-          f"n_ca_blocks={n_ca_blocks}, "
-          f"→ ca_every_n_layers={ca_every_n_auto}, ff_mult={ff_mult_ckpt}")
+    # Compute ca_every_n: use manual override if set; otherwise auto-detect.
+    # NOTE: auto-detect (n_total // n_ca) is only reliable for 'before_sa'/'after_sa'.
+    # For 'late_after_sa', the CA blocks are packed into the second half of layers,
+    # so auto-detect would return the wrong stride — always set the override for mode C.
+    if ca_every_n_layers_override is not None:
+        ca_every_n_resolved = ca_every_n_layers_override
+        print(f"  [Config] ca_every_n_layers={ca_every_n_resolved} (manual override), "
+              f"n_ca_blocks={n_ca_blocks}, ff_mult={ff_mult_ckpt}")
+    else:
+        # For late_after_sa: denominator should be second-half layers only
+        if ca_insertion_mode == 'late_after_sa':
+            second_half = n_total_layers - (n_total_layers // 2)
+            ca_every_n_resolved = second_half // n_ca_blocks if n_ca_blocks > 0 else 1
+        else:
+            ca_every_n_resolved = n_total_layers // n_ca_blocks if n_ca_blocks > 0 else 2
+        print(f"  [AutoDetect] n_total_layers={n_total_layers}, "
+              f"n_ca_blocks={n_ca_blocks}, "
+              f"→ ca_every_n_layers={ca_every_n_resolved}, ff_mult={ff_mult_ckpt}")
 
-    # Verify CA layer positions that will be active
-    ca_positions = [i for i in range(n_total_layers) if (i + 1) % ca_every_n_auto == 0]
-    print(f"  [AutoDetect] CA will be applied at layer indices: {ca_positions}")
+    # Compute and display effective CA layer indices for verification
+    _ca_start = (n_total_layers // 2) if ca_insertion_mode == 'late_after_sa' else 0
+    ca_positions = [
+        idx for idx in range(_ca_start, n_total_layers)
+        if (idx - _ca_start + 1) % ca_every_n_resolved == 0
+    ]
+    print(f"  [Config] ca_insertion_mode={ca_insertion_mode!r}, "
+          f"ca_at_layers={ca_positions}")
 
     # ── Model imports ────────────────────────────────────────────────────
     from models.llama_model import LLaMAHF, LLaMAHFConfig
@@ -634,15 +671,16 @@ def main():
         rf_loss_type         = rf_loss_type,
     )
 
-    # ── RAG model (ca_every_n_layers AUTO-DETECTED from checkpoint) ──────
+    # ── RAG model ────────────────────────────────────────────────────────
     rag_model = LLaMARAGLatentRetrWrapper(
         base_model          = base_model,
         model_dim           = config.n_embd,
         disable_rag         = disable_rag,
         latent_dim          = latent_dim,
-        ca_every_n_layers   = ca_every_n_auto,    # ← KEY FIX
-        ff_mult             = ff_mult_ckpt,        # ← from checkpoint
+        ca_every_n_layers   = ca_every_n_resolved,  # ← manual override or auto-detected
+        ff_mult             = ff_mult_ckpt,           # ← from checkpoint
         disable_latent_retr = disable_latent_retr,
+        ca_insertion_mode   = ca_insertion_mode,      # ← from User config
     ).to(device)
     print(f"  [Model] {rag_model.extra_repr()}")
 
@@ -778,7 +816,12 @@ def main():
 
     # ── Save outputs ──────────────────────────────────────────────────────
     ts   = time.strftime("%Y%m%d_%H%M%S")
-    stem = f"LatentRetr_{sanitize_for_filename(text)}_{ts}"
+    cfg_tag = (
+        f"st{cfg_scale}_sr{cfg_scale_retr}"
+        if not use_joint_cfg
+        else f"cfg{cfg_scale}_joint"
+    )
+    stem = f"LatentRetr_{sanitize_for_filename(text)}_{cfg_tag}_{ts}"
 
     gif_path = os.path.join(output_dir, f"{stem}.gif")
     npy_path = os.path.join(output_dir, f"{stem}.npy")

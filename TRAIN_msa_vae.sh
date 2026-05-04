@@ -33,7 +33,7 @@ if [ -n "$RESUME" ]; then
     RESUME_FLAGS="$RESUME_FLAGS --resume-pth $RESUME"
 fi
 
-accelerate launch --num_processes $NUM_GPUS --mixed_precision bf16 \
+accelerate launch --num_processes $NUM_GPUS \
   train_msa_vae.py \
   --batch-size $BATCH_SIZE \
   --lr 0.00005 \
@@ -45,21 +45,22 @@ accelerate launch --num_processes $NUM_GPUS --mixed_precision bf16 \
   --dilation-growth-rate 3 \
   --out-dir Experiments \
   --dataname $dataset_name \
-  --exp-name MSA_VAEv2_${dataset_name}_2gpus_vis \
+  --exp-name MSA_VAEv5_${dataset_name}_dynamic02_closefp16 \
   --root_loss 7.0 \
   --latent_dim 16 \
   --hidden_size 1024 \
   --trans_d_model 512 \
   --trans_nhead 8 \
-  --trans_enc_layers 4 \
-  --trans_dec_layers 4 \
-  --trans_ff_size 1024 \
+  --trans_enc_layers 6 \
+  --trans_dec_layers 6 \
+  --trans_ff_size 2048 \
   --trans_dropout 0.1 \
   --clip_dim 512 \
   --clip_version ViT-B/32 \
   --latent_recon_weight 1.0 \
   --global_align_weight 0.5 \
   --local_align_weight 0.2 \
+  --spotlight_alpha 0 \
   --use_ft_split \
   --num_gpus $NUM_GPUS \
   $RESUME_FLAGS

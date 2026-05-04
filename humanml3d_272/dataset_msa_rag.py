@@ -187,7 +187,7 @@ def DATALoader(
     hcls_dir='./humanml3d_272/h_cls_latents_msa_vae/exp',
     topk=3,
     exclude_self=True,
-    num_workers=0,
+    num_workers=4,
     text_embed_dim=None,
 ):
     _ = is_test
@@ -209,9 +209,21 @@ def DATALoader(
         num_workers=num_workers,
         collate_fn=collate_fn,
         drop_last=True,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
     return loader
 
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """Give each DataLoader worker a distinct random seed to avoid correlated
+    text-annotation sampling across workers (random.randint in __getitem__)."""
+    import random, numpy as np
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed + worker_id)
+    np.random.seed(seed + worker_id)
 
 def cycle(iterable):
     while True:
