@@ -60,6 +60,12 @@ events.out.tfevents.*
 # ========================
 deps/
 Evaluator_272/deps/
+LAVIS/
+MoLingo/
+MotionCLIP/
+ReMoDiffuse/
+RectifiedFlow/
+VideoVAEPlus/
 output/
 sentencet5-xxl/
 humanml3d_272/t2m_latents/
