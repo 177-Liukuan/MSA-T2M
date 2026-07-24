@@ -6,8 +6,8 @@
 NUM_GPUS=${1:-1}
 
 MSA_VAE_CKPT=${MSA_VAE_CKPT:-Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/net_best_mpjpe.pth}
-# RAG_CKPT=${RAG_CKPT:-Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb/net_Iter100000.pth}
-RAG_CKPT=${RAG_CKPT:-Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb/latest.pth}
+RAG_CKPT=${RAG_CKPT:-Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb_k3_testcode/net_Iter100000.pth}
+# RAG_CKPT=${RAG_CKPT:-Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb/latest.pth}
 MOTION_LATENT_DIR=${MOTION_LATENT_DIR:-./humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right}
 TEXT_LATENT_DIR=${TEXT_LATENT_DIR:-./humanml3d_272/text_latents_t5}
 HCLS_DIR=${HCLS_DIR:-./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right}
@@ -49,7 +49,6 @@ python eval_msa_t2m_rag_t5.py \
   --clip_dim $TEXT_EMBED_DIM \
   --cfg_scale 4.0 \
   --stop_threshold $STOP_THRESHOLD \
-  --exp-name MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb_randomk \
+  --exp-name MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb_k3_testcode_ema \
   --reference_end_latent_path humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/reference_end_latent_msa_vae_t2m_272.npy \
-   --retrieval_topk 3\
-   --disable_ema
+   --retrieval_topk 3

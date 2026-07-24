@@ -22,10 +22,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # =========================
 # User-editable config area
 # =========================
-text = "A figure dances ballet elegantly"
+text = "A man is sitting down, and then standing up, running away"
 cfg_scale = 4  
 threshold = 0.1
-retrieval_topk = 5
+retrieval_topk = 3
 max_length = 300
 fps = 30
 disable_rag = False
@@ -39,7 +39,8 @@ rf_loss_type = "mse"
 
 # Fixed paths (as requested)
 resume_pth = "Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/net_best_mpjpe.pth"
-resume_trans = "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb_k5/net_Iter100000.pth"
+# resume_trans = "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb_k3_testcode_worker4/net_Iter100000.pth"
+resume_trans = "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_vaefulldb/net_Iter100000.pth"
 hcls_dir = "./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right"
 empty_text_path = "./humanml3d_272/text_latents_t5/empty_text_embedding.npy"
 reference_end_latent = "humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/reference_end_latent_msa_vae_t2m_272.npy"

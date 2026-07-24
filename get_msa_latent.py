@@ -29,13 +29,18 @@ torch.manual_seed(args.seed)
 
 # If latent_dir not provided via CLI, use a default based on exp name
 if not hasattr(args, 'latent_dir') or args.latent_dir is None:
-    args.latent_dir = pjoin('./humanml3d_272/t2m_latents_msa_vae', 
+    args.latent_dir = pjoin('./humanml3d_272/t2m_latents_msa_vae',
                             args.exp_name if hasattr(args, 'exp_name') else 'default')
 
 # Initialize h_cls_dir for global semantic features
 if not hasattr(args, 'h_cls_dir') or args.h_cls_dir is None:
     args.h_cls_dir = pjoin('./humanml3d_272/h_cls_latents_msa_vae',
                            args.exp_name if hasattr(args, 'exp_name') else 'default')
+
+# Initialize mu_latent_dir for deterministic latent means (used as local RAG tokens)
+if not hasattr(args, 'mu_latent_dir') or args.mu_latent_dir is None:
+    args.mu_latent_dir = pjoin('./humanml3d_272/mu_latents_msa_vae',
+                               args.exp_name if hasattr(args, 'exp_name') else 'default')
 
 args.out_dir = os.path.join(args.out_dir, 'get_msa_latent_log') if hasattr(args, 'out_dir') else './Experiments/get_msa_latent_log'
 os.makedirs(args.out_dir, exist_ok=True)
@@ -46,6 +51,7 @@ logger.info(f"MSA-VAE Motion Latent Extraction")
 logger.info(f"Resume checkpoint: {args.resume_pth if hasattr(args, 'resume_pth') else 'None'}")
 logger.info(f"Output latent dir: {args.latent_dir}")
 logger.info(f"Output h_cls dir: {args.h_cls_dir}")
+logger.info(f"Output mu latent dir: {args.mu_latent_dir}")
 logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
 
 ##### ---- Dataloader ---- #####
@@ -92,7 +98,7 @@ logger.info(f"Model loaded. Total parameters: {sum(p.numel() for p in net.parame
 
 ##### ---- Extract reference end latent ---- #####
 # Create "impossible pose" prior: all zeros (physically unrealistic)
-reference_end_pose = torch.zeros(1, 4, 272).cuda()  
+reference_end_pose = torch.zeros(1, 4, 272).cuda()
 with torch.no_grad():
     z_local, mu, logvar, h_cls = net.encode(reference_end_pose)
     # Use z_local (physical track) for consistency with CNN decoder
@@ -105,11 +111,13 @@ logger.info(f"Reference end latent shape: {reference_end_latent_np.shape}")
 
 os.makedirs(args.latent_dir, exist_ok=True)
 os.makedirs(args.h_cls_dir, exist_ok=True)
+os.makedirs(args.mu_latent_dir, exist_ok=True)
 
 # Save reference latent for inference
 ref_latent_path = pjoin(args.latent_dir, f'reference_end_latent_msa_vae_{args.dataname}.npy')
 np.save(ref_latent_path, reference_end_latent_np)
 logger.info(f"✓ Reference end latent saved to: {ref_latent_path}")
+
 
 ##### ---- Extract motion latents ---- #####
 logger.info(f"Starting latent extraction for {args.dataname}...")
@@ -122,40 +130,47 @@ with torch.no_grad():
             pose, name = batch
             bs, seq = pose.shape[0], pose.shape[1]
             pose = pose.cuda().float()
-            
+
             # Encode through MSA-VAE CNN encoder
             # z_local shape: (bs, T', latent_dim) where T' = seq / (stride^down_t)
+            # mu shape: (bs, T', latent_dim) - deterministic mean, used as local RAG tokens
             # h_cls shape: (bs, ...) - global semantic features
             z_local, mu, logvar, h_cls = net.encode(pose)
-            
+
             # Process each sample in the batch individually
             for i in range(bs):
                 # Extract local latent for sample i
                 # z_local[i] shape: (T', latent_dim)
                 z_local_i = z_local[i:i+1]  # (1, T', latent_dim) - keep time dim for cat
-                
+
                 # Squeeze batch dimension: (1, T', latent_dim) → (T', latent_dim)
                 z_local_i = z_local_i.squeeze(0)  # (T', latent_dim)
-                
+
                 # Append reference end latent along time dimension
                 # reference_end_latent: (1, latent_dim)
                 # z_local_i: (T', latent_dim)
                 latent = torch.cat([z_local_i, reference_end_latent], dim=0)  # (T'+1, latent_dim)
                 latent_np = latent.cpu().detach().numpy()
-                
+
                 # Save local latent (z_local + reference)
                 sample_name = name[i] if isinstance(name, (list, tuple)) else name
                 latent_save_path = pjoin(args.latent_dir, sample_name + '.npy')
                 np.save(latent_save_path, latent_np)
-                
+
                 # Extract and save global semantic feature (h_cls)
                 # h_cls[i] shape depends on model architecture; typically (h_cls_dim,)
                 h_cls_i = h_cls[i].cpu().detach().numpy()
                 h_cls_save_path = pjoin(args.h_cls_dir, sample_name + '.npy')
                 np.save(h_cls_save_path, h_cls_i)
-                
+
+                # Extract and save deterministic mu latent (for local RAG tokens)
+                # mu[i]: (T', latent_dim) — deterministic, no noise, no end token needed
+                mu_i = mu[i].cpu().detach().numpy()
+                mu_save_path = pjoin(args.mu_latent_dir, sample_name + '.npy')
+                np.save(mu_save_path, mu_i)
+
                 processed_count += 1
-            
+
         except Exception as e:
             logger.warning(f"Error processing batch: {str(e)}")
             skipped_count += bs
@@ -170,5 +185,6 @@ logger.info(f"Processed: {processed_count} samples")
 logger.info(f"Skipped: {skipped_count} samples")
 logger.info(f"Local latent (z_local) saved to: {args.latent_dir}")
 logger.info(f"Global semantic (h_cls) saved to: {args.h_cls_dir}")
+logger.info(f"Mu latent (deterministic) saved to: {args.mu_latent_dir}")
 logger.info(f"Reference latent: {ref_latent_path}")
 logger.info("")
