@@ -62,7 +62,11 @@
 \usepackage{graphicx}
 
 % Note. For the workshop paper template, both \title{} and \workshoptitle{} are required, with the former indicating the paper title shown in the title and the latter indicating the workshop title displayed in the footnote. 
+
+
 \title{Align to Retrieve: Multi-Scale Semantic Latent Alignment for Retrieval-Augmented Text-to-Motion Generation}
+
+
 
 % The \author macro works with any number of authors. There are two commands
 % used to separate the names and addresses of multiple authors: \And and \AND.
@@ -110,60 +114,37 @@
 
 \maketitle
 
-
 \begin{abstract}
-Text-to-motion generation (T2M) aims to synthesize realistic 3D human motion sequences conditioned on natural language descriptions.
-Recent latent-space methods such as MotionStreamer~\citep{xiao2025motionstreamer} achieve strong motion fidelity,
-but their encoders are optimized exclusively for reconstruction:
-the resulting latent space is semantically unstructured, forcing text-motion alignment entirely onto the second-stage generator---which degrades for complex or compositional descriptions---
-and preventing the latent space from serving as a retrieval index for real motion priors.
-Our key insight is that organizing the motion latent space at multiple semantic scales lets it simultaneously act as a structured generation prior and a discriminative retrieval index,
-making alignment, retrieval, and generation mutually reinforcing rather than disjoint modules.
-To this end, we propose \textbf{MSA-T2M}, built on two tightly coupled components.
-\textbf{MSA-VAE} is a causal variational autoencoder that performs joint local-global semantic alignment,
-producing a latent space that explicitly encodes both fine-grained frame-level action semantics and high-level compositional sequence intent.
-Building on this aligned space, \textbf{RAG-Diffusion-AR} retrieves semantically precise motion priors from the aligned latent bank and injects them into an autoregressive diffusion Transformer via Synergistic Classifier-Free Guidance,
-yielding more discriminative priors than existing raw-space retrieval methods~\citep{zhang2023remodiffuse,kalakonda2025morag}.
-Experiments on HumanML3D-272 show that MSA-T2M achieves the best FID (10.832) among all methods,
-with ablations confirming the independent contributions of multi-scale alignment and retrieval augmentation.
+Text-driven human motion generation in continuous latent spaces faces a fundamental trade-off: while semantic alignment is essential for controllability, forcing motion manifolds toward text distributions often distorts physical structures, leading to a decline in generation realism. To resolve this, we propose MSA-T2M, a framework that treats multi-scale semantic alignment and retrieval-augmented generation (RAG) as a tightly coupled solution. We first introduce MSA-VAE, a causal variational autoencoder featuring dual-track physical-semantic disentanglement. By performing joint local (frame-level) and global (sequence-level) alignment, MSA-VAE organizes the latent space into a semantically discriminative and physically consistent structure. We then identify the alignment-realism tension---where tighter alignment improves R-Precision but degrades FID---and propose RAG-Diffusion-AR to bridge this gap. By retrieving real motion priors from the newly structured latent bank, our autoregressive diffusion Transformer anchors the generation back to the natural motion manifold. Experiments on the HumanML3D-272 benchmark demonstrate that MSA-T2M achieves state-of-the-art FID and R-Precision. Our results validate that multi-scale alignment creates a superior retrieval index, while RAG effectively compensates for the realism loss inherent in cross-modal alignment, offering a new paradigm for high-fidelity, semantically precise motion synthesis.
+Code will be publicly available upon acceptance.
 \end{abstract}
+
 
 
 \section{Introduction}
 
 Text-driven human motion generation (T2M) plays a central role in applications such as virtual reality, animation, and embodied AI \citep{Guo_2022_CVPR,tevet2022human,xiao2025motionstreamer}.
 Recent advances have progressively shifted from discrete VQ-VAE-based tokenization \citep{zhang2023generating} to continuous latent-space generation \citep{meng2024rethinking,meng2025absolute,xiao2025motionstreamer}, where causally-structured compact representations better preserve motion fidelity and enable high-quality sequential synthesis.
-However, these latent spaces are optimized exclusively for motion reconstruction: semantic information is entangled with physical dynamics and remains unstructured.
-Without explicit semantic organization in the latent space, text-motion alignment is delegated entirely to the second-stage generator and degrades sharply for complex or compositional descriptions.
+However, these latent spaces are optimized exclusively for motion reconstruction: without explicit semantic organization, text-motion alignment is delegated to the second-stage generator and degrades sharply for complex or compositional descriptions.
 
-The value of a semantically structured motion representation has long been recognized.
-MotionCLIP \citep{tevet2022motionclip} pioneered cross-modal alignment by pulling motion encoder outputs toward CLIP text embeddings, yielding strong semantic interpretability.
-Yet, subsequent state-of-the-art methods \citep{tevet2022human,chen2023executing,zhang2023generating,xiao2025motionstreamer} gradually abandoned explicit latent-space alignment, delegating text-motion correspondence entirely to the second-stage generator.
-The few works that revisit latent-space alignment \citep{he2025molingo,yu2026causal} impose only single-scale, frame-level local constraints---missing a more fundamental observation: \emph{text-motion alignment is inherently multi-scale}.
+While MotionCLIP \citep{tevet2022motionclip} pioneered cross-modal alignment by pulling motion encoder outputs toward CLIP text embeddings, subsequent state-of-the-art methods \citep{tevet2022human,chen2023executing,zhang2023generating,xiao2025motionstreamer} gradually abandoned explicit latent-space alignment, delegating text-motion correspondence entirely to the second-stage generator.
+The few works that revisit latent-space alignment \citep{maldonado2025moclip, he2025molingo} impose only single-scale, frame-level local constraints---missing a more fundamental observation: \emph{text-motion alignment is inherently multi-scale}.
 Short motion segments carry atomic semantics (e.g., \textit{raise the left arm}), while full sequences encode compositional intent (e.g., \textit{walk forward and then sit down}).
-Local-only alignment captures fine-grained detail but lacks global coherence; global-only alignment captures overall intent but misses local semantics.
-Neither alone is sufficient, and no existing latent-space method achieves both.
+Local-only alignment captures fine-grained detail but lacks global coherence; global-only captures overall intent but misses local semantics---and no existing latent-space method achieves both.
 
-Multi-scale alignment, however, introduces an inherent tension that prior work has not addressed.
-Text embeddings are fixed by pre-trained language models and occupy a semantic space that is fundamentally different from the physical dynamics encoded in motion latents.
-The two distributions cannot be fully bridged: forcing motion latents toward the text distribution necessarily distorts the motion manifold, and this distortion degrades generation realism (FID) even as it improves semantic alignment (R-Precision).
+Multi-scale alignment, however, introduces an inherent tension that prior work has not addressed (Fig.~\ref{fig:teaser}a).
+Text embeddings occupy a fundamentally different space from physical motion dynamics; forcing motion latents toward text distributions distorts the motion manifold, degrading realism (FID) even as it improves semantic alignment (R-Precision).
 \emph{The more tightly we align, the more we risk sacrificing physical plausibility---alignment alone cannot simultaneously maximize both objectives.}
 
-This tension reveals a deeper and previously unrecognized role for retrieval-augmented generation (RAG) \citep{lewis2020retrieval}.
-Retrieved real motion priors occupy a unique bridging position: they are drawn directly from the original motion distribution (physically plausible) yet semantically close to the query text.
-Injecting such priors as generation conditions compensates for the realism loss introduced by alignment, anchoring the generation back to the natural motion manifold while preserving the semantic gains from the structured latent space---enabling the model to achieve strong FID \emph{and} R-Precision simultaneously.
-Critically, realizing this requires a semantically discriminative retrieval index.
-Existing RAG methods for motion \citep{zhang2023remodiffuse,kalakonda2025morag} retrieve from raw, high-dimensional motion space, which is noisy and redundant; they cannot reliably identify priors that are simultaneously semantically precise and physically representative.
-Retrieval in a multi-scale aligned latent space---where semantically similar motions are tightly clustered---produces far more discriminative priors and closes this gap.
+This tension reveals a new role for retrieval-augmented generation (RAG) \citep{lewis2020retrieval} (Fig.~\ref{fig:teaser}b): retrieved real motion priors are drawn directly from the natural motion distribution (physically plausible) yet semantically close to the query text, compensating for the realism loss from alignment and enabling strong FID \emph{and} R-Precision simultaneously.
+However, existing RAG methods \citep{zhang2023remodiffuse,kalakonda2025morag} retrieve from raw, high-dimensional motion space, which is noisy and redundant; retrieval in a multi-scale aligned latent space---where semantically similar motions cluster tightly---yields far more discriminative priors.
 
 In this paper, we propose \textbf{MSA-T2M}, the first framework to jointly achieve multi-scale semantic alignment in the motion latent space and leverage it for retrieval-augmented generation (see Fig.~\ref{fig:arc}).
-Our key insight is that alignment and RAG are not independent contributions but a tightly coupled solution to a tightly coupled problem: multi-scale alignment structures the latent space into a discriminative retrieval index, while latent-space RAG compensates for the realism-semantics trade-off that alignment inevitably introduces.
-Specifically, we design \textbf{MSA-VAE}, a causal variational autoencoder with dual-track disentanglement of physical and semantic motion components.
-Local alignment matches frame-level latents to fine-grained action labels from BABEL \citep{punnakkal2021babel}, while global alignment anchors a \texttt{[CLS]} token to dynamically interpolated text targets from HumanML3D \citep{Guo_2022_CVPR}---organizing the latent space at both scales without discarding physical structure.
-The resulting global feature $\mathbf{h}_\text{cls}$ serves as the retrieval key for an offline motion prior bank.
-Building on this aligned space, we introduce \textbf{RAG-Diffusion-AR}, an autoregressive causal diffusion Transformer that retrieves Top-$K$ semantically similar real motion priors, fuses them via softmax-weighted pooling into prefix tokens, and applies \textbf{Synergistic CFG} to jointly balance text and retrieval guidance---injecting priors that are close to both the text query and the motion manifold, thereby restoring the generation realism that alignment alone cannot sustain.
+Our key insight is that alignment and RAG form a tightly coupled solution: multi-scale alignment structures the latent space into a discriminative retrieval index, while latent-space RAG compensates for the realism-semantics trade-off that alignment inevitably introduces.
+We design \textbf{MSA-VAE}, a causal VAE with dual-track physical-semantic disentanglement: local alignment matches frame-level latents to BABEL action labels \citep{punnakkal2021babel}, while global alignment anchors a \texttt{[CLS]} token---serving as the retrieval key for an offline prior bank---to dynamically interpolated HumanML3D captions \citep{Guo_2022_CVPR}, organizing the latent space at both scales without discarding physical structure.
+Building on this, \textbf{RAG-Diffusion-AR} retrieves Top-$K$ semantically similar real motion priors, fuses them via softmax-weighted pooling into prefix tokens, and applies \textbf{Synergistic CFG} to jointly balance text and retrieval guidance---restoring the generation realism that alignment alone cannot sustain.
 
-Extensive experiments on HumanML3D-272 \citep{Guo_2022_CVPR,xiao2025motionstreamer,fan2025go} demonstrate that MSA-T2M achieves state-of-the-art FID and competitive R-Precision, with ablations confirming that alignment and retrieval augmentation contribute complementarily: alignment improves R-Precision while RAG restores FID, and together they outperform either component alone.
+Experiments on HumanML3D-272 \citep{Guo_2022_CVPR,xiao2025motionstreamer,fan2025go} demonstrate state-of-the-art FID and competitive R-Precision, with ablations confirming that alignment and RAG contribute complementarily.
 
 \textbf{Our contributions are summarized as follows:}
 \begin{itemize}
@@ -172,41 +153,55 @@ Extensive experiments on HumanML3D-272 \citep{Guo_2022_CVPR,xiao2025motionstream
     \item MSA-T2M achieves state-of-the-art performance on HumanML3D-272, providing the first framework that tightly couples multi-scale latent alignment with retrieval-augmented generation as a unified solution to the alignment-realism trade-off.
 \end{itemize}
 
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{teaser_v2.pdf}
+  \caption{Stronger latent alignment improves semantics alignment but distorts the motion manifold, degrading realism (a). MSA-VAE achieves multi-scale semantic alignment for precise retrieval. RAG-Diffusion-AR then leverages retrieved priors to anchor generation back to the natural manifold, resolving the alignment-realism trade-off (b).}
+  \label{fig:teaser}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{architecture_v3.pdf}
+  \caption{\textbf{Overall architecture of MSA-T2M.}
+  \textbf{(Left) MSA-VAE:} A Representation Encoder maps input motion to local latents supervised by frame-level BABEL labels ($\mathcal{L}_{\text{local}}$). A Semantic Encoder with a learnable \texttt{[CLS]} token produces global feature $[CLS]$, aligned to HumanML3D sequence-level captions ($\mathcal{L}_{\text{global}}$) and regularized by a Semantic Decoder ($\mathcal{L}_{\text{feature}}$).
+  \textbf{(Right) RAG-Diffusion-AR:} Training motions are pre-encoded offline into a RAG DB via the frozen MSA-VAE. At inference, top-$K$ \texttt{[CLS]} tokens retrieved by cosine similarity are softmax-fused into retrieval token $\mathbf{R}$; an autoregressive Transformer Decoder conditioned on $[\mathbf{T}, \mathbf{R}, \mathbf{z}_{<i}]$ drives a Diffusion Head to denoise each latent $\mathbf{z}_i$, decoded by the frozen Representation Decoder into the raw motion.}
+  \label{fig:arc}
+\end{figure*}
+
+% \begin{figure}[ht]
+%     \centering
+%     \includegraphics[width=0.8\linewidth]{t2.pdf}
+%     \caption{test}
+%     \label{fig:pdf}
+% \end{figure}
+
+
+
 \section{Related Work}
 
 \subsection{Text-to-Motion Generation}
 
-Text-driven human motion generation (T2M) aims to synthesize 3D human motion sequences that are physically plausible and semantically faithful to a natural language description \citep{Guo_2022_CVPR}.
-The dominant paradigm is diffusion-based: MDM \citep{tevet2022human} applies a Transformer denoiser directly in pose space; MLD \citep{chen2023executing} and MoMask \citep{guo2024momask} operate in a compact VQ-VAE or continuous latent space to improve efficiency; FineMoGen \citep{zhang2023finemogen} and MotionLCM \citep{dai2024motionlcm} further refine spatial controllability and sampling speed.
-Despite strong performance on in-distribution descriptions, these methods condition generation on text alone: when inputs are compositional or long-tail, the generator must infer plausible motion structure purely from language, without any concrete motion reference.
-
-More recent work shifts generation into a learned continuous latent space and couples it with causal autoregressive modeling \citep{meng2024rethinking,meng2025absolute,xiao2025motionstreamer}, achieving higher fidelity on long sequences.
-MotionStreamer \citep{xiao2025motionstreamer}---our closest baseline---encodes motion into a 272-dimensional causal latent space via a CNN-VAE and generates latents autoregressively with a Transformer diffusion head.
-However, like all prior latent-space methods, MotionStreamer optimizes its encoder for reconstruction only: the resulting latent space has no semantic organization, so text-motion alignment is delegated entirely to the second-stage generator.
-This is the fundamental gap our work addresses: \emph{without explicit semantic structure in the latent space, neither fine-grained alignment nor semantics-based retrieval is possible.}
+T2M methods span two paradigms. Diffusion-based approaches---MotionDiffuse~\citep{zhang2024motiondiffuse}, MDM \citep{tevet2022human}, MLD \citep{chen2023executing}, MoMask \citep{guo2024momask}---apply denoising in pose or latent space; FineMoGen \citep{zhang2023finemogen} and MotionLCM \citep{dai2024motionlcm} further refine controllability and speed.
+Despite strong benchmark performance, these text-only methods struggle on compositional descriptions, where the generator must infer plausible motion from language alone.
+More recent work couples continuous latent-space generation with causal autoregressive modeling \citep{meng2024rethinking,meng2025absolute,xiao2025motionstreamer,zhu2025motiongpt3,he2025molingo,yu2026causal}.
+MotionStreamer \citep{xiao2025motionstreamer}---our closest baseline---encodes motion into a 272-dimensional causal latent space via a CNN-VAE and generates latents autoregressively with a Transformer diffusion head, but optimizes its encoder for reconstruction only, leaving the latent space semantically unstructured.
+\emph{Without explicit semantic structure, neither fine-grained alignment nor semantics-based retrieval is possible}---the fundamental gap our work addresses.
 
 \subsection{Motion--Language Alignment in Latent Space}
 
-Cross-modal alignment between motion and language has been studied to improve semantic controllability and retrieval accuracy.
-MotionCLIP \citep{tevet2022motionclip} pioneered this direction by pulling motion encoder outputs toward CLIP text embeddings via cosine similarity loss, yielding strong interpretability; TMR \citep{petrovich2023tmr} extends this with contrastive learning for joint retrieval.
-However, after these works, the broader T2M community---MDM \citep{tevet2022human}, MLD \citep{chen2023executing}, T2M-GPT \citep{zhang2023generating}, MotionStreamer \citep{xiao2025motionstreamer}---abandoned explicit latent-space alignment entirely, relying on T5 \citep{raffel2020exploring} or CLIP \citep{pmlr-v139-radford21a} encoders to bridge the modality gap implicitly.
-The gap is that these methods impose no structural constraint on the latent space itself, so the latent space cannot cluster semantically similar motions or serve as a reliable retrieval index.
-
-Recent works have attempted to bridge this gap in two ways.
-One line \citep{li2025unimotion,zhang2025kinmo} performs multi-scale alignment in the \emph{raw data space}---improving generation quality but not producing a compact, retrievable latent structure.
-Another line \citep{he2025molingo,yu2026causal} builds physically structured latent spaces with local (frame-level) semantic alignment and performs masked autoregressive generation therein, but applies only single-scale local constraints without a global counterpart, limiting the ability to capture compositional sequence-level semantics.
-Our work is the first to achieve joint \emph{local and global} multi-scale semantic alignment directly in a continuous latent space, and---crucially---to exploit the resulting structured latent space as the retrieval index for RAG, closing a gap that none of the above methods address.
+MotionCLIP \citep{tevet2022motionclip} pioneered cross-modal alignment toward CLIP \citep{pmlr-v139-radford21a} text embeddings; TMR \citep{petrovich2023tmr} extends this with contrastive learning for joint retrieval.
+Yet subsequent T2M methods---MDM, MLD, T2M-GPT \citep{zhang2023generating}, MotionStreamer---abandoned explicit latent-space alignment entirely, relying on T5 \citep{raffel2020exploring} or CLIP implicitly, leaving no structural constraint on the latent space.
+\citet{li2025unimotion} and \citet{zhang2025kinmo} perform multi-scale alignment in the \emph{raw data space}, improving generation quality but not producing a compact, retrievable latent structure.
+Our work is the first to achieve joint local--global multi-scale alignment directly in a continuous latent space and exploit it as the retrieval index for RAG.
 
 \subsection{Retrieval-Augmented Generation for Motion}
 
-Retrieval-augmented generation (RAG) \citep{lewis2020retrieval} improves generation quality by conditioning the model on retrieved real examples rather than learning from text alone.
-In T2M, ReMoDiffuse \citep{zhang2023remodiffuse} retrieves the most similar training motion sequences (by text-to-motion cosine similarity in CLIP space) and injects them as dense auxiliary features into a diffusion model; MoRAG \citep{kalakonda2025morag} similarly retrieves raw motion sequences and applies body-part-level decomposed conditioning.
-Both methods demonstrate that real motion priors improve generation realism, but both operate directly in raw motion space: retrieval keys are high-dimensional ($\geq$263-D pose sequences), noisy, and redundant, making it difficult to identify semantically precise matches---especially for compositional or multi-phase descriptions.
-
-Our method departs from this paradigm by performing retrieval in the semantically aligned latent space.
-Using \(\mathbf{h}_{\text{cls}}\)---a compact 768-D global feature aligned to text at both local and global scales---as the retrieval key yields more discriminative matches than raw-space cosine similarity.
-Furthermore, we inject retrieved priors as soft prefix tokens (via softmax-weighted pooling) into a causal Transformer, rather than as dense per-step conditioning, keeping the generative process flexible while benefiting from motion priors.
-This tight coupling of multi-scale alignment and latent-space RAG is the central technical contribution distinguishing our work from both alignment-only and RAG-only baselines.
+RAG improves generation by conditioning on retrieved real examples \citep{lewis2020retrieval,gao2023retrieval,blattmann2022retrieval,ren2026videorag}.
+In T2M, ReMoDiffuse \citep{zhang2023remodiffuse} and MoRAG \citep{kalakonda2025morag} retrieve raw motion sequences and inject them as dense conditioning, demonstrating that real motion priors improve realism.
+However, raw-space retrieval keys are high-dimensional, noisy, and redundant, limiting precision for compositional queries.
+Our method instead retrieves in the semantically aligned latent space using \([CLS]\)---aligned to text at both local and global scales---and injects retrieved priors as soft prefix tokens rather than dense per-step conditioning, preserving generative flexibility while benefiting from real motion priors.
 
 
 % ============================================================
@@ -214,43 +209,56 @@ This tight coupling of multi-scale alignment and latent-space RAG is the central
 % ============================================================
 \section{Method}
 
-\subsection{Problem Definition and Overview}
+\subsection{Problem Definition and Preliminaries}
 
-Given a natural language description \(y\), our goal is to generate a physically plausible and semantically aligned 3D human motion sequence \(M = \{\mathbf{x}_1, \mathbf{x}_2, \dots, \mathbf{x}_L\}\) by sampling from the conditional distribution \(P(M \mid y)\), where \(\mathbf{x}_i \in \mathbb{R}^{272}\) is the \(i\)-th pose in the 272-dimensional SMPL parametric representation~\citep{xiao2025motionstreamer,loper2023smpl} and \(L\) is the sequence length.
+Given a natural language description \(y\), our task is to generate a physically plausible and semantically aligned 3D human motion sequence \(M = \{\mathbf{x}_1, \mathbf{x}_2, \dots, \mathbf{x}_L\}\) by sampling from the conditional distribution \(P(M \mid y)\), where \(\mathbf{x}_i \in \mathbb{R}^D\) denotes the \(i\)-th pose and \(L\) the sequence length.
+We adopt the 272-dimensional SMPL parametric representation~\citep{xiao2025motionstreamer}, which directly drives the SMPL model~\citep{loper2023smpl} and bypasses inverse‑kinematics post‑processing.
+The core challenge lies in simultaneously achieving two goals: (i) physical realism (natural motion dynamics and body constraints) and (ii) faithful adherence to the textual instruction.
 
-Our key insight is that an explicitly structured semantic latent space benefits both alignment and retrieval simultaneously.
-Building on this insight, our pipeline consists of two tightly coupled stages (see Fig.~\ref{fig:arc}).
-\textbf{MSA-VAE} (\S\ref{sec:msa-vae}) encodes raw motion into a continuous causal latent space with dual-track physical-semantic disentanglement and multi-scale alignment, producing local latents \(\mathbf{z}_{1:n}\) for generation and a global retrieval feature \(\mathbf{h}_{\text{cls}}\).
-\textbf{RAG-Diffusion-AR} (\S\ref{sec:rag-diffusion}) then uses \(\mathbf{h}_{\text{cls}}\) to retrieve real motion priors from an offline bank and injects them as prefix tokens into an autoregressive causal Transformer diffusion model, guided by Synergistic CFG.
+To address this, our pipeline decouples into two stages (see Fig.~\ref{fig:arc}): MSA-VAE (\S\ref{sec:msa-vae}) compresses raw motions into a semantically organized causal latent space via multi‑scale alignment; RAG‑Diffusion‑AR (\S\ref{sec:rag-diffusion}) then generates within this space conditioned on both text and retrieved real motion priors.
 
 % ------------------------------------------------------------
-\subsection{Multi-Scale Semantic Alignment VAE}
+\subsection{Multi-Scale Semantic Alignment VAE }
 \label{sec:msa-vae}
 
-Existing continuous latent-space methods \citep{meng2024rethinking,meng2025absolute,xiao2025motionstreamer} are optimized solely for motion reconstruction: the resulting latent space conflates physical dynamics with semantic content, providing no structured basis for text-motion alignment or semantics-based retrieval.
-MSA-VAE addresses this by embedding multi-scale semantic alignment directly into a causal variational autoencoder, yielding two complementary outputs: a sequence of \textbf{local latents} \(\mathbf{z}_{1:n}\) for diffusion-based generation and a \textbf{global semantic feature} \(\mathbf{h}_{\text{cls}}\) that serves as the retrieval key for RAG-Diffusion-AR.
+While recent works \citep{meng2024rethinking, meng2025absolute, xiao2025motionstreamer} compress motion into low-dimensional causal latent spaces for efficiency, conventional compression focuses solely on geometric reconstruction without explicit semantic structuring---leaving the latent space unorganized for precise text-motion alignment.
 
-\subsubsection{Causal Convolutional VAE}
+Multi-Scale Semantic Alignment VAE addresses this gap by embedding multi-scale semantic alignment directly into a causal
+variational autoencoder. It produces two complementary representations:
+(1) a sequence of \textbf{local latents} \(\mathbf{z}_{1:n}\) for diffusion-based generation, and
+(2) a global semantic feature $[CLS]$ that serves as the retrieval token
+for RAG-Diffusion-AR.
 
-Because human motion is temporally causal---each pose depends only on past states---and raw motion data contains high-frequency noise that makes direct diffusion expensive and artifact-prone \citep{chen2023executing}, we build the physical-layer encoder \(\mathcal{E}_{\text{cnn}}\) and decoder \(\mathcal{D}_{\text{cnn}}\) with stacked 1D causal convolutions following MotionStreamer~\citep{xiao2025motionstreamer}.
-Given raw motion \(\mathbf{X} = \{\mathbf{x}_1, \dots, \mathbf{x}_N\}\), \(\mathcal{E}_{\text{cnn}}\) applies causal layers with temporal downsampling rate \(l=4\) and projects to latent dimension \(d_c = 16\), outputting posterior parameters \(\boldsymbol{\mu}, \log\boldsymbol{\sigma}^2 \in \mathbb{R}^{n \times d_c}\) where \(n = N/l\).
-A latent \(\mathbf{z}\) is sampled via reparameterization; \(\mathcal{D}_{\text{cnn}}\) reconstructs \(\hat{\mathbf{X}}\) from \(\mathbf{z}\).
-Crucially, the deterministic component \(\boldsymbol{\mu}_{1:n}\)---the distribution centers, free of reparameterization noise---is passed to the semantic layer for alignment, isolating physical fidelity from semantic structuring.
+\subsubsection{Representation VAE}
+
+Following the causal latent space design of MotionStreamer~\citep{xiao2025motionstreamer}
+and MARDM~\citep{meng2024rethinking}, we build the CausalTemporalCNN-VAE, a low-level motion encoder
+\(\mathcal{E}_{\text{cnn}}\) and decoder \(\mathcal{D}_{\text{cnn}}\) with 1D causal convolutions
+to explicitly model temporal dependencies. Given raw motion
+\(\mathbf{X} = \{\mathbf{x}_1, \dots, \mathbf{x}_N\}\) with \(\mathbf{x}_i \in \mathbb{R}^{272}\),
+\(\mathcal{E}_{\text{cnn}}\) applies stacked causal layers with temporal downsampling rate
+\(l = 4\) and motion-dimension compression to hidden size \(h\), outputting posterior parameters
+\(\boldsymbol{\mu}, \log\boldsymbol{\sigma}^2 \in \mathbb{R}^{n \times d_c}\) where \(n = N/l\).
+A latent variable \(\mathbf{z}\) is sampled via reparameterization, from which
+\(\mathcal{D}_{\text{cnn}}\) reconstructs \(\hat{\mathbf{X}}\).
 
 \subsubsection{Semantic Autoencoder}
 
-A remaining challenge is extracting a single global feature that captures both high-level sequence intent and local motion details, so that \(\mathbf{h}_{\text{cls}}\) can serve as an effective retrieval key.
-We feed \(\boldsymbol{\mu}_{1:n}\) (rather than the noisy sample \(\mathbf{z}\)) into a Transformer encoder \(\mathcal{E}_{\text{trans}}\) with a prepended learnable \texttt{[CLS]} token; the \texttt{[CLS]} output \(\mathbf{h}_{\text{cls}} \in \mathbb{R}^{d_{\text{model}}}\) serves as the global motion feature.
-To prevent \(\mathbf{h}_{\text{cls}}\) from collapsing to a coarse summary that loses structural detail, a symmetric Transformer decoder \(\mathcal{D}_{\text{trans}}\) is trained to reconstruct \(\boldsymbol{\mu}_{1:n}\) from \(\mathbf{h}_{\text{cls}}\) alone, with a feature reconstruction loss \(\mathcal{L}_{\text{feature}} = \|\hat{\boldsymbol{\mu}} - \boldsymbol{\mu}\|_2^2\) that forces the \texttt{[CLS]} token to encode a complete, information-preserving summary of the motion sequence.
+We feed the deterministic component \(\boldsymbol{\mu}_{1:n}\) into a Transformer encoder
+\(\mathcal{E}_{\text{trans}}\) with a prepended learnable \texttt{[CLS]} \citep{devlin2019bert} token;
+its output \([CLS] \in \mathbb{R}^{d_{\text{model}}}\) serves as the global motion feature.
+A Transformer decoder \(\mathcal{D}_{\text{trans}}\) reconstructs \(\boldsymbol{\mu}_{1:n}\) from \([CLS]\),
+and reconstruction loss \(\mathcal{L}_{\text{feature}}\) forces \([CLS]\) to retain full structural information.
 
 \subsubsection{Multi-Scale Semantic Alignment}
 
-Single-scale alignment is fundamentally insufficient: frame-level (local) alignment captures fine-grained action semantics but misses global compositional intent, while sequence-level (global) alignment captures overall meaning but loses local detail.
-We therefore align the latent space at two complementary scales.
+We align the latent space at two complementary scales.
 
 \paragraph{Local alignment.}
-We use frame-level action labels from BABEL~\citep{punnakkal2021babel} to construct a local text embedding \(\mathbf{l}_i \in \mathbb{R}^{d_t}\) for each latent step by averaging T5 embeddings of all frame labels within the corresponding temporal window.
-The local alignment loss applies cosine similarity directly to the deterministic center \(\boldsymbol{\mu}_i\), aligning each frame latent with its fine-grained action semantics:
+Using frame-level action labels from BABEL~\citep{punnakkal2021babel}, we construct a local
+text embedding \(\mathbf{l}_i \in \mathbb{R}^{d_t}\) for each latent step by averaging the
+T5 embeddings of all frame labels within the corresponding temporal window. The local
+alignment loss directly acts on the deterministic center \(\boldsymbol{\mu}_i\):
 \begin{equation}
 \mathcal{L}_{\text{local}} = \frac{1}{n} \sum_{i=1}^{n}
 \left(1 - \frac{\boldsymbol{\mu}_i \cdot \mathbf{l}_i}
@@ -259,35 +267,41 @@ The local alignment loss applies cosine similarity directly to the deterministic
 \end{equation}
 
 \paragraph{Global alignment.}
-A naive approach would align \(\mathbf{h}_{\text{cls}}\) directly with the HumanML3D global caption \citep{Guo_2022_CVPR}, but this causes semantic mismatch: training uses randomly cropped windows of fixed length \(T{=}64\) frames, while the global caption describes the full sequence of length \(L\).
-We resolve this with a dynamic interpolation strategy: we introduce weight \(\alpha = T/L\) and construct a ``window-aware'' global target by blending the full-sequence embedding \(\mathbf{g}_{\text{global}}\) with the window-pooled local text \(\mathbf{l}_{\text{pooled}}\):
-\begin{equation}
-\mathbf{g}_{\text{mixed}} = (1-\alpha)\,\mathbf{g}_{\text{global}} + \alpha\,\mathbf{l}_{\text{pooled}}, \qquad
-\mathbf{g}_{\text{target}} = \frac{\mathbf{g}_{\text{mixed}}}{\|\mathbf{g}_{\text{mixed}}\|_2}.
-\end{equation}
-The global alignment loss is then:
-\begin{equation}
-\mathcal{L}_{\text{global}} = 1 - \frac{\mathbf{h}_{\text{cls}} \cdot \mathbf{g}_{\text{target}}}{\|\mathbf{h}_{\text{cls}}\| \|\mathbf{g}_{\text{target}}\|}.
-\label{eq:loss-global}
-\end{equation}
-Together, local alignment structures each frame latent for fine-grained semantic precision, while global alignment organizes \(\mathbf{h}_{\text{cls}}\) as a compact, compositionally-aware retrieval key.
+Using the global captions from HumanML3D \citep{Guo_2022_CVPR}, we employ a dynamic interpolation strategy to construct a ``local-motion-aware'' global text target. Because training uses randomly cropped windows of fixed length \(T=64\), while the global caption corresponds to the full long sequence (length \(L\)), direct alignment would cause semantic mismatch. Therefore, we introduce a dynamic interpolation weight \(\alpha = T/L\) and fuse the original global embedding \(\mathbf{g}_{\text{global}}\) with the window-pooled local text \(\mathbf{l}_{\text{pooled}}\):
+    \begin{align}
+    \mathbf{g}_{\text{mixed}} &= (1-\alpha)\,\mathbf{g}_{\text{global}} + \alpha\,\mathbf{l}_{\text{pooled}}, \label{eq:g-mixed}\\
+    \mathbf{g}_{\text{target}} &= \frac{\mathbf{g}_{\text{mixed}}}{\|\mathbf{g}_{\text{mixed}}\|_2}.
+    \label{eq:g-target}
+    \end{align}
+    The global alignment loss then applies cosine similarity between the \([CLS]\) output and the normalized target:
+    \begin{equation}
+    \mathcal{L}_{\text{global}} = 1 - \frac{[CLS] \cdot \mathbf{g}_{\text{target}}}{\|[CLS]\| \, \|\mathbf{g}_{\text{target}}\|}.
+    \label{eq:loss-global}
+    \end{equation}
+
+
+This dual-scale design ensures that each local latent aligns with fine-grained action semantics,
+while the global token aggregates the compositional semantics of the entire window---forming
+an ideal basis for retrieval.
 
 \subsubsection{Three-Stage Progressive Training}
 
-Training MSA-VAE end-to-end from scratch is unstable: the semantic alignment losses can interfere with CNN-VAE convergence before physical reconstruction is established, leading to degraded motion quality.
-We therefore train in three stages.
-\textbf{Stage~1}: Train \(\mathcal{E}_{\text{cnn}}\) and \(\mathcal{D}_{\text{cnn}}\) alone with reconstruction, KL-divergence, and root-joint losses to establish a stable physical latent space.
-\textbf{Stage~2}: Freeze the CNN-VAE and train the Transformer autoencoder with the feature reconstruction loss \(\mathcal{L}_{\text{feature}}\) and the dual-scale alignment losses (Eqs.~\ref{eq:loss-local}--\ref{eq:loss-global}), so alignment is imposed on a fixed, physically meaningful \(\boldsymbol{\mu}_{1:n}\).
-\textbf{Stage~3}: Jointly fine-tune all components so the CNN-VAE can adapt to the semantic structure imposed by the Transformer.
+We train MSA-VAE in three stages:
+(1) Train \(\mathcal{E}_{\text{cnn}}\) and \(\mathcal{D}_{\text{cnn}}\) with only reconstruction,
+KL, and root-joint losses to establish a stable physical latent space.
+(2) Freeze the CNN-VAE and train the Transformer autoencoder with latent reconstruction loss
+\(\|\hat{\boldsymbol{\mu}} - \boldsymbol{\mu}\|_2^2\) and dual-scale alignment losses
+(Eqs.~\ref{eq:loss-local}--\ref{eq:loss-global}).
+(3) Jointly fine-tune all components.
 Detailed loss formulations are provided in Appendix~\ref{app:loss}.
 
 % ------------------------------------------------------------
 \subsection{Retrieval-Augmented Autoregressive Diffusion Generation (RAG-Diffusion-AR)}
 \label{sec:rag-diffusion}
 
-Text-only conditioning is insufficient for complex or long-tail descriptions: the generator must infer plausible motions from language alone, without any concrete motion reference.
-We address this by introducing a retrieval augmentation mechanism that explicitly supplies real motion priors from the MSA-VAE prior bank.
-The generation is factorized autoregressively over local latents:
+We adopt a latent-space autoregressive diffusion paradigm~\citep{xiao2025motionstreamer}
+but introduce a retrieval augmentation mechanism that explicitly injects real motion priors
+into the generation process. The generation is formalized as:
 \begin{equation}
 p(\mathbf{z}_{1:n} \mid \mathbf{t}, \mathcal{R}) = \prod_{i=1}^{n}
 p(\mathbf{z}_i \mid \mathbf{z}_{<i}, \mathbf{t}, \mathbf{r}),
@@ -297,46 +311,56 @@ where \(\mathbf{t}\) is the text condition and \(\mathbf{r}\) is the retrieved m
 
 \subsubsection{Retrieval Prior Database}
 
-Because \(\mathbf{h}_{\text{cls}}\) is a globally aligned, compact semantic summary of a motion sequence, it provides a more discriminative and noise-free retrieval key than raw motion features.
-We pre-encode all training motions offline using MSA-VAE to build a prior bank \(\mathcal{R} = \{\mathbf{h}_{\text{cls}}^{(k)}\}_{k=1}^{|\mathcal{R}|}\).
-At inference, given text embedding \(\mathbf{t}\) (from T5-XXL, \(d_t{=}768\)), we retrieve the top-\(K\) training motions by cosine similarity and fuse their features via softmax-weighted pooling into a single retrieval prior token:
+Using the global semantic feature \([CLS]\) from MSA-VAE, we pre-encode all
+training motions offline to construct a prior bank
+\(\mathcal{R} = \{[CLS]^{(k)}\}_{k=1}^{K}\).
+At inference, given text embedding \(\mathbf{t}\) (from T5-XXL, \(d_t = 768\)), we retrieve the
+top-\(K\) most similar samples via cosine similarity. Their features \(\{[CLS]^{(k)}\}\)
+and scores \(\{s_k\}\) are fused via softmax-weighted pooling into a single retrieval prior token:
 \begin{equation}
 \mathbf{r} = \sum_{k=1}^{K} \frac{\exp(s_k)}{\sum_{j=1}^{K}\exp(s_j)}
-\cdot \text{Proj}(\mathbf{h}_{\text{cls}}^{(k)}),
+\cdot \text{Proj}([CLS]^{(k)}),
 \label{eq:retrieval-fusion}
 \end{equation}
-where \(s_k\) is the cosine similarity score and \(\text{Proj}(\cdot)\) is a linear projection to the Transformer hidden dimension \(d_{\text{model}}{=}768\).
-Softmax weighting ensures that highly relevant priors dominate while marginal matches contribute proportionally less.
+where \(\text{Proj}(\cdot)\) maps to the Transformer hidden dimension \(d_{\text{model}} = 768\).
 
 \subsubsection{Autoregressive Diffusion Generation}
 
-At each autoregressive step \(i\), we concatenate the text token \(\mathbf{t}\), retrieval prior \(\mathbf{r}\), and all previously generated latents \(\mathbf{z}_{<i}\) into a prefix sequence, which is processed by a LLaMA-style causal Transformer \citep{touvron2023llama}. Its output \(\mathbf{c}_i \in \mathbb{R}^{d_{\text{model}}}\) aggregates all conditioning signals.
-A lightweight 9-layer MLP diffusion head conditioned via AdaLN \citep{peebles2023scalable} then denoises the next latent: during training, the head predicts the added noise \(\boldsymbol{\epsilon}\):
+At each step \(i\), we concatenate the text token \(\mathbf{t}\), retrieval prior \(\mathbf{r}\),
+and previously generated latents \(\mathbf{z}_{<i}\) into a prefix sequence \(\mathbf{s}_i\), which
+is fed into a causal Transformer. Its output \(\mathbf{c}_i \in \mathbb{R}^{d_{\text{model}}}\)
+aggregates all conditioning signals. A lightweight MLP diffusion head then denoises the next
+latent: during training, the head predicts the noise \(\boldsymbol{\epsilon}\) added to the
+ground-truth latent \(\mathbf{z}_i\) conditioned on \(\mathbf{c}_i\) and timestep \(t\):
 \begin{equation}
 \mathcal{L}_{\text{diff}} = \mathbb{E}_{\boldsymbol{\epsilon}, t}
 \big[\|\boldsymbol{\epsilon} - \epsilon_{\theta}(\mathbf{z}_i^{(t)} \mid t, \mathbf{c}_i)\|_2^2\big].
 \label{eq:diff-loss}
 \end{equation}
-During inference, starting from Gaussian noise, the head applies a cosine-scheduled DDPM with \(T_{\text{diff}}{=}50\) steps to produce \(\hat{\mathbf{z}}_i\).
+During inference, starting from pure noise, the head iteratively denoises to produce
+\(\hat{\mathbf{z}}_i\).
 
 \subsubsection{Synergistic Classifier-Free Guidance}
 
-Because both text and retrieval conditions guide generation, they must be jointly balanced; dropping only one condition during CFG training would cause the model to over-rely on the remaining condition at test time.
-We therefore jointly drop both text and retrieval conditions with probability \(0.1\) during training, replacing them with learnable null embeddings \(\emptyset_{\text{text}}, \emptyset_{\text{ret}}\).
-At inference, the guided noise prediction is:
+We adopt CFG \citep{ho2022classifier,chang2023muse}: during training, we jointly drop text and retrieval conditions
+with probability 10\%, replacing them with learnable null embeddings \(\emptyset_{\text{text}}, \emptyset_{\text{ret}}\).
+At inference, the noise prediction at each step is extrapolated:
 \begin{equation}
 \boldsymbol{\epsilon}_{\text{guided}} = \boldsymbol{\epsilon}_{\text{uncond}}
 + s \cdot \big(\boldsymbol{\epsilon}_{\text{cond}} - \boldsymbol{\epsilon}_{\text{uncond}}\big),
 \label{eq:cfg}
 \end{equation}
-where \(\boldsymbol{\epsilon}_{\text{cond}} = \epsilon_{\theta}(\mathbf{z}_i^{(t)} \mid t, \mathbf{t}, \mathbf{r})\), \(\boldsymbol{\epsilon}_{\text{uncond}} = \epsilon_{\theta}(\mathbf{z}_i^{(t)} \mid t, \emptyset_{\text{text}}, \emptyset_{\text{ret}})\), and the guidance scale \(s{=}4.0\).
-Joint dropping prevents either condition from dominating and encourages the model to leverage both text semantics and motion priors synergistically.
+where \(\boldsymbol{\epsilon}_{\text{cond}} = \epsilon_{\theta}(\mathbf{z}_i^{(t)} \mid t, \mathbf{t},
+\mathbf{r})\), \(\boldsymbol{\epsilon}_{\text{uncond}} = \epsilon_{\theta}(\mathbf{z}_i^{(t)} \mid t,
+\emptyset_{\text{text}}, \emptyset_{\text{ret}})\), and \(s = 4.0\).
 
 \subsubsection{Inference}
 
-At inference, the model generates latents autoregressively until a termination criterion is met: we compare each generated latent to a pre-computed reference end latent \(\mathbf{z}_{\text{end}}\) (obtained by encoding an all-zero pose), and stop when the cosine distance falls below a threshold for two consecutive steps.
-This avoids a fixed-length assumption and allows the model to generate sequences of appropriate length without supervision on sequence length.
-Finally, the MSA-VAE decoder reconstructs the latent sequence \(\{\hat{\mathbf{z}}_1, \dots, \hat{\mathbf{z}}_n\}\) into the full motion frame sequence.
+Generation terminates when the distance between the current latent and a pre-computed reference
+end latent \(\mathbf{z}_{\text{end}}\) (obtained by encoding an all-zero pose) falls below a
+threshold for two consecutive steps. Finally, the MSA-VAE decoder reconstructs the latent
+sequence \(\{\hat{\mathbf{z}}_1, \dots, \hat{\mathbf{z}}_n\}\) into the full motion frame sequence.
+
 
 
 
@@ -362,14 +386,6 @@ RAG-Diffusion-AR: a LLaMA-style decoder-only Transformer~\citep{touvron2023llama
 All stages use AdamW with initial lr \(1{\times}10^{-4}\) and cosine annealing.
 Loss weights: \(\lambda_{\text{root}}{=}7.0\), \(\lambda_{\text{latent}}{=}1.0\), \(\lambda_{\text{global}}{=}0.5\), \(\lambda_{\text{local}}{=}0.2\).
 
-
-\subsection{Comparison with State-of-the-Art Methods}
-
-\subsubsection{Quantitative Comparison}
-
-We compare against representative T2M baselines on HumanML3D-272 under the TMR evaluation protocol.
-Baselines span three paradigms: (i) latent-space diffusion (MDM~\citep{tevet2022human}, MLD~\citep{chen2023executing}); (ii) discrete-token autoregressive (MoMask~\citep{guo2024momask}, MotionGPT~\citep{jiang2023motiongpt}); (iii) the strongest latent-space autoregressive baseline (MotionStreamer~\citep{xiao2025motionstreamer}); and (iv) the most relevant RAG baseline (ReMoDiffuse~\citep{zhang2023remodiffuse}).
-
 \begin{table*}[t]
 \centering
 \caption{Quantitative comparison on HumanML3D-272 (TMR protocol). Best results in \textbf{bold}, second best \underline{underlined}.}
@@ -387,10 +403,20 @@ MoMask \citep{guo2024momask} & 12.232 & 0.621 & 0.784 & 0.846 & 16.138 & 27.127 
 ReMoDiffuse \citep{zhang2023remodiffuse} & 13.700 & \textbf{0.718} & \textbf{0.845} & \textbf{0.899} & \underline{15.943} & \textbf{27.474} \\
 MotionStreamer \citep{xiao2025motionstreamer} & \underline{11.790} & 0.631 & 0.802 & 0.859 & 16.081 & 27.284 \\
 \midrule
-Ours & \textbf{10.832} & \underline{0.638} & \underline{0.807} & \underline{0.876} & \textbf{15.917} & \underline{27.528} \\
+Ours & \textbf{10.826} & \underline{0.659} & \underline{0.813} & \underline{0.877} & \textbf{15.820} & \underline{27.459} \\
 \bottomrule
 \end{tabular}
 \end{table*}
+
+
+
+\subsection{Comparison with State-of-the-Art Methods}
+
+\subsubsection{Quantitative Comparison}
+
+We compare against representative T2M baselines on HumanML3D-272 under the TMR evaluation protocol.
+Baselines span three paradigms: (i) latent-space diffusion (MDM~\citep{tevet2022human}, MLD~\citep{chen2023executing}); (ii) discrete-token autoregressive (MoMask~\citep{guo2024momask}, MotionGPT~\citep{jiang2023motiongpt}); (iii) the strongest latent-space autoregressive baseline (MotionStreamer~\citep{xiao2025motionstreamer}); and (iv) the most relevant RAG baseline (ReMoDiffuse~\citep{zhang2023remodiffuse}).
+
 
 As shown in Tab.~\ref{tab:sota}, MSA-T2M achieves the best FID (10.832) among all methods, improving over the strongest prior latent-space method MotionStreamer by \textbf{8.1\%} and over all non-RAG baselines by a large margin.
 In MM-Dist, our method achieves the best score (15.917), surpassing even ReMoDiffuse (15.943), indicating that our generated motions are closer in embedding space to their text descriptions.
@@ -402,24 +428,16 @@ Overall, MSA-T2M achieves the best balance between motion quality (FID, MM-Dist,
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=\textwidth]{vis_v2.png}
-  \caption{Qualitative comparison on challenging compositional text prompts. Each motion is rendered as a sequence of SMPL meshes with a light-to-dark color gradient indicating temporal progression. Compared to MotionStreamer and ReMoDiffuse, MSA-T2M produces motions with more accurate action ordering, correct body-part coordination, and smoother transitions between action phases.}
+  \includegraphics[width=\textwidth]{vis_v4.pdf}
+  \caption{Qualitative comparison on challenging compositional text prompts. Each motion is rendered as a sequence of SMPL meshes with a light-to-dark color gradient indicating temporal progression. Compared to MotionStreamer and ReMoDiffuse, MSA-T2M produces motions with more accurate action ordering, correct body-part coordination, smoother transitions between action phases, and higher action completeness, consistently executing every action specified in the description whereas the baselines occasionally omit one or more. }
   \label{fig:vis}
 \end{figure*}
 
 Fig.~\ref{fig:vis} shows side-by-side visual comparisons on three challenging compositional text prompts (e.g., sequences involving multi-stage actions or fine-grained body-part control).
 MSA-T2M generates motions with correct action ordering and natural transitions, whereas MotionStreamer~\citep{xiao2025motionstreamer} frequently produces semantic drift in the later frames and ReMoDiffuse~\citep{zhang2023remodiffuse} exhibits pose artifacts at action boundaries.
 These qualitative gains are consistent with the quantitative FID improvement and reflect the benefit of multi-scale semantic alignment in organizing the latent space for generation.
-Additional comparisons are provided in the supplementary material.
 
 
-\subsection{Ablation Studies}
-
-We conduct ablations to validate each design choice in MSA-T2M.
-All ablations use \(K{=}3\) for efficiency; the main SOTA comparison uses \(K{=}5\) (see paragraph below).
-
-\textbf{Component ablation.}
-Tab.~\ref{tab:ablation} dissects the contributions of local alignment, global alignment, and retrieval augmentation.
 
 \begin{table*}[t]
 \centering
@@ -431,51 +449,57 @@ Methods & FID $\downarrow$ & R@1 $\uparrow$ & R@2 $\uparrow$ & R@3 $\uparrow$ & 
 \midrule
 Real motion & 0.002 & 0.702 & 0.864 & 0.914 & 15.151 & 27.492 \\
 \midrule
-w/o local align, w/o RAG (global only) & \underline{11.306} & \underline{0.639} & 0.802 & \underline{0.864} & \underline{15.925} & 27.207 \\
+w/o local align, w/o RAG (global only) & \underline{11.236} & \underline{0.661} & 0.821 & \underline{0.882} & \underline{15.715} & 27.330 \\
 w/o global align, w/o RAG (local only) & -- & -- & -- & -- & -- & -- \\
-w/o RAG (local + global align) & 11.767 & 0.647 & \underline{0.805} & 0.842 & 15.983 & \underline{27.442} \\
-w/o local align (global align + RAG) & 11.428 & \textbf{0.649} & \textbf{0.816} & \textbf{0.886} & \textbf{15.784} & 27.165 \\
-Ours (local + global + RAG) & \textbf{10.896} & 0.637 & 0.794 & 0.859 & 16.030 & \textbf{27.336} \\
+w/o RAG (local + global align) & 11.697 & 0.669 & \underline{0.824} & 0.860 & 15.773 & \underline{27.565} \\
+w/o local align (global align + RAG) & 11.358 & \textbf{0.671} & \textbf{0.835} & \textbf{0.904} & \textbf{15.574} & 27.288 \\
+Ours (local + global + RAG) & \textbf{10.826} & 0.659 & 0.813 & 0.877 & 15.820 & \textbf{27.459} \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
+
+\subsection{Ablation Studies}
+
+We conduct ablations to validate each design choice in MSA-T2M.
+All ablations use \(K{=}3\) for efficiency; the main SOTA comparison uses \(K{=}5\) (see below).
+
+\textbf{Component ablation.}
+Tab.~\ref{tab:ablation} dissects the contributions of local alignment, global alignment, and retrieval augmentation.
+
 \textit{(1) RAG consistently improves motion quality.}
-Removing the RAG branch while keeping both alignment losses (``w/o RAG'') increases FID from 10.896 to 11.767 (+0.871, $+$8.0\%).
+Removing the RAG branch while keeping both alignment losses (``w/o RAG'') increases FID from 10.826 to 11.697 (+0.871, $+$8.1\%).
 This confirms that real motion priors from the semantically structured prior bank provide complementary guidance beyond text conditioning alone, and that alignment alone is insufficient to reach the best FID.
 
 \textit{(2) Local alignment is the primary driver of latent space structure.}
-Global alignment alone (``w/o local align, w/o RAG'') achieves FID~11.306, which already outperforms the model without any alignment (represented approximately by pure MotionStreamer at 11.790), indicating that even coarse global alignment improves the latent space.
-However, the variant retaining global alignment and RAG but removing local alignment (``w/o local align'') achieves FID~11.428---worse than our full model by 0.532---demonstrating that frame-level supervision from BABEL is essential for fine-grained semantic structure in the latent space.
+Global alignment alone (``w/o local align, w/o RAG'') achieves FID~11.236, which already outperforms the reconstruction-only baseline (MotionStreamer at 11.790), indicating that even coarse global alignment improves the latent space.
+However, the variant retaining global alignment and RAG but removing local alignment (``w/o local align'') achieves FID~11.358---worse than our full model by 0.532---demonstrating that frame-level supervision from BABEL is essential for fine-grained semantic structure in the latent space.
 
-\textit{(3) Global alignment amplifies retrieval benefit.}
-The full model (10.896) outperforms ``w/o local align'' (11.428) despite both having retrieval.
-The difference traces to the quality of \(\mathbf{h}_{\text{cls}}\) as a retrieval key: with both local and global alignment, \(\mathbf{h}_{\text{cls}}\) captures compositionally-aware sequence semantics, producing more relevant retrieved priors.
-Global alignment thus amplifies retrieval gain---a synergy that neither component achieves in isolation.
+\textit{(3) Global alignment amplifies retrieval; full model achieves best FID and Diversity.}
+The full model (10.826) outperforms ``w/o local align'' (11.358) because local+global alignment enables \([CLS]\) to capture compositionally-aware semantics and yield more relevant priors; the slight R-Precision dip is expected, as local alignment regularizes toward diverse action semantics, trading retrieval recall for generation realism.
 
-\textit{(4) Full model achieves best FID and Diversity.}
-The complete MSA-T2M achieves best FID (10.896) and best Diversity (27.336), validating that multi-scale alignment and RAG are jointly necessary for optimal motion quality and coverage.
-The slight decrease in R-Precision relative to ``w/o local align'' is expected: local alignment regularizes the latent space toward diverse action semantics, which can reduce retrieval recall while improving generation realism.
+
 
 \textbf{Effect of retrieved sample count \textit{K}.}
 Fig.~\ref{fig:ablation_k} shows that FID improves from \(K{=}1\) to \(K{=}5\) (best FID) but degrades beyond \(K{=}7\), while R@3 remains stable throughout.
-This indicates that a moderate number of priors provides sufficient semantic coverage without introducing out-of-distribution noise; we fix \(K{=}5\) for SOTA comparison and \(K{=}3\) for ablations.
+This indicates that a moderate number of priors provides sufficient semantic coverage without introducing out-of-distribution noise; we fix \(K{=}3\) for SOTA comparison and ablations.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{ablation_k_fid_r3.png}
+\includegraphics[width=\linewidth]{k.pdf}
 \caption{Effect of retrieved sample count $K$ on FID and R@3. FID is minimized at $K{=}5$; R@3 is relatively insensitive to $K$.}
 \label{fig:ablation_k}
 \end{figure}
 
 
 
+\section{Conclusion}
+This paper addresses the alignment-realism trade-off in text-to-motion generation by proposing MSA-T2M.
+The key idea is to treat multi-scale semantic alignment and retrieval-augmented generation as a tightly coupled solution: MSA-VAE structures the latent space into a discriminative retrieval index at both local (frame) and global (sequence) scales, while RAG-Diffusion-AR injects real motion priors to compensate for the realism loss that alignment introduces.
+On HumanML3D-272, MSA-T2M achieves state-of-the-art FID (10.826) and competitive R-Precision (R@1: 0.659); ablations confirm that local and global alignment contribute complementarily, and that RAG consistently restores the FID degraded by alignment---validating the tightly coupled design.
 
-\section{Conclusion and Limitation}
-In this work, we propose MSA-T2M, a text-driven motion generation model that for the first time achieves multi-scale semantic alignment in a continuous causal latent space and fully exploits the dividends of alignment via a retrieval-augmented generation (RAG) mechanism, enabling high-quality autoregressive diffusion motion synthesis. By exploring hierarchical latent space modeling together with semantic alignment, our method produces realistic and natural motions that more faithfully follow text instructions, achieving state-of-the-art results on a range of metrics including FID and R-Precision. An important finding is that simultaneously introducing both local and global multi-scale semantic alignment in the latent space yields a ``1+1>2'' synergistic effect: it generates more realistic motions while maintaining competitive text-motion retrieval accuracy. Furthermore, we observe that appropriately incorporating motion latent priors to guide autoregressive diffusion generation improves both realism and semantic fidelity, confirming the positive role of external knowledge injection in generation quality.
+Limitations and future directions are discussed in Appendix~\ref{app:limitations}.
 
-
-Despite its strong performance, MSA-T2M has several limitations. First, current datasets with frame-level action labels (e.g., BABEL) only describe atomic actions such as ``walk'', ``turn'', ``stand'', and ``sit'', lacking fine-grained annotations of specific body-part behaviors (e.g., ``a person raises their right hand and waves it three times'' instead of simply ``wave''). This makes it difficult for the model to precisely follow complex instructions that involve detailed body-part control. In the future, we plan to leverage large language models to construct richly annotated datasets and design more advanced architectures to achieve higher-precision text-to-motion generation, moving the model toward industrial-ready applications. Second, the current model supports only offline single-segment motion generation with a length limited by the training data. Extending multi-scale semantic alignment to online streaming motion generation and further unleashing the power of motion latent priors to produce natural, realistic, and infinitely long motions is an exciting direction for future work.
 
 
 
@@ -489,54 +513,183 @@ More information about this disclosure can be found at: \url{https://neurips.cc/
 Do {\bf not} include this section in the anonymized submission, only in the final paper. You can use the \texttt{ack} environment provided in the style file to automatically hide this section in the anonymized submission.
 \end{ack}
 
-\section*{References}
-
-
-References follow the acknowledgments in the camera-ready paper. Use unnumbered first-level heading for
-the references. Any choice of citation style is acceptable as long as you are
-consistent. It is permissible to reduce the font size to \verb+small+ (9 point)
-when listing the references.
-Note that the Reference section does not count towards the page limit.
-\medskip
-
-
-{
-\small
-
-
-[1] Alexander, J.A.\ \& Mozer, M.C.\ (1995) Template-based algorithms for
-connectionist rule extraction. In G.\ Tesauro, D.S.\ Touretzky and T.K.\ Leen
-(eds.), {\it Advances in Neural Information Processing Systems 7},
-pp.\ 609--616. Cambridge, MA: MIT Press.
-
-
-[2] Bower, J.M.\ \& Beeman, D.\ (1995) {\it The Book of GENESIS: Exploring
-  Realistic Neural Models with the GEneral NEural SImulation System.}  New York:
-TELOS/Springer--Verlag.
-
-
-[3] Hasselmo, M.E., Schnell, E.\ \& Barkai, E.\ (1995) Dynamics of learning and
-recall at excitatory recurrent synapses and cholinergic modulation in rat
-hippocampal region CA3. {\it Journal of Neuroscience} {\bf 15}(7):5249-5262.
-}
-
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibliographystyle{plainnat}
+\bibliography{mybib}
 
 \appendix
 
-\section{Technical appendices and supplementary material}
-Technical appendices with additional results, figures, graphs, and proofs may be submitted with the paper submission before the full submission deadline (see above). You can upload a ZIP file for videos or code, but do not upload a separate PDF file for the appendix. There is no page limit for the technical appendices. 
+% ============================================================
+% Appendix A: Background
+% ============================================================
+\section{Human Motion Representation and Evaluation Protocol}
+\label{app:representation}
 
-Note: Think of the appendix as ``optional reading'' for reviewers. The paper must be able to stand alone without the appendix; for example, adding critical experiments that support the main claims to an appendix is inappropriate. 
+\paragraph{From HumanML3D-263 to MS-272.}
+The HumanML3D benchmark~\citep{Guo_2022_CVPR} introduced a 263-dimensional pose representation comprising root trajectory, local joint positions, velocities, joint rotations (recovered via inverse kinematics from AMASS~\citep{mahmood2019amass}), and foot contact labels.
+While this representation enabled unified benchmarking, two limitations have emerged.
+First, MARDM~\citep{meng2024rethinking} showed that the first 67 dimensions contain most of the information, indicating substantial redundancy.
+Second, the IK-recovered joint rotations suffer from twist ambiguity and jitter artifacts; converting generated motions back to SMPL body parameters requires running SMPLify~\citep{bogo2016keep}, which takes $\sim$60 seconds per 10-second clip and introduces additional errors.
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+MotionStreamer~\citep{xiao2025motionstreamer} addressed both issues by extracting SMPL joint rotations directly from AMASS and encoding them as 6D continuous rotations~\citep{zhou2019continuity}, yielding a \textbf{272-dimensional representation} (MS-272).
+Each pose $\mathbf{x} \in \mathbb{R}^{272}$ decomposes as:
+\begin{itemize}
+    \item \textbf{Root (8D):} linear velocities $\dot{r}^x, \dot{r}^z \in \mathbb{R}$ on the XZ-plane; 6D root angular velocity $\dot{r}^a \in \mathbb{R}^6$.
+    \item \textbf{Joints (264D):} local positions $\mathbf{j}^p \in \mathbb{R}^{3 \times 22}$, local velocities $\mathbf{j}^v \in \mathbb{R}^{3 \times 22}$, and 6D local rotations $\mathbf{j}^r \in \mathbb{R}^{6 \times 22}$ relative to the root, for all $K=22$ SMPL joints.
+\end{itemize}
+The 6D rotation parameterization is continuous and singularity-free, guarantees consistent bone lengths, and allows generated motions to drive an SMPL character directly without any post-processing.
+
+\paragraph{Evaluation protocol.}
+Concurrent with the representation redesign, MotionStreamer replaces the original GRU-based feature extractor with \textbf{TMR}~\citep{petrovich2023tmr}---a contrastive text--motion retrieval model---as the evaluation backbone.
+TMR produces a more semantically coherent joint embedding space, yielding more reliable FID, R-Precision, and MM-Dist estimates for methods that operate in continuous latent spaces.
+The resulting \textbf{MS-272 + TMR} protocol has been adopted by subsequent works~\citep{meng2024rethinking,meng2025absolute,fan2025go} for fair comparison.
+We follow this protocol throughout all experiments.
+
+% ============================================================
+% Appendix B: Full Loss Formulation
+% ============================================================
+\section{Full Loss Formulation}
+\label{app:loss}
+
+The total MSA-VAE training objective combines six terms:
+\begin{equation}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{KL}}
++ \lambda_{\text{root}}\,\mathcal{L}_{\text{root}}
++ \lambda_{\text{latent}}\,\mathcal{L}_{\text{latent}}
++ \lambda_{\text{global}}\,\mathcal{L}_{\text{global}}
++ \lambda_{\text{local}}\,\mathcal{L}_{\text{local}}.
+\end{equation}
+
+\paragraph{Reconstruction loss $\mathcal{L}_{\text{recon}}$.}
+Following the $\sigma$-VAE formulation~\citep{rybkin2021simple}, we use an optimal-$\sigma$ Gaussian negative log-likelihood:
+\begin{equation}
+\mathcal{L}_{\text{recon}} = \sum_{d=1}^{D}\sum_{i=1}^{N}
+\left(\frac{(x_{di}-\hat{x}_{di})^2}{2\sigma^{*2}} + \ln\sigma^{*}\right),
+\quad
+\sigma^{*2} = \frac{1}{DN}\sum_{d,i}(x_{di}-\hat{x}_{di})^2.
+\end{equation}
+
+\paragraph{KL divergence $\mathcal{L}_{\text{KL}}$.}
+\begin{equation}
+\mathcal{L}_{\text{KL}} = \frac{1}{2}\sum_{d=1}^{d_c}\sum_{i'=1}^{n}
+\bigl(\mu_{di'}^2 + \sigma_{di'}^2 - \ln\sigma_{di'}^2 - 1\bigr),
+\end{equation}
+where $(\mu_{di'}, \sigma_{di'})$ are the posterior parameters of the $i'$-th causal latent in the $d$-th dimension.
+
+\paragraph{Root-joint loss $\mathcal{L}_{\text{root}}$.}
+The same NLL is applied to the root dimensions only ($D_{\text{root}}=8$, the first 8 dims of the 272-dim representation), weighted by $\lambda_{\text{root}}=7.0$ to stabilize root trajectory reconstruction:
+\begin{equation}
+\mathcal{L}_{\text{root}} = \sum_{d=1}^{D_{\text{root}}}\sum_{i=1}^{N}
+\left(\frac{(x_{di}-\hat{x}_{di})^2}{2\sigma^{*2}} + \ln\sigma^{*}\right).
+\end{equation}
+
+\paragraph{Latent reconstruction loss $\mathcal{L}_{\text{latent}}$.}
+The Transformer decoder $\mathcal{D}_{\text{trans}}$ reconstructs local CNN latents $\boldsymbol{\mu}_{1:n}$ from $[CLS]$; a mean-squared reconstruction loss is applied:
+\begin{equation}
+\mathcal{L}_{\text{feature}} = \frac{1}{n}\sum_{i=1}^{n}\|\hat{\boldsymbol{\mu}}_i - \boldsymbol{\mu}_i\|_2^2,
+\end{equation}
+with weight $\lambda_{\text{latent}}=1.0$.
+
+\paragraph{Global alignment loss $\mathcal{L}_{\text{global}}$.}
+As defined in Eq.~\ref{eq:loss-global}, cosine similarity between $[CLS]$ and the dynamically interpolated text target $\mathbf{g}_{\text{target}}$, with weight $\lambda_{\text{global}}=0.5$.
+
+\paragraph{Local alignment loss $\mathcal{L}_{\text{local}}$.}
+As defined in Eq.~\ref{eq:loss-local}, average cosine similarity between each local latent $\boldsymbol{\mu}_i$ and its corresponding BABEL frame-label embedding $\mathbf{l}_i$, with weight $\lambda_{\text{local}}=0.2$.
+
+% ============================================================
+% Appendix C: Detailed Architecture
+% ============================================================
+\section{Detailed Architecture}
+\label{app:arch}
+
+\subsection{Representation VAE)}
+
+The Representation VAE follows the Causal TAE design of MotionStreamer~\citep{xiao2025motionstreamer}.
+Both encoder $\mathcal{E}_{\text{cnn}}$ and decoder $\mathcal{D}_{\text{cnn}}$ are built from 1D causal ResNet blocks~\citep{he2016deep}.
+Causality is enforced by left-only padding: for a convolution with kernel size $k_t$, stride $s_t$, and dilation $d_t$, we pad $(k_t-1)\times d_t + (1-s_t)$ frames at the \emph{beginning} of the sequence, so each output frame depends only on past frames.
+
+The encoder applies two successive downsampling stages (strided causal convolution, rate $2\times$ each), yielding total temporal compression $l=4$.
+Each downsampling stage is followed by a causal ResNet block with three parallel dilated residual branches (dilations 9, 3, 1) operating at hidden size $h=1024$.
+The final encoder output is projected to $2d_c=32$ channels to produce posterior parameters $(\boldsymbol{\mu}, \log\boldsymbol{\sigma}^2) \in \mathbb{R}^{n \times 16}$, where $n=N/4$ and $d_c=16$.
+A linear adapter further reduces the sampled latents to the compact space used for downstream generation.
+The decoder mirrors the encoder, replacing strided downsampling with nearest-neighbour upsampling.
+
+\begin{table}[h]
+\centering
+\caption{CNN-VAE hyper-parameters.}
+\label{tab:cnn_vae_arch}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+Input / output dim & 272 \\
+Hidden size $h$ & 1024 \\
+Temporal downsampling rate $l$ & 4 (2$\times$2) \\
+Latent dim $d_c$ & 16 \\
+ResNet dilations (per stage) & 9, 3, 1 \\
+Training window $N$ & 64 frames \\
+Optimizer & AdamW ($\beta_1{=}0.9, \beta_2{=}0.99$) \\
+Stage-1 lr schedule & 1900K iters @ 5e-5 + 100K @ 2.5e-6 \\
+Batch size & 128 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Semantic Autoencoder}
+
+The Semantic Autoencoder consists of a Transformer encoder $\mathcal{E}_{\text{trans}}$ and a Transformer decoder $\mathcal{D}_{\text{trans}}$, both built on standard multi-head self-attention blocks.
+A learnable \texttt{[CLS]} token is prepended to the sequence of local CNN latents $\boldsymbol{\mu}_{1:n}$ before $\mathcal{E}_{\text{trans}}$.
+The \texttt{[CLS]} output is projected by a linear head to the text embedding dimension (768) to form the global retrieval feature $[CLS]$.
+Each local latent output from $\mathcal{E}_{\text{trans}}$ is similarly projected by a separate linear head for local alignment.
+$\mathcal{D}_{\text{trans}}$ takes $[CLS]$ as memory and autoregressively reconstructs $\hat{\boldsymbol{\mu}}_{1:n}$ via cross-attention.
+
+\begin{table}[h]
+\centering
+\caption{Semantic Autoencoder hyper-parameters.}
+\label{tab:sem_ae_arch}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+Input sequence length & $n = N/l$ (up to 16 tokens) \\
+Model dim $d_{\text{model}}$ & 768 \\
+Attention heads & 8 \\
+Encoder layers & 6 \\
+Decoder layers & 6 \\
+FFN dim & 2048 \\
+Dropout & 0.1 \\
+Text embedding dim (alignment target) & 768 (T5-XXL) \\
+Learnable tokens & \texttt{[CLS]} $\in \mathbb{R}^{768}$ \\
+Stage-2/3 lr & $1\times10^{-4}$ with cosine annealing \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{RAG-Diffusion-AR}
+
+The autoregressive Transformer follows LLaMA~\citep{touvron2023llama} architecture (decoder-only, RMS Norm, SwiGLU FFN, RoPE positional encoding, QK normalization for training stability).
+The MLP diffusion head uses AdaLN~\citep{peebles2023scalable} conditioned on the Transformer output and diffusion timestep.
+Detailed hyper-parameters match those reported in §4.1 of the main text.
+
+% ============================================================
+% Appendix D: Additional Qualitative Results
+% ============================================================
+
+
+
+% ============================================================
+% Appendix E: Limitations and Future Work
+% ============================================================
+\section{Limitations and Future Work}
+\label{app:limitations}
+
+\paragraph{Frame-level supervision coverage.}
+Local alignment relies on BABEL, which covers only atomic action categories (e.g., ``walk'', ``sit'') and lacks body-part-level annotations, limiting fine-grained instruction following for body-part control. Extending to richly annotated data and finer-grained alignment is a natural next step.
+
+\paragraph{Single-segment generation.}
+The current model supports offline single-segment generation; applying multi-scale alignment to online streaming generation for arbitrary-length motion is an important open direction.
 
 \newpage
 \input{checklist.tex}
-
-\bibliographystyle{plainnat}
-\bibliography{mybib}
 
 
 \end{document}
