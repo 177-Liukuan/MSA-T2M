@@ -19,6 +19,8 @@ import torch
 from torch.utils import data
 from tqdm import tqdm
 
+from humanml3d_272.msa_rag_cache import PackedMSARAGCache, validate_cache
+
 
 class Text2MotionMSARAGDataset(data.Dataset):
     """Text-to-motion dataset with retrieval-augmented h_cls prior."""
@@ -32,6 +34,8 @@ class Text2MotionMSARAGDataset(data.Dataset):
         topk=3,
         exclude_self=True,
         text_embed_dim=None,
+        cache_mode='reference',
+        cache_dir=None,
     ):
         self.dataset_name = dataset_name
         self.motion_latent_dir = motion_latent_dir
@@ -39,12 +43,47 @@ class Text2MotionMSARAGDataset(data.Dataset):
         self.hcls_dir = hcls_dir
         self.topk = topk
         self.exclude_self = exclude_self
+        self.cache_mode = cache_mode
+        self.cache_dir = cache_dir
+
+        if cache_mode not in {'reference', 'packed'}:
+            raise ValueError(
+                f"cache_mode must be 'reference' or 'packed', got {cache_mode!r}"
+            )
+        if cache_mode == 'packed' and not cache_dir:
+            raise ValueError('cache_dir is required when cache_mode=packed.')
 
         if dataset_name == 't2m_272':
             data_root = './humanml3d_272'
             split_file = pjoin(data_root, 'split', 'train.txt')
         else:
             raise ValueError(f'Unsupported dataset: {dataset_name}')
+
+        if cache_mode == 'packed':
+            if text_embed_dim is None:
+                raise ValueError('text_embed_dim is required when cache_mode=packed.')
+            validate_cache(
+                cache_dir=cache_dir,
+                dataset_name=dataset_name,
+                motion_latent_dir=motion_latent_dir,
+                text_latent_dir=text_latent_dir,
+                hcls_dir=hcls_dir,
+                topk=topk,
+                text_embed_dim=int(text_embed_dim),
+                exclude_self=exclude_self,
+            )
+            self.packed_cache = PackedMSARAGCache(
+                cache_dir=cache_dir,
+                requested_topk=topk,
+            )
+            self.sample_ids = list(self.packed_cache.sample_ids)
+            self.data = [{'id': sample_id} for sample_id in self.sample_ids]
+            self.text_embed_dim = int(text_embed_dim)
+            print(
+                f'Loaded packed RAG cache: {len(self.data)} samples, '
+                f'text_embed_dim={self.text_embed_dim}, topk={self.topk}'
+            )
+            return
 
         id_list = []
         with cs.open(split_file, 'r') as f:
@@ -105,6 +144,7 @@ class Text2MotionMSARAGDataset(data.Dataset):
         self.library_hcls = torch.from_numpy(np.stack(self.library_hcls)).float()  # [N, D]
         self.library_hcls_norm = self._l2_normalize(self.library_hcls)
         self.id_to_library_index = {sid: i for i, sid in enumerate(self.library_ids)}
+        self.sample_ids = list(self.library_ids)
 
         print(
             f'Retrieval library ready: {self.library_hcls.shape[0]} vectors, '
@@ -119,17 +159,38 @@ class Text2MotionMSARAGDataset(data.Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
+        return self.get_item(idx, caption_idx=None)
+
+    def get_item(self, idx, caption_idx=None):
+        if self.cache_mode == 'packed':
+            caption_count = int(self.packed_cache.text_counts[idx])
+            if caption_idx is None:
+                caption_idx = random.randint(0, caption_count - 1)
+            return self.packed_cache.get(idx, caption_idx)
+
         entry = self.data[idx]
 
         motion_latents = np.load(entry['motion_path']).astype(np.float32)
 
         text_all = np.load(entry['text_path']).astype(np.float32)
         if text_all.ndim == 2 and text_all.shape[0] > 1:
-            text_idx = random.randint(0, text_all.shape[0] - 1)
+            text_idx = (
+                random.randint(0, text_all.shape[0] - 1)
+                if caption_idx is None
+                else caption_idx
+            )
             text_emb = text_all[text_idx]
         elif text_all.ndim == 2:
+            if caption_idx not in (None, 0):
+                raise IndexError(
+                    f"caption_idx out of range for {entry['id']}: {caption_idx}"
+                )
             text_emb = text_all[0]
         else:
+            if caption_idx not in (None, 0):
+                raise IndexError(
+                    f"caption_idx out of range for {entry['id']}: {caption_idx}"
+                )
             text_emb = text_all.reshape(-1)
 
         if text_emb.shape[0] != self.text_embed_dim:
@@ -189,6 +250,8 @@ def DATALoader(
     exclude_self=True,
     num_workers=4,
     text_embed_dim=None,
+    cache_mode='reference',
+    cache_dir=None,
 ):
     _ = is_test
 
@@ -200,6 +263,8 @@ def DATALoader(
         topk=topk,
         exclude_self=exclude_self,
         text_embed_dim=text_embed_dim,
+        cache_mode=cache_mode,
+        cache_dir=cache_dir,
     )
 
     loader = torch.utils.data.DataLoader(
