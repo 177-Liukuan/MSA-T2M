@@ -9,7 +9,6 @@ Core design:
 
 import os
 import sys
-import math
 import json
 import argparse
 import torch
@@ -20,6 +19,11 @@ from accelerate import Accelerator
 
 from models.llama_model import LLaMAHF, LLaMAHFConfig
 from models.llama_rag_model import LLaMARAGWrapper
+from models.rag_training import (
+    RAGTwoForwardLoss,
+    estimate_lengths_from_padded_latents,
+    get_rag_model,
+)
 from humanml3d_272 import dataset_msa_rag
 import options.option_transformer as option_trans
 import utils.utils_model as utils_model
@@ -127,105 +131,33 @@ def update_ema_state_dict(ema_state, model, decay):
         else:
             ema_state[k].copy_(v.detach())
 
-def lengths_to_mask(lengths, max_len):
-    return torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
-
-
-def estimate_lengths_from_padded_latents(m_tokens):
-    """Estimate valid lengths from zero-padded latent sequences."""
-    valid = m_tokens.abs().sum(dim=-1) > 0
-    lens = valid.long().sum(dim=1)
-    lens = torch.clamp(lens, min=2)
-    return lens
-
-
-def cosine_decay(step, total_steps, start_value=1.0, end_value=0.0):
-    step = torch.tensor(step, dtype=torch.float32)
-    total_steps = torch.tensor(total_steps, dtype=torch.float32)
-    cosine_factor = 0.5 * (1 + torch.cos(torch.pi * step / total_steps))
-    return start_value + (end_value - start_value) * cosine_factor
-
-
-def replace_with_pred(latents, pred_xstart, step, total_steps):
-    decay_factor = cosine_decay(step, total_steps).to(latents.device)
-
-    bsz, seq_len, _ = latents.shape
-    num_replace = int(seq_len * decay_factor)
-
-    replace_indices = torch.randperm(seq_len, device=latents.device)[:num_replace]
-
-    replace_mask = torch.zeros(bsz, seq_len, dtype=torch.bool, device=latents.device)
-    replace_mask[:, replace_indices] = 1
-
-    updated_latents = latents.clone()
-    updated_latents[replace_mask] = pred_xstart[replace_mask]
-    return updated_latents
-
-
-def get_core_model(model):
-    """Return the underlying model for both single-GPU and DDP cases."""
-    return model.module if hasattr(model, 'module') else model
-
-
-def forward_loss_withmask_2_forward(
-    latents,
-    rag_model,
-    m_lens,
-    text_emb,
-    top3_h_cls,
-    top3_sim_scores,
-    step,
-    total_steps,
-    cfg_drop_mask,
-    empty_text_emb,
-    diffmlps_batch_mul=4,
+def build_checkpoint_payload(
+    training_model,
+    accelerator,
+    optimizer,
+    scheduler,
+    iteration,
+    generative_head_type,
+    ema_enabled,
+    ema_decay,
+    ema_base_state=None,
+    ema_rag_state=None,
 ):
-    """Two-forward training with RAG condition and diffusion denoising loss."""
-    core_model = get_core_model(rag_model)
-
-    bsz, seq_len, _ = latents.shape
-    mask = lengths_to_mask(m_lens, seq_len).reshape(bsz * seq_len).repeat(diffmlps_batch_mul)
-
-    # First forward is used only to build pseudo x_start; keep it out of autograd
-    # to avoid DDP multi-forward graph bookkeeping conflicts.
-    with torch.no_grad():
-        conditions = rag_model(
-            motion_latents=latents,
-            text_emb=text_emb,
-            top3_h_cls=top3_h_cls,
-            top3_sim_scores=top3_sim_scores,
-            cfg_drop_mask=cfg_drop_mask,
-            empty_text_emb=empty_text_emb,
-        )
-
-        # 关键对齐：双条件 token 时，motion[0] 对应 hidden index=1。
-        z = core_model.motion_condition_slice(conditions, seq_len)
-        target = latents.clone().detach().reshape(bsz * seq_len, -1)
-        z = z.reshape(bsz * seq_len, -1)
-        _, pred_xstart = core_model.base_model.diff_loss(target=target, z=z)
-
-    pred_xstart = pred_xstart.clone().detach().reshape(bsz, seq_len, -1)
-
-    # Second forward: replace part of input with predicted x_start
-    updated_latents = replace_with_pred(latents, pred_xstart, step, total_steps)
-    updated_conditions = rag_model(
-        motion_latents=updated_latents,
-        text_emb=text_emb,
-        top3_h_cls=top3_h_cls,
-        top3_sim_scores=top3_sim_scores,
-        cfg_drop_mask=cfg_drop_mask,
-        empty_text_emb=empty_text_emb,
-    )
-    updated_z = core_model.motion_condition_slice(updated_conditions, seq_len)
-
-    updated_target = latents.clone().detach().reshape(bsz * seq_len, -1).repeat(diffmlps_batch_mul, 1)
-    updated_z = updated_z.reshape(bsz * seq_len, -1).repeat(diffmlps_batch_mul, 1)
-
-    updated_target = updated_target[mask]
-    updated_z = updated_z[mask]
-
-    updated_loss, _ = core_model.base_model.diff_loss(target=updated_target, z=updated_z)
-    return updated_loss
+    research_model = get_rag_model(accelerator.unwrap_model(training_model))
+    payload = {
+        'trans': research_model.base_model.state_dict(),
+        'rag': research_model.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'iter': iteration,
+        'generative_head_type': generative_head_type,
+        'use_ema': ema_enabled,
+        'ema_decay': ema_decay,
+    }
+    if ema_enabled:
+        payload['trans_ema'] = ema_base_state
+        payload['rag_ema'] = ema_rag_state
+    return payload
 
 
 def main():
@@ -342,34 +274,31 @@ def main():
     rag_model.train()
     rag_model.to(comp_device)
     empty_text_emb = empty_text_emb.to(comp_device)
+    training_model = RAGTwoForwardLoss(rag_model, diffmlps_batch_mul=4)
 
     optimizer = utils_model.initial_optim(
         args.decay_option,
         args.lr,
         args.weight_decay,
-        rag_model,
+        training_model,
         args.optimizer,
     )
     scheduler = WarmupCosineDecayScheduler(optimizer, args.total_iter // 10, args.total_iter)
 
-    rag_model, optimizer, train_loader = accelerator.prepare(rag_model, optimizer, train_loader)
+    training_model, optimizer, train_loader = accelerator.prepare(
+        training_model, optimizer, train_loader
+    )
     train_loader_iter = dataset_msa_rag.cycle(train_loader)
 
     ema_enabled = bool(args.use_ema)
-    unwrapped_model = accelerator.unwrap_model(rag_model)
+    research_model = get_rag_model(accelerator.unwrap_model(training_model))
     if ema_enabled:
         if ema_base_state is None:
-            ema_base_state = init_ema_state_dict(unwrapped_model.base_model)
+            ema_base_state = init_ema_state_dict(research_model.base_model)
         if ema_rag_state is None:
-            ema_rag_state = init_ema_state_dict(unwrapped_model)
+            ema_rag_state = init_ema_state_dict(research_model)
         if accelerator.is_main_process:
             logger.info(f'EMA enabled: decay={args.ema_decay}, update_every={args.ema_update_every}')
-
-    # Restore original MotionStreamer multi-GPU behavior for speed/stability: use core model forward path.
-    # Single-GPU keeps the wrapped object unchanged.
-    train_forward_model = rag_model.module if (args.num_gpus > 1 and hasattr(rag_model, 'module')) else rag_model
-    if accelerator.is_main_process and args.num_gpus > 1:
-        logger.info('Using legacy multi-GPU core-model forward path (rag_model.module).')
 
     nb_iter, avg_loss, avg_loss_ddpm, avg_loss_rf = 0, 0.0, 0.0, 0.0
     print_iter = 100
@@ -380,14 +309,14 @@ def main():
     while nb_iter <= args.total_iter:
         text_emb, top3_h_cls, top3_sim_scores, m_tokens = next(train_loader_iter)
 
-        text_emb = text_emb.to(comp_device)
-        top3_h_cls = top3_h_cls.to(comp_device)
+        text_emb = text_emb.to(comp_device, non_blocking=True)
+        top3_h_cls = top3_h_cls.to(comp_device, non_blocking=True)
         if text_emb.shape[-1] != args.text_embed_dim:
             raise ValueError(f'text_emb dim mismatch: got {text_emb.shape[-1]}, expected {args.text_embed_dim}')
         if top3_h_cls.shape[-1] != args.text_embed_dim:
             raise ValueError(f'top3_h_cls dim mismatch: got {top3_h_cls.shape[-1]}, expected {args.text_embed_dim}')
-        top3_sim_scores = top3_sim_scores.to(comp_device)
-        m_tokens = m_tokens.to(comp_device)
+        top3_sim_scores = top3_sim_scores.to(comp_device, non_blocking=True)
+        m_tokens = m_tokens.to(comp_device, non_blocking=True)
 
         # Estimate valid lengths from zero padding, then align with input_latent = m_tokens[:, :-1].
         m_tokens_len = estimate_lengths_from_padded_latents(m_tokens)
@@ -397,9 +326,8 @@ def main():
         # Joint CFG dropout: drop text and retrieval together for 10% samples.
         cfg_drop_mask = torch.rand(text_emb.shape[0], device=comp_device) < args.cfg_dropout_prob
 
-        loss = forward_loss_withmask_2_forward(
+        loss = training_model(
             latents=input_latent,
-            rag_model=train_forward_model,
             m_lens=m_lens,
             text_emb=text_emb,
             top3_h_cls=top3_h_cls,
@@ -408,7 +336,6 @@ def main():
             total_steps=args.total_iter,
             cfg_drop_mask=cfg_drop_mask,
             empty_text_emb=empty_text_emb,
-            diffmlps_batch_mul=4,
         )
 
         optimizer.zero_grad()
@@ -417,14 +344,15 @@ def main():
         scheduler.step(nb_iter)
 
         if ema_enabled and ((nb_iter + 1) % max(1, args.ema_update_every) == 0):
-            update_ema_state_dict(ema_base_state, unwrapped_model.base_model, args.ema_decay)
-            update_ema_state_dict(ema_rag_state, unwrapped_model, args.ema_decay)
+            update_ema_state_dict(ema_base_state, research_model.base_model, args.ema_decay)
+            update_ema_state_dict(ema_rag_state, research_model, args.ema_decay)
 
-        avg_loss += loss.item()
+        loss_value = loss.item()
+        avg_loss += loss_value
         if args.generative_head_type == 'ddpm':
-            avg_loss_ddpm += loss.item()
+            avg_loss_ddpm += loss_value
         else:
-            avg_loss_rf += loss.item()
+            avg_loss_rf += loss_value
         nb_iter += 1
 
         if nb_iter % print_iter == 0:
@@ -445,19 +373,18 @@ def main():
 
         if nb_iter % save_iter == 0 and accelerator.is_main_process:
             ckpt_path = os.path.join(args.out_dir, f'net_Iter{nb_iter:06d}.pth')
-            payload = {
-                'trans': accelerator.unwrap_model(rag_model).base_model.state_dict(),
-                'rag': accelerator.unwrap_model(rag_model).state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'iter': nb_iter,
-                'generative_head_type': args.generative_head_type,
-                'use_ema': ema_enabled,
-                'ema_decay': args.ema_decay,
-            }
-            if ema_enabled:
-                payload['trans_ema'] = ema_base_state
-                payload['rag_ema'] = ema_rag_state
+            payload = build_checkpoint_payload(
+                training_model=training_model,
+                accelerator=accelerator,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                iteration=nb_iter,
+                generative_head_type=args.generative_head_type,
+                ema_enabled=ema_enabled,
+                ema_decay=args.ema_decay,
+                ema_base_state=ema_base_state,
+                ema_rag_state=ema_rag_state,
+            )
             torch.save(payload, ckpt_path)
             logger.info(f'Checkpoint saved to: {ckpt_path}')
 

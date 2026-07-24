@@ -47,7 +47,7 @@ class FakeRAGModel(nn.Module):
         weights = torch.softmax(top3_sim_scores, dim=1).unsqueeze(-1)
         retrieval = (top3_h_cls * weights).sum(dim=1)
         retrieval_token = self.retrieval_projection(retrieval).unsqueeze(1)
-        motion_tokens = self.motion_projection(motion_latents)
+        motion_tokens = self.motion_projection(motion_latents) + text_token
         return torch.cat([text_token, retrieval_token, motion_tokens], dim=1)
 
     def motion_condition_slice(self, hidden_states, motion_len):
@@ -175,6 +175,18 @@ class ModuleHolder:
         self.module = module
 
 
+class AcceleratorDouble:
+    @staticmethod
+    def unwrap_model(model):
+        return model
+
+
+class SchedulerDouble:
+    @staticmethod
+    def state_dict():
+        return {"scheduler": "state"}
+
+
 class RAGTrainingTest(unittest.TestCase):
     def test_loss_and_gradients_match_reference(self):
         torch.manual_seed(19)
@@ -220,6 +232,55 @@ class RAGTrainingTest(unittest.TestCase):
         self.assertFalse(
             any(key.startswith("rag_model.") for key in get_rag_model(training_module).state_dict())
         )
+
+    def test_checkpoint_payload_preserves_research_model_keys(self):
+        from train_t2m_rag import build_checkpoint_payload
+
+        rag_model = FakeRAGModel()
+        training_module = RAGTwoForwardLoss(rag_model)
+        optimizer = torch.optim.SGD(training_module.parameters(), lr=0.1)
+        ema_base_state = copy.deepcopy(rag_model.base_model.state_dict())
+        ema_rag_state = copy.deepcopy(rag_model.state_dict())
+
+        payload = build_checkpoint_payload(
+            training_model=training_module,
+            accelerator=AcceleratorDouble(),
+            optimizer=optimizer,
+            scheduler=SchedulerDouble(),
+            iteration=17,
+            generative_head_type="ddpm",
+            ema_enabled=True,
+            ema_decay=0.9999,
+            ema_base_state=ema_base_state,
+            ema_rag_state=ema_rag_state,
+        )
+
+        self.assertEqual(
+            set(payload),
+            {
+                "trans",
+                "rag",
+                "scheduler",
+                "optimizer",
+                "iter",
+                "generative_head_type",
+                "use_ema",
+                "ema_decay",
+                "trans_ema",
+                "rag_ema",
+            },
+        )
+        self.assertEqual(list(payload["rag"]), list(rag_model.state_dict()))
+        self.assertEqual(
+            {key: tuple(value.shape) for key, value in payload["rag"].items()},
+            {
+                key: tuple(value.shape)
+                for key, value in rag_model.state_dict().items()
+            },
+        )
+        self.assertFalse(any(key.startswith("rag_model.") for key in payload["rag"]))
+        self.assertEqual(payload["iter"], 17)
+        self.assertEqual(payload["generative_head_type"], "ddpm")
 
 
 if __name__ == "__main__":
