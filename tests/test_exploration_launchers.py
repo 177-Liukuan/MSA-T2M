@@ -139,6 +139,37 @@ class ExplorationLauncherTest(unittest.TestCase):
             with self.subTest(path=relative_path):
                 self.assertIn(checkpoint_path, content)
 
+    def test_active_cross_attention_defaults_use_archived_results(self):
+        latent_checkpoint = (
+            "Experiments/explorations/cross_attention/latent_retrieval/"
+            "MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr_"
+            "6layer_top3_ddpm/net_Iter100000.pth"
+        )
+        for relative_path in (
+            "cross_attention/latent_retrieval/EVAL_t2m_rag_latent_retr.sh",
+            "cross_attention/latent_retrieval/EVAL_t2m_rag_latent_retr_addcfg.sh",
+        ):
+            with self.subTest(path=relative_path):
+                self.assertIn(latent_checkpoint, (EXPLORATIONS / relative_path).read_text())
+
+        for relative_path in (
+            "cross_attention/mca/msa_gen_motion_mca.py",
+            "cross_attention/mca/msa_gen_motion_mca_op.py",
+        ):
+            with self.subTest(path=relative_path):
+                content = (EXPLORATIONS / relative_path).read_text()
+                self.assertIn("resume_trans = RESUME_TRANS_B", content)
+
+        local_content = (
+            EXPLORATIONS / "cross_attention/local_rag/msa_gen_motion_local.py"
+        ).read_text()
+        self.assertIn(
+            "Experiments/explorations/cross_attention/local_rag/"
+            "MotionStreamer_t2m_272_msa_rag_local_L4_k3_crossattn/"
+            "net_Iter100000.pth",
+            local_content,
+        )
+
     def test_cross_archive_imports_use_package_paths(self):
         expected_imports = {
             "ablations/no_rag/demo_msa_t2m_no_rag_t5.py":

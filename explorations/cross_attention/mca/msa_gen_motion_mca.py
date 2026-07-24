@@ -59,7 +59,7 @@ RESUME_TRANS_B = (
 )
 
 # Active checkpoint  ← switch between A and B here
-resume_trans = RESUME_TRANS_A
+resume_trans = RESUME_TRANS_B
 
 # For model A (trained with independent retrieval CFG): use dual-CFG (3-forward).
 #   cfg_scale_retr controls retrieval contribution (1.0 = mild, 2.0 = stronger).

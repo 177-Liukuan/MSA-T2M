@@ -58,7 +58,7 @@ add_selfatten = False   # will be overridden from checkpoint if True
 
 # Fixed paths
 resume_pth = "Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/net_best_mpjpe.pth"
-resume_trans = "Experiments/MotionStreamer_t2m_272_msa_rag_local_L_k3_crossattn/net_Iter100000.pth"
+resume_trans = "Experiments/explorations/cross_attention/local_rag/MotionStreamer_t2m_272_msa_rag_local_L4_k3_crossattn/net_Iter100000.pth"
 hcls_dir = "./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right"
 z_latent_dir = "./humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right"
 empty_text_path = "./humanml3d_272/text_latents_t5/empty_text_embedding.npy"

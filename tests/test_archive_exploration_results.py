@@ -89,6 +89,43 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
             with self.assertRaisesRegex(FileExistsError, "destination exists"):
                 preflight(root, [ArchiveEntry("clip", "run")])
 
+    def test_preflight_rejects_symlink_source(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            target = root / "real-run"
+            source = root / "run"
+            target.mkdir(parents=True)
+            source.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "source symlink"):
+                preflight(root, [ArchiveEntry("clip", "run")])
+
+    def test_preflight_rejects_dangling_destination_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            (root / "run").mkdir(parents=True)
+            destination = root / "explorations" / "clip" / "run"
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(root / "missing")
+
+            with self.assertRaisesRegex(FileExistsError, "destination exists"):
+                preflight(root, [ArchiveEntry("clip", "run")])
+
+    def test_apply_rejects_dangling_destination_symlink_created_after_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            source = root / "run"
+            source.mkdir(parents=True)
+            records = preflight(root, [ArchiveEntry("clip", "run")])
+            destination = root / "explorations" / "clip" / "run"
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(root / "missing")
+
+            with self.assertRaisesRegex(FileExistsError, "destination appeared"):
+                apply_moves(records)
+            self.assertTrue(source.is_dir())
+            self.assertTrue(destination.is_symlink())
+
     def test_preflight_rejects_destination_on_another_filesystem(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "Experiments"

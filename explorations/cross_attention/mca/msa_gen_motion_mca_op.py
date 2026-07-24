@@ -58,7 +58,7 @@ RESUME_TRANS_B = (
 )
 
 # Active checkpoint  ← switch between A and B here
-resume_trans = RESUME_TRANS_A
+resume_trans = RESUME_TRANS_B
 
 # CA insertion mode — MUST match the training config of resume_trans.
 # Cannot be auto-detected from checkpoint weights alone.

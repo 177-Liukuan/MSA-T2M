@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -111,9 +112,11 @@ def preflight(experiments_root, entries, rollback=False):
         source, destination = (
             (archived, root_path) if rollback else (root_path, archived)
         )
+        if source.is_symlink():
+            raise ValueError("source symlink is not an experiment directory: {}".format(source))
         if not source.is_dir():
             raise FileNotFoundError("missing source: {}".format(source))
-        if destination.exists():
+        if os.path.lexists(destination):
             raise FileExistsError("destination exists: {}".format(destination))
         if source.stat().st_dev != root_device:
             raise OSError("source is on a different filesystem: {}".format(source))
@@ -138,7 +141,7 @@ def preflight(experiments_root, entries, rollback=False):
 def apply_moves(records):
     for record in records:
         record.destination.parent.mkdir(parents=True, exist_ok=True)
-        if record.destination.exists():
+        if os.path.lexists(record.destination):
             raise FileExistsError(
                 "destination appeared during move: {}".format(record.destination)
             )
