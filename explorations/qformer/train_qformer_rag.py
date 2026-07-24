@@ -107,7 +107,7 @@ def get_args():
                    help='负样本比例（MTM hard negative mining）')
 
     # 输出 & 日志
-    p.add_argument('--out-dir',    default='Experiments', type=str)
+    p.add_argument('--out-dir',    default='Experiments/explorations/qformer', type=str)
     p.add_argument('--exp-name',   default='QFormer_t2m_272', type=str)
     p.add_argument('--print-iter', default=100,   type=int)
     p.add_argument('--eval-iter',  default=5000,  type=int)

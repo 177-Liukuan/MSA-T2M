@@ -123,7 +123,7 @@ accelerate launch --num_processes $NUM_GPUS \
     --batch-size $BATCH_SIZE \
     --lr $LR \
     --total-iter $TOTAL_ITER \
-    --out-dir Experiments \
+    --out-dir Experiments/explorations/cross_attention/latent_retrieval \
     --exp-name $EXP_NAME \
     --dataname $DATASET \
     --latent_dir $MOTION_LATENT_DIR \

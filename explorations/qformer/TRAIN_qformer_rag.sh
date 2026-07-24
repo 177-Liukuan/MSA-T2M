@@ -10,7 +10,7 @@ cd "$REPO_ROOT"
 #   bash TRAIN_qformer_rag.sh 1 QFormer_t2m_272_v3
 #
 # 用法（断点续训）:
-#   RESUME=Experiments/QFormer_t2m_272_v2/net_best_r1.pth \
+#   RESUME=Experiments/explorations/qformer/QFormer_t2m_272_v2/net_best_r1.pth \
 #   bash TRAIN_qformer_rag.sh 1 QFormer_t2m_272_v3
 #
 # ── v3 相对 v2 的改动 ──────────────────────────────────────────────
@@ -80,7 +80,7 @@ accelerate launch --num_processes ${NUM_GPUS} \
   --w-mtm             1.0 \
   --w-mtg             0.1 \
   --early-stop-patience 20 \
-  --out-dir           Experiments \
+  --out-dir           Experiments/explorations/qformer \
   --exp-name          ${EXP_NAME} \
   --print-iter        100 \
   --eval-iter         1000 \
@@ -89,5 +89,5 @@ accelerate launch --num_processes ${NUM_GPUS} \
   ${RESUME_FLAGS}
 
 echo "======================================="
-echo "  训练完成: Experiments/${EXP_NAME}/"
+echo "  训练完成: Experiments/explorations/qformer/${EXP_NAME}/"
 echo "======================================="

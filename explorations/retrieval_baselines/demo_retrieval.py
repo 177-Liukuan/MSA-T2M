@@ -15,7 +15,7 @@ demo_retrieval.py
   # 若有 Q-Former + TAE，可直接用文本检索最相似 RAG Token
   python demo_retrieval.py \\
       --db-dir global_rag/QFormer_t2m_272_v1 \\
-      --qformer-ckpt Experiments/QFormer_t2m_272_v1/net_best_r1.pth \\
+      --qformer-ckpt Experiments/explorations/qformer/QFormer_t2m_272_v1/net_best_r1.pth \\
       --tae-ckpt Experiments/causal_TAE_t2m_272_h100_20260203/net_best_mpjpe.pth \\
       --text "a person kicks with left leg" \\
       --topk 5 \\

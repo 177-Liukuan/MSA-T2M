@@ -55,6 +55,56 @@ MOVED_PYTHON_TARGETS = {
         "explorations.representation_experiments.train_tae_gan_v1",
 }
 
+EXPLORATION_OUTPUT_ROOTS = {
+    "clip/TRAIN_t2m_baseline_clip.sh": "Experiments/explorations/clip",
+    "rectified_flow/Train_t2m_rag_rf.sh": "Experiments/explorations/rectified_flow",
+    "cross_attention/mca/Train_t2m_rag_multi_text_token.sh": (
+        "Experiments/explorations/cross_attention/mca"
+    ),
+    "cross_attention/latent_retrieval/Train_t2m_rag_latent_retr.sh": (
+        "Experiments/explorations/cross_attention/latent_retrieval"
+    ),
+    "cross_attention/local_rag/TRAIN_t2m_rag_local.sh": (
+        "Experiments/explorations/cross_attention/local_rag"
+    ),
+    "cross_attention/local_rag/TRAIN_THEN_EVAL_t2m_rag_local.sh": (
+        "Experiments/explorations/cross_attention/local_rag"
+    ),
+    "qformer/TRAIN_qformer_rag.sh": "Experiments/explorations/qformer",
+    "representation_experiments/TRAIN_sae_v1.sh": (
+        "Experiments/explorations/representation_experiments"
+    ),
+    "representation_experiments/TRAIN_tae_gan_v1.sh": (
+        "Experiments/explorations/representation_experiments/TAE_GAN_Loss_"
+    ),
+    "motionstreamer_baselines/TRAIN_motionstreamer.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+    "motionstreamer_baselines/TRAIN_t2m.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+    "motionstreamer_baselines/Train_t2m_multi.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+    "motionstreamer_baselines/TRAIN_t2m_cached.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+}
+
+MOVED_CHECKPOINT_REFERENCES = {
+    "clip/EVAL_t2m_clip_baseline.sh": (
+        "Experiments/explorations/clip/MotionStreamer_t2m_272_baseline_clip"
+    ),
+    "rectified_flow/EVAL_t2m_rag_t5_rf.sh": (
+        "Experiments/explorations/rectified_flow/"
+        "MotionStreamer_t2m_272_msa_rag_t5_trans662048_rf_100000Iter_addEMA"
+    ),
+    "cross_attention/local_rag/EVAL_t2m_rag_local.sh": (
+        "Experiments/explorations/cross_attention/local_rag/"
+        "MotionStreamer_t2m_272_msa_rag_local_L16_k3_sa_ca"
+    ),
+}
+
 
 class ExplorationLauncherTest(unittest.TestCase):
     def test_shell_launchers_enter_repository_root(self):
@@ -76,6 +126,18 @@ class ExplorationLauncherTest(unittest.TestCase):
             for target in targets:
                 with self.subTest(path=relative_path, target=target):
                     self.assertIn(f"-m {target}", content)
+
+    def test_exploration_training_outputs_stay_under_archive(self):
+        for relative_path, output_root in EXPLORATION_OUTPUT_ROOTS.items():
+            content = (EXPLORATIONS / relative_path).read_text()
+            with self.subTest(path=relative_path):
+                self.assertIn(output_root, content)
+
+    def test_exploration_evaluations_read_archived_checkpoints(self):
+        for relative_path, checkpoint_path in MOVED_CHECKPOINT_REFERENCES.items():
+            content = (EXPLORATIONS / relative_path).read_text()
+            with self.subTest(path=relative_path):
+                self.assertIn(checkpoint_path, content)
 
     def test_cross_archive_imports_use_package_paths(self):
         expected_imports = {

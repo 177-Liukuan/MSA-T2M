@@ -39,7 +39,7 @@ RETRIEVAL_TOPK=${RETRIEVAL_TOPK:-3}
 # Training-specific parameters
 # -----------------------------------------------------------------------
 TOTAL_ITER=${TOTAL_ITER:-100000}
-OUT_DIR=${OUT_DIR:-Experiments}
+OUT_DIR=${OUT_DIR:-Experiments/explorations/cross_attention/local_rag}
 EXP_NAME=${EXP_NAME:-MotionStreamer_t2m_272_msa_rag_local_L${L_LOCAL}_k${RETRIEVAL_TOPK}_crossattn}
 
 GENERATIVE_HEAD_TYPE=${GENERATIVE_HEAD_TYPE:-ddpm}

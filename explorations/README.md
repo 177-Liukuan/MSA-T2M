@@ -17,6 +17,14 @@ T5 特征、Global-RAG DDPM 训练与评估脚本。
 - `BASELINE`：比较方法或上游 MotionStreamer。
 - `HISTORY`：历史 demo、诊断或项目记录。
 
+## Experiment results
+
+Existing and future exploration results live under
+`Experiments/explorations/<route>/`. Official Causal TAE, MSA-VAE,
+Global-RAG DDPM, and formal ablation results remain directly under
+`Experiments/`. Exploration scripts may still consume an official checkpoint
+from the root; only their own output belongs under the exploration tree.
+
 ## No-RAG
 
 状态：`ABLATION`。使用正式 T5/DDPM 训练实现，但关闭检索 token。

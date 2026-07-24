@@ -60,7 +60,7 @@ accelerate launch --num_processes $NUM_GPUS \
     --batch-size $BATCH_SIZE \
     --lr 0.0001 \
     --total-iter 100000 \
-    --out-dir Experiments \
+    --out-dir Experiments/explorations/cross_attention/local_rag \
     --exp-name MotionStreamer_t2m_272_msa_rag_local_L${L_LOCAL}_k${RETRIEVAL_TOPK}_sa_ca \
     --dataname $DATASET \
     --latent_dir $MOTION_LATENT_DIR \

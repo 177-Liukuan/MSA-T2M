@@ -42,7 +42,7 @@ unit_length = 4
 
 # Required model/data paths from task description
 resume_pth = "Experiments/causal_TAE_t2m_272_h100_20260203/net_last.pth"
-resume_trans = "Experiments/MotionStreamer_t2m_272_cached_embeddings_8gpu_bf16/latest.pth"
+resume_trans = "Experiments/explorations/motionstreamer_baselines/MotionStreamer_t2m_272_cached_embeddings_8gpu_bf16/latest.pth"
 
 # Text encoder and auxiliary files (same style as demo_t2m.py)
 t5_model_path = "sentencet5-xxl/"

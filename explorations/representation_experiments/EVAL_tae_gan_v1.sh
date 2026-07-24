@@ -8,6 +8,6 @@ ln -s ../options ./Evaluator_272/
 ln -s ../models ./Evaluator_272/
 ln -s ../visualization ./Evaluator_272/
 
-CKPT=${1:-../Experiments/TAE_GAN_Loss_/tae_gan_v1_t2m_272_v2/net_best_mpjpe.pth}
+CKPT=${1:-Experiments/explorations/representation_experiments/TAE_GAN_Loss_/tae_gan_v1_t2m_272_v2/net_best_mpjpe.pth}
 
 python eval_causal_TAE.py --resume-pth $CKPT

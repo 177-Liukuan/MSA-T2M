@@ -10,7 +10,7 @@ cd "$REPO_ROOT"
 NUM_GPUS=${1:-1}
 
 MSA_VAE_CKPT=${MSA_VAE_CKPT:-Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048/net_best_mpjpe.pth}
-RAG_CKPT=${RAG_CKPT:-Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_rf_100000Iter_addEMA/net_Iter100000.pth}
+RAG_CKPT=${RAG_CKPT:-Experiments/explorations/rectified_flow/MotionStreamer_t2m_272_msa_rag_t5_trans662048_rf_100000Iter_addEMA/net_Iter100000.pth}
 MOTION_LATENT_DIR=${MOTION_LATENT_DIR:-./humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048}
 TEXT_LATENT_DIR=${TEXT_LATENT_DIR:-./humanml3d_272/text_latents_t5}
 HCLS_DIR=${HCLS_DIR:-./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048}

@@ -54,7 +54,7 @@ RESUME_TRANS_A = (
 )
 # Model B: original (joint CFG training, ca_every_n_layers=4 as well)
 RESUME_TRANS_B = (
-    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
+    "Experiments/explorations/cross_attention/latent_retrieval/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
     "_6layer_top3_ddpm/net_Iter100000.pth"
 )
 
