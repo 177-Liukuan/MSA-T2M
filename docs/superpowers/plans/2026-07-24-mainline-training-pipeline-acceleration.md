@@ -48,10 +48,10 @@
 
 **Interfaces:**
 - Produces: `CacheValidationError(ValueError)`.
-- Produces: `build_cache(dataset_name: str, motion_latent_dir: str, text_latent_dir: str, hcls_dir: str, cache_dir: str, topk: int, text_embed_dim: int, exclude_self: bool = True, force: bool = False) -> dict`.
+- Produces: `build_cache(dataset_name: str, motion_latent_dir: str, text_latent_dir: str, hcls_dir: str, cache_dir: str, topk: int, text_embed_dim: int, exclude_self: bool = True, force: bool = False, retrieval_batch_size: int = 256) -> dict`.
 - Produces: `validate_cache(cache_dir: str, dataset_name: str, motion_latent_dir: str, text_latent_dir: str, hcls_dir: str, topk: int, text_embed_dim: int, exclude_self: bool = True) -> dict`.
 - Produces: `PackedMSARAGCache(cache_dir: str, requested_topk: int)` with `sample_ids`, `__len__()`, and `get(sample_idx: int, caption_idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]`.
-- Produces CLI: `python build_msa_rag_cache.py --dataset-name ... --motion-latent-dir ... --text-latent-dir ... --hcls-dir ... --cache-dir ... --topk ... --text-embed-dim ... [--force] [--validate-only]`.
+- Produces CLI: `python build_msa_rag_cache.py --dataset-name ... --motion-latent-dir ... --text-latent-dir ... --hcls-dir ... --cache-dir ... --topk ... --text-embed-dim ... [--retrieval-batch-size 256] [--force] [--validate-only]`.
 
 - [ ] **Step 1: Add a deterministic three-sample feature fixture**
 
@@ -123,17 +123,21 @@ retrieval_scores.npy
 
 Discover samples from `humanml3d_272/split/train.txt` and retain the same ordered intersection rule as the reference dataset. Convert all feature inputs to C-contiguous float32 arrays. Match the reference handling of `[CLS]` inputs by averaging axis 0 when an input is two-dimensional and flattening it otherwise. Flatten only the leading motion-sequence/caption axis; preserve the final feature dimension.
 
-For each caption, compute retrieval with the reference operations:
+Compute retrieval in bounded caption chunks with the same float32 reference
+operations:
 
 ```python
-query = torch.from_numpy(caption).float().unsqueeze(0)
+query = torch.from_numpy(caption_chunk).float()
 query = query / (query.norm(dim=-1, keepdim=True) + 1e-6)
-similarity = torch.matmul(query, library_hcls_norm.t()).squeeze(0)
-similarity[self_index] = -1e6
-scores, indices = torch.topk(similarity, k=topk, dim=0)
+similarity = torch.matmul(query, library_hcls_norm.t())
+similarity[torch.arange(chunk_size), source_sample_indices] = -1e6
+scores, indices = torch.topk(similarity, k=topk, dim=1)
 ```
 
-Store both indices and scores. For a target such as
+The default chunk contains at most 256 captions so the full similarity matrix
+is never materialized. The test fixture additionally compares chunk sizes 1
+and 3, requiring identical Top-K indices and float32-close scores. Store both
+indices and scores. For a target such as
 `humanml3d_272/msa_rag_cache/experiment-top5`, construct into a unique sibling
 such as `humanml3d_272/msa_rag_cache/.experiment-top5.tmp-550e8400`, write the
 manifest last, validate all shapes, then atomically publish it. With
