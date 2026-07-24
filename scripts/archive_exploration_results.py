@@ -66,6 +66,7 @@ class TreeSnapshot:
 
 @dataclass(frozen=True)
 class MoveRecord:
+    experiments_root: Path
     entry: ArchiveEntry
     source: Path
     destination: Path
@@ -97,6 +98,25 @@ def _nearest_existing_ancestor(path):
     return candidate
 
 
+def _reject_destination_parent_symlinks(experiments_root, destination_parent):
+    try:
+        relative_parent = destination_parent.relative_to(experiments_root)
+    except ValueError:
+        raise ValueError(
+            "destination parent is outside experiments root: {}".format(
+                destination_parent
+            )
+        )
+
+    candidate = experiments_root
+    if candidate.is_symlink():
+        raise OSError("destination parent symlink: {}".format(candidate))
+    for component in relative_parent.parts:
+        candidate = candidate / component
+        if candidate.is_symlink():
+            raise OSError("destination parent symlink: {}".format(candidate))
+
+
 def preflight(experiments_root, entries, rollback=False):
     names = [archive_entry.name for archive_entry in entries]
     if len(names) != len(set(names)):
@@ -116,6 +136,7 @@ def preflight(experiments_root, entries, rollback=False):
             raise ValueError("source symlink is not an experiment directory: {}".format(source))
         if not source.is_dir():
             raise FileNotFoundError("missing source: {}".format(source))
+        _reject_destination_parent_symlinks(experiments_root, destination.parent)
         if os.path.lexists(destination):
             raise FileExistsError("destination exists: {}".format(destination))
         if source.stat().st_dev != root_device:
@@ -129,6 +150,7 @@ def preflight(experiments_root, entries, rollback=False):
             )
         records.append(
             MoveRecord(
+                experiments_root=experiments_root,
                 entry=archive_entry,
                 source=source,
                 destination=destination,
@@ -140,7 +162,13 @@ def preflight(experiments_root, entries, rollback=False):
 
 def apply_moves(records):
     for record in records:
+        _reject_destination_parent_symlinks(
+            record.experiments_root, record.destination.parent
+        )
         record.destination.parent.mkdir(parents=True, exist_ok=True)
+        _reject_destination_parent_symlinks(
+            record.experiments_root, record.destination.parent
+        )
         if os.path.lexists(record.destination):
             raise FileExistsError(
                 "destination appeared during move: {}".format(record.destination)
@@ -309,6 +337,7 @@ def load_manifest(path, experiments_root):
         )
         records.append(
             MoveRecord(
+                experiments_root=experiments_root,
                 entry=entry_value,
                 source=experiments_root / entry_value.name,
                 destination=(

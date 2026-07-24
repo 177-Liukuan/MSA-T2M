@@ -111,6 +111,17 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
             with self.assertRaisesRegex(FileExistsError, "destination exists"):
                 preflight(root, [ArchiveEntry("clip", "run")])
 
+    def test_preflight_rejects_explorations_parent_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            outside = Path(temporary_directory) / "outside"
+            (root / "run").mkdir(parents=True)
+            outside.mkdir()
+            (root / "explorations").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(OSError, "destination parent symlink"):
+                preflight(root, [ArchiveEntry("clip", "run")])
+
     def test_apply_rejects_dangling_destination_symlink_created_after_preflight(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "Experiments"
@@ -141,6 +152,24 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
                 apply_moves(records)
             self.assertTrue(source.is_symlink())
             self.assertFalse(records[0].destination.exists())
+
+    def test_apply_rejects_route_parent_symlink_created_after_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            outside = Path(temporary_directory) / "outside"
+            source = root / "run"
+            source.mkdir(parents=True)
+            records = preflight(root, [ArchiveEntry("clip", "run")])
+            route_parent = root / "explorations" / "clip"
+            route_parent.mkdir(parents=True)
+            route_parent.rmdir()
+            outside.mkdir()
+            route_parent.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(OSError, "destination parent symlink"):
+                apply_moves(records)
+            self.assertTrue(source.is_dir())
+            self.assertTrue(route_parent.is_symlink())
 
     def test_preflight_rejects_destination_on_another_filesystem(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

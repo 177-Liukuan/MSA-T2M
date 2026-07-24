@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 import unittest
 
@@ -167,7 +168,19 @@ class ExplorationLauncherTest(unittest.TestCase):
         ):
             with self.subTest(path=relative_path):
                 content = (EXPLORATIONS / relative_path).read_text()
-                self.assertIn("resume_trans = RESUME_TRANS_B", content)
+                self.assertNotIn("RESUME_TRANS_A", content)
+                self.assertNotIn("RESUME_TRANS_B", content)
+                resume_trans = next(
+                    statement.value
+                    for statement in ast.parse(content).body
+                    if isinstance(statement, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name)
+                        and target.id == "resume_trans"
+                        for target in statement.targets
+                    )
+                )
+                self.assertEqual(ast.literal_eval(resume_trans), latent_checkpoint)
                 self.assertIn("use_joint_cfg = True", content)
 
         mca_op_content = (
