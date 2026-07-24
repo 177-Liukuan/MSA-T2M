@@ -19,6 +19,7 @@ __pycache__/
 Experiments/
 Causal_TAE/
 Evaluator_272/experiments/
+demo_output/
 
 # ========================
 # Datasets & Large Files
@@ -40,6 +41,7 @@ Evaluator_272/datasets/humanml3d_272
 *.pth
 *.pt
 *.npz
+*.safetensors
 Evaluator_272/epoch=99.ckpt
 
 # ========================
@@ -69,3 +71,14 @@ body_models/
 Unimotion/
 body_models/
 *.npy
+
+# ========================
+# Local Worktrees & LaTeX Build Products
+# ========================
+.worktrees/
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
