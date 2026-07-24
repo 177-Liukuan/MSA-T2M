@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
@@ -117,6 +118,85 @@ def _reject_destination_parent_symlinks(experiments_root, destination_parent):
             raise OSError("destination parent symlink: {}".format(candidate))
 
 
+def _validate_archive_path_component(value, is_route):
+    if not isinstance(value, str) or not value:
+        raise ValueError("unsafe archive path component: {!r}".format(value))
+    if "\\" in value:
+        raise ValueError("unsafe archive path component: {!r}".format(value))
+    normalized_parts = value.replace("\\", "/").split("/")
+    if (
+        Path(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or any(part in {"", ".", ".."} for part in normalized_parts)
+        or (not is_route and len(normalized_parts) != 1)
+    ):
+        raise ValueError("unsafe archive path component: {!r}".format(value))
+
+
+def _validate_archive_entry(archive_entry):
+    _validate_archive_path_component(archive_entry.route, is_route=True)
+    _validate_archive_path_component(archive_entry.name, is_route=False)
+
+
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _same_directory(left, right):
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _directory_path_matches_fd(path, directory_fd):
+    try:
+        lexical = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(lexical.st_mode) and _same_directory(
+        lexical, os.fstat(directory_fd)
+    )
+
+
+def _open_directory_chain(experiments_root, directory, create=False):
+    relative = directory.relative_to(experiments_root)
+    directory_fd = os.open(experiments_root, _DIRECTORY_OPEN_FLAGS)
+    try:
+        if not _directory_path_matches_fd(experiments_root, directory_fd):
+            raise OSError("destination parent changed: {}".format(experiments_root))
+        for component in relative.parts:
+            try:
+                child_fd = os.open(
+                    component, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, dir_fd=directory_fd)
+                child_fd = os.open(
+                    component, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd
+                )
+            child_stat = os.stat(
+                component, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if not stat.S_ISDIR(child_stat.st_mode) or not _same_directory(
+                child_stat, os.fstat(child_fd)
+            ):
+                os.close(child_fd)
+                raise OSError("destination parent changed: {}".format(directory))
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def _directory_entry_exists(directory_fd, name):
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def preflight(experiments_root, entries, rollback=False):
     names = [archive_entry.name for archive_entry in entries]
     if len(names) != len(set(names)):
@@ -125,6 +205,7 @@ def preflight(experiments_root, entries, rollback=False):
     records = []
     root_device = experiments_root.stat().st_dev
     for archive_entry in entries:
+        _validate_archive_entry(archive_entry)
         archived = (
             experiments_root / "explorations" / archive_entry.route / archive_entry.name
         )
@@ -165,21 +246,64 @@ def apply_moves(records):
         _reject_destination_parent_symlinks(
             record.experiments_root, record.destination.parent
         )
-        record.destination.parent.mkdir(parents=True, exist_ok=True)
-        _reject_destination_parent_symlinks(
-            record.experiments_root, record.destination.parent
+        destination_fd = _open_directory_chain(
+            record.experiments_root, record.destination.parent, create=True
         )
-        if os.path.lexists(record.destination):
-            raise FileExistsError(
-                "destination appeared during move: {}".format(record.destination)
+        source_fd = _open_directory_chain(
+            record.experiments_root, record.source.parent
+        )
+        try:
+            if not _directory_path_matches_fd(record.destination.parent, destination_fd):
+                raise OSError(
+                    "destination parent changed: {}".format(record.destination.parent)
+                )
+            if _directory_entry_exists(destination_fd, record.destination.name):
+                raise FileExistsError(
+                    "destination appeared during move: {}".format(record.destination)
+                )
+            source_stat = os.stat(
+                record.source.name, dir_fd=source_fd, follow_symlinks=False
             )
-        if record.source.is_symlink():
-            raise ValueError(
-                "source symlink appeared during move: {}".format(record.source)
-            )
-        if not record.source.is_dir():
-            raise FileNotFoundError("source disappeared during move: {}".format(record.source))
-        record.source.rename(record.destination)
+            if stat.S_ISLNK(source_stat.st_mode):
+                raise ValueError(
+                    "source symlink appeared during move: {}".format(record.source)
+                )
+            if not stat.S_ISDIR(source_stat.st_mode):
+                raise FileNotFoundError(
+                    "source disappeared during move: {}".format(record.source)
+                )
+            try:
+                os.rename(
+                    record.source.name,
+                    record.destination.name,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=destination_fd,
+                )
+            except OSError:
+                if not _directory_path_matches_fd(
+                    record.destination.parent, destination_fd
+                ):
+                    raise OSError(
+                        "destination parent changed during move: {}".format(
+                            record.destination.parent
+                        )
+                    )
+                raise
+            if not _directory_path_matches_fd(record.destination.parent, destination_fd):
+                os.rename(
+                    record.destination.name,
+                    record.source.name,
+                    src_dir_fd=destination_fd,
+                    dst_dir_fd=source_fd,
+                )
+                raise OSError(
+                    "destination parent changed during move: {}".format(
+                        record.destination.parent
+                    )
+                )
+        finally:
+            os.close(source_fd)
+            os.close(destination_fd)
         verify_moves([record])
 
 
@@ -288,16 +412,10 @@ def render_manifest(records, operation):
 
 
 def _validate_manifest_path_component(value, is_route):
-    if not isinstance(value, str) or not value:
-        raise ValueError("unsafe manifest path component: {!r}".format(value))
-    normalized_parts = value.replace("\\", "/").split("/")
-    if (
-        Path(value).is_absolute()
-        or PureWindowsPath(value).is_absolute()
-        or any(part in {"", ".", ".."} for part in normalized_parts)
-        or (not is_route and len(normalized_parts) != 1)
-    ):
-        raise ValueError("unsafe manifest path component: {!r}".format(value))
+    try:
+        _validate_archive_path_component(value, is_route)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("unsafe archive path", "unsafe manifest path"))
 
 
 def load_manifest(path, experiments_root):

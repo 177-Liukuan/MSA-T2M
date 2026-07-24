@@ -630,9 +630,10 @@ def main():
         model_dim           = config.n_embd,
         disable_rag         = disable_rag,
         latent_dim          = latent_dim,
-        ca_every_n_layers   = ca_every_n_auto,    # ← KEY FIX
+        ca_every_n_layers   = 4,                  # Matches the archived checkpoint/eval.
         ff_mult             = ff_mult_ckpt,        # ← from checkpoint
         disable_latent_retr = disable_latent_retr,
+        ca_insertion_mode   = "after_sa",
     ).to(device)
     print(f"  [Model] {rag_model.extra_repr()}")
 

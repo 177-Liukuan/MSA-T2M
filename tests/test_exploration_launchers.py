@@ -183,6 +183,42 @@ class ExplorationLauncherTest(unittest.TestCase):
                 self.assertEqual(ast.literal_eval(resume_trans), latent_checkpoint)
                 self.assertIn("use_joint_cfg = True", content)
 
+                tree = ast.parse(content)
+                wrapper_call = next(
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "LLaMARAGLatentRetrWrapper"
+                )
+                keyword_values = {
+                    keyword.arg: keyword.value for keyword in wrapper_call.keywords
+                }
+                self.assertIn("ca_every_n_layers", keyword_values)
+                if relative_path.endswith("msa_gen_motion_mca.py"):
+                    self.assertEqual(
+                        ast.literal_eval(keyword_values["ca_every_n_layers"]), 4
+                    )
+                if "ca_insertion_mode" in keyword_values:
+                    insertion_mode = keyword_values["ca_insertion_mode"]
+                    if isinstance(insertion_mode, ast.Name):
+                        insertion_mode = next(
+                            statement.value
+                            for statement in tree.body
+                            if isinstance(statement, ast.Assign)
+                            and any(
+                                isinstance(target, ast.Name)
+                                and target.id == insertion_mode.id
+                                for target in statement.targets
+                            )
+                        )
+                    self.assertEqual(
+                        ast.literal_eval(insertion_mode),
+                        "after_sa",
+                    )
+                else:
+                    self.fail("missing explicit ca_insertion_mode")
+
         mca_op_content = (
             EXPLORATIONS / "cross_attention/mca/msa_gen_motion_mca_op.py"
         ).read_text()

@@ -74,6 +74,28 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate source"):
                 preflight(root, entries)
 
+    def test_preflight_rejects_unsafe_entry_paths_before_creating_outside_root(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            source = root / "run"
+            source.mkdir(parents=True)
+            outside = Path(temporary_directory) / "outside"
+            unsafe_entries = (
+                ArchiveEntry("../../outside", "run"),
+                ArchiveEntry("/outside", "run"),
+                ArchiveEntry("clip\\outside", "run"),
+                ArchiveEntry("clip//nested", "run"),
+                ArchiveEntry("clip", "../run"),
+                ArchiveEntry("clip", "run\\outside"),
+            )
+
+            for archive_entry in unsafe_entries:
+                with self.subTest(entry=archive_entry):
+                    with self.assertRaisesRegex(ValueError, "unsafe archive path"):
+                        preflight(root, [archive_entry])
+            self.assertTrue(source.is_dir())
+            self.assertFalse(outside.exists())
+
     def test_preflight_rejects_missing_source(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "Experiments"
@@ -170,6 +192,36 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
                 apply_moves(records)
             self.assertTrue(source.is_dir())
             self.assertTrue(route_parent.is_symlink())
+
+    def test_apply_restores_source_if_route_parent_changes_at_rename(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            outside = Path(temporary_directory) / "outside"
+            source = root / "run"
+            source.mkdir(parents=True)
+            (source / "checkpoint.pth").write_bytes(b"checkpoint")
+            records = preflight(root, [ArchiveEntry("clip", "run")])
+            route_parent = root / "explorations" / "clip"
+            outside.mkdir()
+            original_rename = os.rename
+            swapped = [False]
+
+            def swap_route_then_rename(*args, **kwargs):
+                if not swapped[0]:
+                    route_parent.rmdir()
+                    route_parent.symlink_to(outside, target_is_directory=True)
+                    swapped[0] = True
+                return original_rename(*args, **kwargs)
+
+            with patch(
+                "scripts.archive_exploration_results.os.rename",
+                side_effect=swap_route_then_rename,
+            ):
+                with self.assertRaisesRegex(OSError, "destination parent changed"):
+                    apply_moves(records)
+            self.assertTrue((source / "checkpoint.pth").is_file())
+            self.assertTrue(route_parent.is_symlink())
+            self.assertFalse((outside / "run").exists())
 
     def test_preflight_rejects_destination_on_another_filesystem(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
