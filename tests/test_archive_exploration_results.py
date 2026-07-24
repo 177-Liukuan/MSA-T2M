@@ -126,6 +126,22 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
             self.assertTrue(source.is_dir())
             self.assertTrue(destination.is_symlink())
 
+    def test_apply_rejects_source_symlink_created_after_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            source = root / "run"
+            source.mkdir(parents=True)
+            records = preflight(root, [ArchiveEntry("clip", "run")])
+            source.rmdir()
+            target = root / "replacement"
+            target.mkdir()
+            source.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "source symlink appeared"):
+                apply_moves(records)
+            self.assertTrue(source.is_symlink())
+            self.assertFalse(records[0].destination.exists())
+
     def test_preflight_rejects_destination_on_another_filesystem(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "Experiments"

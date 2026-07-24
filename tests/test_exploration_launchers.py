@@ -147,10 +147,19 @@ class ExplorationLauncherTest(unittest.TestCase):
         )
         for relative_path in (
             "cross_attention/latent_retrieval/EVAL_t2m_rag_latent_retr.sh",
-            "cross_attention/latent_retrieval/EVAL_t2m_rag_latent_retr_addcfg.sh",
         ):
             with self.subTest(path=relative_path):
-                self.assertIn(latent_checkpoint, (EXPLORATIONS / relative_path).read_text())
+                content = (EXPLORATIONS / relative_path).read_text()
+                self.assertIn(latent_checkpoint, content)
+                self.assertIn("CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:-4}", content)
+
+        addcfg_content = (
+            EXPLORATIONS
+            / "cross_attention/latent_retrieval/EVAL_t2m_rag_latent_retr_addcfg.sh"
+        ).read_text()
+        self.assertIn("RAG_CKPT=${RAG_CKPT:?", addcfg_content)
+        self.assertIn("CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:?", addcfg_content)
+        self.assertIn("CA_INSERTION_MODE=${CA_INSERTION_MODE:?", addcfg_content)
 
         for relative_path in (
             "cross_attention/mca/msa_gen_motion_mca.py",
@@ -159,6 +168,12 @@ class ExplorationLauncherTest(unittest.TestCase):
             with self.subTest(path=relative_path):
                 content = (EXPLORATIONS / relative_path).read_text()
                 self.assertIn("resume_trans = RESUME_TRANS_B", content)
+                self.assertIn("use_joint_cfg = True", content)
+
+        mca_op_content = (
+            EXPLORATIONS / "cross_attention/mca/msa_gen_motion_mca_op.py"
+        ).read_text()
+        self.assertIn("ca_every_n_layers_override = 4", mca_op_content)
 
         local_content = (
             EXPLORATIONS / "cross_attention/local_rag/msa_gen_motion_local.py"

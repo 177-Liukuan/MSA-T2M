@@ -145,6 +145,12 @@ def apply_moves(records):
             raise FileExistsError(
                 "destination appeared during move: {}".format(record.destination)
             )
+        if record.source.is_symlink():
+            raise ValueError(
+                "source symlink appeared during move: {}".format(record.source)
+            )
+        if not record.source.is_dir():
+            raise FileNotFoundError("source disappeared during move: {}".format(record.source))
         record.source.rename(record.destination)
         verify_moves([record])
 

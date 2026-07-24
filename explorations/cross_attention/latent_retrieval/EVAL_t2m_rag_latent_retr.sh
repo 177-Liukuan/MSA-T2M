@@ -37,7 +37,7 @@ LATENT_DIM=${LATENT_DIM:-16}
 
 # CA architecture hyper-parameters  ── must match training config
 CA_N_HEAD=${CA_N_HEAD:-0}               # 0 = auto (same as backbone)
-CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:-2}  # Must match training (e.g. 1=every layer)
+CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:-4}  # Must match the archived 6-layer checkpoint
 CA_INSERTION_MODE=${CA_INSERTION_MODE:-after_sa}   # before_sa | after_sa | late_after_sa
 # CFG_SCALE_RETR is no longer used: inference uses 2-forward velocity-space CFG
 # (joint dropout mode). The retrieval signal is baked into z_cond via CA blocks.

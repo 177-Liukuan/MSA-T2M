@@ -75,7 +75,7 @@ ca_insertion_mode = 'after_sa'   # ← change this when switching checkpoints
 # For 'late_after_sa', this is the stride within the second-half layers only.
 # For 'before_sa' / 'after_sa', this is the global stride across all layers.
 # Set to None to auto-detect (reliable for before_sa/after_sa; NOT for late_after_sa).
-ca_every_n_layers_override = 2   # ← set to None to auto-detect
+ca_every_n_layers_override = 4   # Matches the archived Model B checkpoint.
 
 # For model A (trained with independent retrieval CFG): use dual-CFG (3-forward).
 #   cfg_scale_retr controls retrieval contribution (1.0 = mild, 2.0 = stronger).
@@ -100,7 +100,7 @@ cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=Fa
 #   is an out-of-distribution extrapolation the diffusion head has never seen.
 #   For a 12-CA-block model the difference (z_both - z_retr) is huge, so the
 #   4x amplification pushes z_guided far outside the training manifold.
-use_joint_cfg = False    # True for ALL models — see explanation above
+use_joint_cfg = True     # Model B uses joint-CFG training.
 
 # Stop token threshold (L2 distance from generated token to reference_end_latent).
 # Data calibration:

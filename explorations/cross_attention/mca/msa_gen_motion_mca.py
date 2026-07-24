@@ -84,7 +84,7 @@ cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=Fa
 #   is an out-of-distribution extrapolation the diffusion head has never seen.
 #   For a 12-CA-block model the difference (z_both - z_retr) is huge, so the
 #   4x amplification pushes z_guided far outside the training manifold.
-use_joint_cfg = False    # True for ALL models — see explanation above
+use_joint_cfg = True     # Model B uses joint-CFG training.
 
 # Stop token threshold (L2 distance from generated token to reference_end_latent).
 # Data calibration:
