@@ -1,8 +1,11 @@
 import io
+import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.archive_exploration_results import (
     ARCHIVE_ENTRIES,
@@ -17,6 +20,29 @@ from scripts.archive_exploration_results import (
 
 
 class ArchiveExplorationResultsTest(unittest.TestCase):
+    @staticmethod
+    def _write_manifest_payload(path, entries):
+        payload = {
+            "version": 1,
+            "records": [
+                {
+                    "route": entry.route,
+                    "name": entry.name,
+                    "snapshot": {
+                        "byte_size": 0,
+                        "file_count": 0,
+                        "checkpoint_names": [],
+                    },
+                }
+                for entry in entries
+            ],
+        }
+        path.write_text(
+            "<!-- ARCHIVE_MANIFEST_JSON\n{}\nARCHIVE_MANIFEST_JSON -->".format(
+                json.dumps(payload)
+            )
+        )
+
     def test_manifest_contains_exactly_35_unique_sources(self):
         names = [entry.name for entry in ARCHIVE_ENTRIES]
         self.assertEqual(len(names), 35)
@@ -63,6 +89,29 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
             with self.assertRaisesRegex(FileExistsError, "destination exists"):
                 preflight(root, [ArchiveEntry("clip", "run")])
 
+    def test_preflight_rejects_destination_on_another_filesystem(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            source = root / "run"
+            destination_parent = root / "explorations"
+            source.mkdir(parents=True)
+            destination_parent.mkdir()
+            original_stat = Path.stat
+
+            def stat_with_destination_on_another_device(path, *args, **kwargs):
+                result = original_stat(path, *args, **kwargs)
+                if path == destination_parent:
+                    values = list(result)
+                    values[2] = result.st_dev + 1
+                    return os.stat_result(values)
+                return result
+
+            with patch.object(Path, "stat", new=stat_with_destination_on_another_device):
+                with self.assertRaisesRegex(OSError, "destination is on a different filesystem"):
+                    preflight(root, [ArchiveEntry("clip", "run")])
+            self.assertTrue(source.is_dir())
+            self.assertFalse((destination_parent / "clip" / "run").exists())
+
     def test_apply_verify_and_rollback_preserve_tree(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "Experiments"
@@ -88,16 +137,49 @@ class ArchiveExplorationResultsTest(unittest.TestCase):
     def test_manifest_round_trip_preserves_pre_move_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "Experiments"
-            run = root / "run"
-            run.mkdir(parents=True)
+            for entry in ARCHIVE_ENTRIES:
+                (root / entry.name).mkdir(parents=True)
+            run = root / ARCHIVE_ENTRIES[0].name
             (run / "checkpoint.ckpt").write_bytes(b"model")
-            records = preflight(root, [ArchiveEntry("clip", "run")])
+            records = preflight(root, ARCHIVE_ENTRIES)
             manifest_path = root / "archive.md"
             manifest_path.write_text(render_manifest(records, "archive"))
 
             loaded = load_manifest(manifest_path, root)
 
             self.assertEqual(loaded, records)
+
+    def test_load_manifest_rejects_wrong_entry_count_and_membership(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            root.mkdir()
+            manifest_path = root / "archive.md"
+
+            self._write_manifest_payload(manifest_path, ARCHIVE_ENTRIES[:-1])
+            with self.assertRaisesRegex(ValueError, "exactly 35"):
+                load_manifest(manifest_path, root)
+
+            altered_entries = list(ARCHIVE_ENTRIES)
+            altered_entries[0] = ArchiveEntry("clip", "unexpected")
+            self._write_manifest_payload(manifest_path, altered_entries)
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                load_manifest(manifest_path, root)
+
+    def test_load_manifest_rejects_traversal_and_absolute_components(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "Experiments"
+            root.mkdir()
+            manifest_path = root / "archive.md"
+            for unsafe_entry in (
+                ArchiveEntry("../clip", ARCHIVE_ENTRIES[0].name),
+                ArchiveEntry("clip", "/outside"),
+            ):
+                altered_entries = list(ARCHIVE_ENTRIES)
+                altered_entries[0] = unsafe_entry
+                self._write_manifest_payload(manifest_path, altered_entries)
+                with self.subTest(entry=unsafe_entry):
+                    with self.assertRaisesRegex(ValueError, "unsafe manifest path"):
+                        load_manifest(manifest_path, root)
 
     def test_cli_apply_verify_and_rollback_use_manifest(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

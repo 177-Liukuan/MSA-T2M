@@ -4,7 +4,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 @dataclass(frozen=True)
@@ -86,6 +86,16 @@ def snapshot_tree(path):
     )
 
 
+def _nearest_existing_ancestor(path):
+    candidate = path
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            raise FileNotFoundError("no existing destination ancestor: {}".format(path))
+        candidate = parent
+    return candidate
+
+
 def preflight(experiments_root, entries, rollback=False):
     names = [archive_entry.name for archive_entry in entries]
     if len(names) != len(set(names)):
@@ -107,6 +117,13 @@ def preflight(experiments_root, entries, rollback=False):
             raise FileExistsError("destination exists: {}".format(destination))
         if source.stat().st_dev != root_device:
             raise OSError("source is on a different filesystem: {}".format(source))
+        destination_ancestor = _nearest_existing_ancestor(destination.parent)
+        if destination_ancestor.stat().st_dev != root_device:
+            raise OSError(
+                "destination is on a different filesystem: {}".format(
+                    destination_ancestor
+                )
+            )
         records.append(
             MoveRecord(
                 entry=archive_entry,
@@ -233,6 +250,19 @@ def render_manifest(records, operation):
     return "\n".join(lines)
 
 
+def _validate_manifest_path_component(value, is_route):
+    if not isinstance(value, str) or not value:
+        raise ValueError("unsafe manifest path component: {!r}".format(value))
+    normalized_parts = value.replace("\\", "/").split("/")
+    if (
+        Path(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or any(part in {"", ".", ".."} for part in normalized_parts)
+        or (not is_route and len(normalized_parts) != 1)
+    ):
+        raise ValueError("unsafe manifest path component: {!r}".format(value))
+
+
 def load_manifest(path, experiments_root):
     content = Path(path).read_text()
     match = re.search(
@@ -245,9 +275,23 @@ def load_manifest(path, experiments_root):
     payload = json.loads(match.group(1))
     if payload.get("version") != 1:
         raise ValueError("unsupported manifest version")
+    items = payload.get("records")
+    if not isinstance(items, list) or len(items) != len(ARCHIVE_ENTRIES):
+        raise ValueError("manifest must contain exactly 35 archive entries")
+    entries = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("manifest record must be an object")
+        route = item.get("route")
+        name = item.get("name")
+        _validate_manifest_path_component(route, is_route=True)
+        _validate_manifest_path_component(name, is_route=False)
+        entries.append(ArchiveEntry(route=route, name=name))
+    if set(entries) != set(ARCHIVE_ENTRIES):
+        raise ValueError("manifest entries do not match immutable archive manifest")
+
     records = []
-    for item in payload.get("records", []):
-        entry_value = ArchiveEntry(route=item["route"], name=item["name"])
+    for item, entry_value in zip(items, entries):
         snapshot_value = item["snapshot"]
         snapshot = TreeSnapshot(
             byte_size=snapshot_value["byte_size"],
