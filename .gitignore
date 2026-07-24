@@ -69,6 +69,7 @@ VideoVAEPlus/
 output/
 sentencet5-xxl/
 humanml3d_272/t2m_latents/
+humanml3d_272/msa_rag_cache/
 .vscode/
 __pycache__/
 *.pyc

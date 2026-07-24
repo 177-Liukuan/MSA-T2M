@@ -79,6 +79,12 @@ def parse_args():
     extra_parser.add_argument('--cfg_dropout_prob', type=float, default=0.1)
     extra_parser.add_argument('--num_workers', type=int, default=4)
     extra_parser.add_argument('--text_embed_dim', type=int, default=768)
+    extra_parser.add_argument(
+        '--cache_mode',
+        choices=('reference', 'packed'),
+        default='reference',
+    )
+    extra_parser.add_argument('--cache_dir', type=str, default=None)
     extra_parser.add_argument('--disable_rag', action='store_true', default=False, help='Ablation: disable retrieval token and use text-only conditioning.')
     extra_parser.add_argument('--ema_decay', type=float, default=0.9999)
     extra_parser.add_argument('--ema_update_every', type=int, default=1)
@@ -100,6 +106,8 @@ def parse_args():
     args.cfg_dropout_prob = custom_args.cfg_dropout_prob
     args.num_workers = custom_args.num_workers
     args.text_embed_dim = custom_args.text_embed_dim
+    args.cache_mode = custom_args.cache_mode
+    args.cache_dir = custom_args.cache_dir
     args.disable_rag = custom_args.disable_rag
     args.ema_decay = custom_args.ema_decay
     args.ema_update_every = custom_args.ema_update_every
@@ -186,6 +194,8 @@ def main():
         topk=args.retrieval_topk,
         num_workers=args.num_workers,
         text_embed_dim=args.text_embed_dim,
+        cache_mode=args.cache_mode,
+        cache_dir=args.cache_dir,
     )
 
     # Load precomputed empty text embedding for CFG unconditional branch.

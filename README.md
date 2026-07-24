@@ -258,12 +258,40 @@ export EMPTY_TEXT_PATH=./humanml3d_272/text_latents_t5/empty_text_embedding.npy
 GENERATIVE_HEAD_TYPE=ddpm bash TRAIN_t2m_rag.sh <NUM_GPUS>
 ```
 
+正式 launcher 默认使用 `RAG_CACHE_MODE=packed`。首次启动时，它会在
+`accelerate launch` 之前，将静态 motion latent、caption T5 特征和
+`[CLS]` 库打包，并为每条 caption 预计算 Top-K 检索；后续实验会先校验
+源文件和配置，再复用该缓存。缓存位于
+`humanml3d_272/msa_rag_cache/`，属于本地生成产物，不应提交到 Git。
+
+如果更换或重新导出了 MSA-VAE/T5 特征，应显式重建：
+
+```bash
+REBUILD_RAG_CACHE=true \
+GENERATIVE_HEAD_TYPE=ddpm \
+bash TRAIN_t2m_rag.sh <NUM_GPUS>
+```
+
+慢速 reference 路径仍保留用于数值等价性复核和紧急回退：
+
+```bash
+RAG_CACHE_MODE=reference \
+GENERATIVE_HEAD_TYPE=ddpm \
+bash TRAIN_t2m_rag.sh <NUM_GPUS>
+```
+
+可通过 `RAG_CACHE_DIR`、`RETRIEVAL_TOPK` 和 `NUM_WORKERS` 覆盖默认缓存
+目录、Top-K 和 DataLoader worker 数。packed 模式检测到缓存不完整、
+源文件变化或配置不兼容时会直接停止，不会静默退回在线检索。
+
 核心调用链为：
 
 ```text
 TRAIN_t2m_rag.sh
+├── build_msa_rag_cache.py
 └── train_t2m_rag.py
     ├── humanml3d_272/dataset_msa_rag.py
+    ├── models/rag_training.py
     ├── models/llama_model.py
     └── models/llama_rag_model.py
 ```
