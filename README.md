@@ -199,7 +199,8 @@ TEXT_ENCODER_TYPE=t5 \
 bash TRAIN_msa_vae_phase2.sh <NUM_GPUS> t2m_272
 ```
 
-> **不要将 `TRAIN_msa_vae.sh` 当作正式入口。** 它是早期一次性训练/CLIP 配置的遗留脚本，没有体现最终的三阶段渐进训练。
+> **不要将 `explorations/representation_experiments/TRAIN_msa_vae.sh`
+> 当作正式入口。** 它是早期一次性训练/CLIP 配置的遗留脚本，没有体现最终的三阶段渐进训练。
 
 ### 迭代数说明
 
@@ -339,6 +340,10 @@ python msa_gen_motion.py
 
 ## 代码谱系与状态
 
+根目录仅保留论文正式复现入口。消融、负结果、上游基线、早期 demo
+和诊断脚本统一归档在 [`explorations/`](explorations/README.md)；归档脚本应从
+仓库根目录按该索引中的新命令启动。
+
 ### `OFFICIAL`：论文正式主线
 
 | 路线 | 关键文件 | 说明 |
@@ -355,40 +360,41 @@ python msa_gen_motion.py
 | 去除局部/全局对齐 | `--local_align_weight`、`--global_align_weight` | MSA-VAE 组件消融 |
 | 去除 dual-track decoupling | `--disable_decoupling` | MSA-VAE 结构消融 |
 | 不同检索数量 K | `--retrieval_topk` | RAG 超参数消融 |
-| No-RAG | `--disable_rag` | 模型实现支持；现有 launcher 需要修正，见“已知问题” |
+| No-RAG | `--disable_rag` | 使用 `explorations/ablations/no_rag/TRAIN_t2m_no_rag.sh` |
 
 ### `EXPERIMENTAL`：论文之后或尚未进入正式主线
 
 | 路线 | 关键文件 | 说明 |
 |---|---|---|
-| Local RAG cross-attention | `train_t2m_rag_local.py`、`eval_msa_t2m_rag_local.py` | 使用检索到的局部 `mu` token；不是当前论文方法 |
-| Multi-text-token MCA | `train_t2m_rag_multi_text_token.py`、`models/llama_rag_model_mca.py` | token-level T5 cross-attention |
-| Latent retrieval CA | `train_t2m_rag_latent_retr.py`、`models/llama_rag_model_latent_retr.py` | 检索完整 motion latent 后做 cross-attention |
-| MCA/local inference | `msa_gen_motion_mca.py`、`msa_gen_motion_local.py` | 对应探索分支的推理 |
+| Local RAG cross-attention | `explorations/cross_attention/local_rag/` | 使用检索到的局部 `mu` token；不是当前论文方法 |
+| Multi-text-token MCA | `explorations/cross_attention/mca/`、`models/llama_rag_model_mca.py` | token-level T5 cross-attention |
+| Latent retrieval CA | `explorations/cross_attention/latent_retrieval/`、`models/llama_rag_model_latent_retr.py` | 检索完整 motion latent 后做 cross-attention |
+| MCA/local inference | `explorations/cross_attention/` | 对应探索分支的推理 |
 
 ### `LEGACY / NEGATIVE RESULT`：早期或效果不佳路线
 
 | 路线 | 关键文件 | 结论 |
 |---|---|---|
-| CLIP 文本编码 | `train_t2m_baseline_clip.py`、`demo_msa_t2m_clip.py`、`get_text_latent_clip.py` | 早期版本，最终方法改用 T5 |
-| Rectified Flow head | `Train_t2m_rag_rf.sh`、`eval_msa_t2m_rag_t5_rf.py`、`models/diffloss.py` | 替换 DDPM 后效果不佳，正式方法保留 DDPM |
-| 生成器 cross-attention | `Train_t2m_rag_multi_text_token.sh`、`models/llama_rag_model_mca.py` | MCA 路线效果未达到主线；不属于论文 |
-| Q-Former RAG | `train_qformer_rag.py`、`TRAIN_qformer_rag.sh` | 独立检索表示尝试，未进入当前方法 |
-| 一次性 MSA-VAE | `TRAIN_msa_vae.sh` | 早期 CLIP/phase-0 入口，已由三阶段训练替代 |
-| 原始 MotionStreamer | `train_t2m.py`、`train_motionstreamer.py` | 上游基线与继承代码，不是 MSA-T2M |
+| CLIP 文本编码 | `explorations/clip/` | 早期版本，最终方法改用 T5 |
+| Rectified Flow head | `explorations/rectified_flow/`、`models/diffloss.py` | 替换 DDPM 后效果不佳，正式方法保留 DDPM |
+| 生成器 cross-attention | `explorations/cross_attention/mca/`、`models/llama_rag_model_mca.py` | MCA 路线效果未达到主线；不属于论文 |
+| Q-Former RAG | `explorations/qformer/` | 独立检索表示尝试，未进入当前方法 |
+| 一次性 MSA-VAE | `explorations/representation_experiments/TRAIN_msa_vae.sh` | 早期 CLIP/phase-0 入口，已由三阶段训练替代 |
+| 原始 MotionStreamer | `explorations/motionstreamer_baselines/` | 上游基线与继承代码，不是 MSA-T2M |
 
 `EXPERIMENTAL` 与 `LEGACY / NEGATIVE RESULT` 的区别是：前者可作为 AAAI 2027 补充实验候选，后者已有负面结果或已经被正式设计替代。交叉注意力相关代码跨越多个时间点，均不应混入正式复现命令。
 
 ## 已知问题与复现注意事项
 
-1. **T5 launcher 失效：** `PREPARE_text_embeddings.sh` 当前调用仓库中不存在的 **prepare_text_embeddings.py**。请直接使用 `get_text_latent_t5.py`，不要把该 launcher 作为已验证入口。
-2. **No-RAG launcher 未传参：** `TRAIN_t2m_no_rag.sh` 仅设置环境变量 `DISABLE_RAG=1`，但 `TRAIN_t2m_rag.sh` 当前没有将它转换为 `--disable_rag`。做消融时应直接给 `train_t2m_rag.py` 传参或先修复 launcher。
-3. **论文与 shell 迭代数不一致：** 草稿写为 2000K / 25K / 5K，当前 MSA-VAE phase shell 为 50K / 50K。
-4. **K 的默认值发生过变化：** 当前 `TRAIN_t2m_rag.sh` 默认 K=5，部分 checkpoint 名与评估脚本仍包含 K=3。
-5. **大量路径仍硬编码：** shell 和 demo 中的实验名是作者工作区快照，运行前必须改为自己的 checkpoint/feature 目录。
-6. **推理脚本尚未 CLI 化：** `msa_gen_motion.py` 需在文件顶部修改配置。
-7. **环境文件需要复核：** 当前运行环境出现过 NumPy ABI 及 Hugging Face 依赖版本冲突，完整 clean-environment smoke test 尚未完成。
-8. **尚未发布完整资产：** MSA-T2M checkpoint、完整局部标签预处理和最终 AAAI 配置尚未公开。
+1. **历史 T5 launcher 失效：** `explorations/qformer/PREPARE_text_embeddings.sh`
+   调用仓库中不存在的 `prepare_text_embeddings.py`。正式路线请直接使用
+   `get_text_latent_t5.py`。
+2. **论文与 shell 迭代数不一致：** 草稿写为 2000K / 25K / 5K，当前 MSA-VAE phase shell 为 50K / 50K。
+3. **K 的默认值发生过变化：** 当前 `TRAIN_t2m_rag.sh` 默认 K=5，部分 checkpoint 名与评估脚本仍包含 K=3。
+4. **大量路径仍硬编码：** shell 和 demo 中的实验名是作者工作区快照，运行前必须改为自己的 checkpoint/feature 目录。
+5. **推理脚本尚未 CLI 化：** `msa_gen_motion.py` 需在文件顶部修改配置。
+6. **环境文件需要复核：** 当前运行环境出现过 NumPy ABI 及 Hugging Face 依赖版本冲突，完整 clean-environment smoke test 尚未完成。
+7. **尚未发布完整资产：** MSA-T2M checkpoint、完整局部标签预处理和最终 AAAI 配置尚未公开。
 
 ## 与 MotionStreamer 的关系
 

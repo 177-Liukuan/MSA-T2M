@@ -1,0 +1,1 @@
+"""Upstream MotionStreamer baseline entrypoints."""

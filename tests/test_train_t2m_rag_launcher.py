@@ -8,6 +8,13 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPOSITORY_ROOT / "TRAIN_t2m_rag.sh"
+NO_RAG_LAUNCHER = (
+    REPOSITORY_ROOT
+    / "explorations"
+    / "ablations"
+    / "no_rag"
+    / "TRAIN_t2m_no_rag.sh"
+)
 
 
 def write_executable(path, content):
@@ -47,7 +54,12 @@ printf 'accelerate:%s\\n' "$*" >> "$LOG_PATH"
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def run_launcher(self, cache_mode="packed", cache_exit_code=0):
+    def run_launcher(
+        self,
+        cache_mode="packed",
+        cache_exit_code=0,
+        launcher=LAUNCHER,
+    ):
         environment = os.environ.copy()
         environment.update(
             {
@@ -68,7 +80,7 @@ printf 'accelerate:%s\\n' "$*" >> "$LOG_PATH"
             }
         )
         return subprocess.run(
-            ["bash", str(LAUNCHER), "1"],
+            ["bash", str(launcher), "1"],
             cwd=str(REPOSITORY_ROOT),
             env=environment,
             text=True,
@@ -109,6 +121,16 @@ printf 'accelerate:%s\\n' "$*" >> "$LOG_PATH"
         commands = self.read_commands()
         self.assertEqual(len(commands), 1)
         self.assertTrue(commands[0].startswith("cache:"), commands)
+
+    def test_no_rag_wrapper_reaches_official_launcher_and_sets_flag(self):
+        result = self.run_launcher(
+            "reference",
+            launcher=NO_RAG_LAUNCHER,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        commands = self.read_commands()
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--disable_rag", commands[0])
 
 
 if __name__ == "__main__":

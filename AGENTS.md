@@ -7,7 +7,7 @@ main research path has two stages:
 
 1. `models/msa_vae.py` and `train_msa_vae.py` learn the multi-scale semantic
    alignment VAE (MSA-VAE).
-2. `models/llama_rag_model.py` and the `train_t2m_rag*.py` entrypoints train
+2. `models/llama_rag_model.py` and `train_t2m_rag.py` train
    retrieval-augmented autoregressive diffusion in the learned latent space.
 
 The 272-dimensional HumanML3D data loaders live in `humanml3d_272/`. Shared
@@ -36,18 +36,18 @@ allocated multi-GPU machine.
 ## Authoritative workflows
 
 - MSA-VAE training is progressive. Use `TRAIN_msa_vae_phase1.sh` followed by
-  `TRAIN_msa_vae_phase2.sh`; `TRAIN_msa_vae.sh` and `train_msa_vae.py` contain
-  the shared implementation.
+  `TRAIN_msa_vae_phase2.sh`; `train_msa_vae.py` contains the shared
+  implementation.
 - Extract MSA-VAE motion and retrieval latents with `get_msa_latent.py`.
 - Train the global retrieval model with `TRAIN_t2m_rag.sh` /
   `train_t2m_rag.py`.
-- Train the global-plus-local retrieval model with
-  `TRAIN_t2m_rag_local.sh` / `train_t2m_rag_local.py`.
 - Evaluate MSA-VAE reconstruction with `EVAL_msa_vae.sh`.
-- Evaluate generation with `EVAL_t2m_rag_t5.sh` or
-  `EVAL_t2m_rag_local.sh`, matching the checkpoint architecture.
-- Use `TRAIN_THEN_EVAL_t2m_rag_local.sh` only when an end-to-end run was
-  explicitly requested.
+- Evaluate official generation with `EVAL_t2m_rag_t5.sh`.
+
+Exploration and ablation entrypoints are archived under `explorations/`; see
+`explorations/README.md` for their commands and status. Do not modify or use
+that tree for official work unless an exploration or ablation is explicitly
+in scope.
 
 Treat shell scripts as experiment records as well as launchers. Keep training
 and evaluation values consistent for checkpoint paths, latent directories,

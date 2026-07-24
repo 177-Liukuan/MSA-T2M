@@ -21,6 +21,20 @@ EMPTY_TEXT_PATH=${EMPTY_TEXT_PATH:-./humanml3d_272/text_latents_t5/empty_text_em
 TEXT_EMBED_DIM=${TEXT_EMBED_DIM:-768}
 RETRIEVAL_TOPK=${RETRIEVAL_TOPK:-5}
 NUM_WORKERS=${NUM_WORKERS:-4}
+DISABLE_RAG=${DISABLE_RAG:-0}
+
+ABLATION_FLAGS=()
+case "$DISABLE_RAG" in
+  1|true|TRUE|yes|YES)
+    ABLATION_FLAGS+=(--disable_rag)
+    ;;
+  0|false|FALSE|no|NO)
+    ;;
+  *)
+    echo "ERROR: DISABLE_RAG must be a boolean value, got: $DISABLE_RAG"
+    exit 2
+    ;;
+esac
 
 RAG_CACHE_MODE=${RAG_CACHE_MODE:-packed}
 MOTION_EXPERIMENT=$(basename "${MOTION_LATENT_DIR%/}")
@@ -47,6 +61,7 @@ echo "h_cls latents   : $HCLS_DIR"
 echo "Motion latents  : $MOTION_LATENT_DIR"
 echo "Text embed dim  : $TEXT_EMBED_DIM"
 echo "Retrieval top-K : $RETRIEVAL_TOPK"
+echo "Disable RAG     : $DISABLE_RAG"
 echo "Workers         : $NUM_WORKERS"
 echo "Cache mode      : $RAG_CACHE_MODE"
 echo "Cache dir       : $RAG_CACHE_DIR"
@@ -114,4 +129,5 @@ esac
     --num_flow_steps "$NUM_FLOW_STEPS" \
     --flow_solver "$FLOW_SOLVER" \
     --rf_time_sampling "$RF_TIME_SAMPLING" \
-    --rf_loss_type "$RF_LOSS_TYPE"
+    --rf_loss_type "$RF_LOSS_TYPE" \
+    "${ABLATION_FLAGS[@]}"
