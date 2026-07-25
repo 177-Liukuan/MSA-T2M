@@ -32,6 +32,7 @@ import models.msa_vae as msa_vae
 import utils.losses as losses
 import options.option_msa_vae as option_msa_vae
 import utils.utils_model as utils_model
+from utils.msa_vae_alignment import distributed_masked_cosine_alignment
 from humanml3d_272 import dataset_msa_vae, dataset_eval_tae, dataset_eval_t2m
 import utils.eval_trans as eval_trans
 import sys
@@ -80,53 +81,6 @@ class FrozenT5TextEncoder(nn.Module):
             normalize_embeddings=False,
         )
         return torch.from_numpy(emb).to(device=device, dtype=torch.float32)
-
-
-# ---------------------------------------------------------------------------
-#   Alignment Losses
-# ---------------------------------------------------------------------------
-class CLIPAlignmentLoss(nn.Module):
-    """Cosine embedding loss for cross-modal alignment."""
-    def __init__(self):
-        super().__init__()
-        self.loss_fn = nn.CosineEmbeddingLoss(margin=0.0)
-
-    def forward(self, feat_a, feat_b, mask=None):
-        """
-        Args:
-            feat_a: (B, D) or (B, T, D)
-            feat_b: same shape as feat_a
-            mask:   (B,) bool - True means this sample is **valid**
-                    If None, all samples are valid.
-        Returns:
-            scalar loss
-        """
-        target = torch.ones(feat_a.size(0), device=feat_a.device)
-
-        if feat_a.dim() == 3:
-            # Per-token alignment: flatten (B, T, D) -> (B*T, D)
-            B, T, D = feat_a.shape
-            feat_a = feat_a.reshape(B * T, D)
-            feat_b = feat_b.reshape(B * T, D)
-            if mask is not None:
-                # Expand mask from (B,) -> (B, T) -> (B*T,)
-                token_mask = mask.unsqueeze(1).expand(-1, T).reshape(B * T)
-                feat_a = feat_a[token_mask]
-                feat_b = feat_b[token_mask]
-            target = torch.ones(feat_a.size(0), device=feat_a.device)
-        else:
-            if mask is not None:
-                feat_a = feat_a[mask]
-                feat_b = feat_b[mask]
-                target = torch.ones(feat_a.size(0), device=feat_a.device)
-
-        if feat_a.size(0) == 0:
-            return torch.tensor(0.0, device=feat_a.device, requires_grad=True)
-
-        # L2 normalize before cosine loss for stability
-        feat_a = F.normalize(feat_a, dim=-1)
-        feat_b = F.normalize(feat_b, dim=-1)
-        return self.loss_fn(feat_a, feat_b, target)
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +361,6 @@ train_loader_iter = dataset_msa_vae.cycle(train_loader)
 ##### ---- Losses ---- #####
 Loss = losses.ReConsLoss(motion_dim=272)
 latent_recon_loss_fn = nn.MSELoss()
-global_align_loss_fn = CLIPAlignmentLoss()
-local_align_loss_fn = CLIPAlignmentLoss()
 
 ##### ---- Training function (shared by warmup & main) ---- #####
 def compute_losses(batch, net_module):
@@ -451,7 +403,10 @@ def compute_losses(batch, net_module):
     }
 
     # --- Global alignment: h_cls vs Spotlight(global text, local pooled text) ---
-    loss_global = torch.tensor(0.0, device=comp_device, requires_grad=True)
+    global_backward_loss = out['clip_global_feat'].sum() * 0.0
+    global_mean = global_backward_loss.detach()
+    global_valid_count = torch.zeros((), device=comp_device, dtype=torch.long)
+    global_valid_ratio = global_mean
     if args.global_align_weight > 0:
         with torch.no_grad():
             if args.use_offline_global_text:
@@ -479,38 +434,70 @@ def compute_losses(batch, net_module):
             g_mixed = (1 - alpha) * text_feat + alpha * l_pooled
             g_target = F.normalize(g_mixed, dim=-1)
 
-        if valid_global.any():
-            loss_global = global_align_loss_fn(out['clip_global_feat'], g_target, mask=valid_global)
-    loss_dict['global_align'] = loss_global
+        global_alignment = distributed_masked_cosine_alignment(
+            out['clip_global_feat'], g_target, valid_global, accelerator
+        )
+        global_backward_loss = global_alignment.backward_loss
+        global_mean = global_alignment.global_mean
+        global_valid_count = global_alignment.valid_count
+        global_possible_count = accelerator.reduce(
+            torch.tensor(valid_global.numel(), device=comp_device, dtype=torch.long),
+            reduction='sum',
+        )
+        global_valid_ratio = global_valid_count.float() / global_possible_count.clamp_min(1).float()
+    loss_dict['global_align'] = global_mean
+    loss_dict['global_valid_count'] = global_valid_count.float()
+    loss_dict['global_valid_ratio'] = global_valid_ratio
 
     # --- Local alignment: z_i projected vs CLIP(local label) ---
-    loss_local = torch.tensor(0.0, device=comp_device, requires_grad=True)
-    if args.local_align_weight > 0 and has_local.any():
-        loss_local = local_align_loss_fn(
-            out['clip_local_feat'], local_text_gt, mask=has_local
+    local_backward_loss = out['clip_local_feat'].sum() * 0.0
+    local_mean = local_backward_loss.detach()
+    local_valid_count = torch.zeros((), device=comp_device, dtype=torch.long)
+    local_valid_ratio = local_mean
+    if args.local_align_weight > 0:
+        local_alignment = distributed_masked_cosine_alignment(
+            out['clip_local_feat'], local_text_gt, has_local, accelerator
         )
-    loss_dict['local_align'] = loss_local
+        local_backward_loss = local_alignment.backward_loss
+        local_mean = local_alignment.global_mean
+        local_valid_count = local_alignment.valid_count
+        local_possible_count = accelerator.reduce(
+            torch.tensor(
+                local_text_gt.shape[0] * local_text_gt.shape[1],
+                device=comp_device,
+                dtype=torch.long,
+            ),
+            reduction='sum',
+        )
+        local_valid_ratio = local_valid_count.float() / local_possible_count.clamp_min(1).float()
+    loss_dict['local_align'] = local_mean
+    loss_dict['local_valid_count'] = local_valid_count.float()
+    loss_dict['local_valid_ratio'] = local_valid_ratio
 
     # --- Total loss ---
     if args.phase == 1:
         # Phase 1: only latent + alignment losses
         total_loss = (args.latent_recon_weight * loss_latent
-                      + args.global_align_weight * loss_global
-                      + args.local_align_weight * loss_local)
+                      + args.global_align_weight * global_backward_loss
+                      + args.local_align_weight * local_backward_loss)
     else:
         # Phase 0/2: all losses
         total_loss = (loss_motion
                       + loss_kl
                       + args.root_loss * loss_root
                       + args.latent_recon_weight * loss_latent
-                      + args.global_align_weight * loss_global
-                      + args.local_align_weight * loss_local)
+                      + args.global_align_weight * global_backward_loss
+                      + args.local_align_weight * local_backward_loss)
 
     return total_loss, loss_dict
 
 
 ##### ---- Warm-up ---- #####
-avg = {k: 0. for k in ['recon', 'kl', 'root', 'latent', 'global_align', 'local_align']}
+avg = {k: 0. for k in [
+    'recon', 'kl', 'root', 'latent', 'global_align', 'local_align',
+    'global_valid_count', 'local_valid_count',
+    'global_valid_ratio', 'local_valid_ratio',
+]}
 
 logger.info(f'=== Warm-up: {args.warm_up_iter} iterations ===')
 for nb_iter in range(1, args.warm_up_iter):
@@ -538,7 +525,11 @@ for nb_iter in range(1, args.warm_up_iter):
 
 
 ##### ---- Training ---- #####
-avg = {k: 0. for k in ['recon', 'kl', 'root', 'latent', 'global_align', 'local_align']}
+avg = {k: 0. for k in [
+    'recon', 'kl', 'root', 'latent', 'global_align', 'local_align',
+    'global_valid_count', 'local_valid_count',
+    'global_valid_ratio', 'local_valid_ratio',
+]}
 
 # Initial eval
 eval_net = net.module if args.num_gpus > 1 else net
