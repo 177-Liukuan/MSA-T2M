@@ -152,6 +152,8 @@ def get_args_parser():
 
     args = parser.parse_args()
     if args.msa_data_mode == 'babel_sparse_global':
+        if args.phase == 0:
+            parser.error('babel_sparse_global supports only --phase 1 or --phase 2')
         if args.text_encoder_type != 't5':
             parser.error('babel_sparse_global requires --text_encoder_type t5')
         if args.text_embed_dim not in (0, 768):

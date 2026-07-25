@@ -50,6 +50,13 @@ def _resolved_file(path, label):
     return resolved
 
 
+def _resolved_directory(path, label):
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError("{} not found: {}".format(label, resolved))
+    return resolved
+
+
 def _file_sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as source:
@@ -109,11 +116,44 @@ def build_msa_checkpoint_metadata(
     train_manifest_sha256 = None
     validation_manifest_path = None
     validation_manifest_sha256 = None
+    bridge_split_path = None
+    bridge_split_sha256 = None
+    bridge_motion_root = None
+    bridge_text_root = None
+    bridge_global_embed_root = None
+    bridge_local_embed_root = None
     if mode == "babel_sparse_global":
         if include_train_manifest:
             train_manifest_path, train_manifest_sha256 = _manifest_identity(
                 args.babel_train_cache_manifest,
                 "BABEL training cache manifest",
+            )
+            bridge_split = _resolved_file(
+                args.bridge_split_file, "HumanML/BABEL bridge split"
+            )
+            bridge_split_path = str(bridge_split)
+            bridge_split_sha256 = _file_sha256(bridge_split)
+            bridge_motion_root = str(
+                _resolved_directory(
+                    args.bridge_motion_dir, "HumanML/BABEL bridge motion root"
+                )
+            )
+            bridge_text_root = str(
+                _resolved_directory(
+                    args.bridge_text_dir, "HumanML/BABEL bridge text root"
+                )
+            )
+            bridge_global_embed_root = str(
+                _resolved_directory(
+                    args.bridge_global_embed_dir,
+                    "HumanML/BABEL bridge global-target root",
+                )
+            )
+            bridge_local_embed_root = str(
+                _resolved_directory(
+                    args.bridge_local_embed_dir,
+                    "HumanML/BABEL bridge local-target root",
+                )
             )
         validation_manifest_path, validation_manifest_sha256 = _manifest_identity(
             args.babel_val_cache_manifest,
@@ -138,6 +178,12 @@ def build_msa_checkpoint_metadata(
         "train_cache_manifest_sha256": train_manifest_sha256,
         "val_cache_manifest_path": validation_manifest_path,
         "val_cache_manifest_sha256": validation_manifest_sha256,
+        "bridge_split_path": bridge_split_path,
+        "bridge_split_sha256": bridge_split_sha256,
+        "bridge_motion_root": bridge_motion_root,
+        "bridge_text_root": bridge_text_root,
+        "bridge_global_embed_root": bridge_global_embed_root,
+        "bridge_local_embed_root": bridge_local_embed_root,
         "causal_tae_artifact_path": causal_path,
         "causal_tae_artifact_sha256": causal_sha256,
         "global_align_weight": float(args.global_align_weight),
@@ -215,6 +261,18 @@ def validate_msa_checkpoint_metadata(
                     )
                 )
         if scope == "training":
+            for key, label in (
+                ("bridge_split_path", "bridge split path"),
+                ("bridge_split_sha256", "bridge split identity"),
+                ("bridge_motion_root", "bridge motion root"),
+                ("bridge_text_root", "bridge text root"),
+                ("bridge_global_embed_root", "bridge global-target root"),
+                ("bridge_local_embed_root", "bridge local-target root"),
+            ):
+                if metadata.get(key) != expected[key]:
+                    raise ValueError(
+                        "checkpoint {} does not match requested asset".format(label)
+                    )
             causal_path = metadata.get("causal_tae_artifact_path")
             causal_sha256 = metadata.get("causal_tae_artifact_sha256")
             if causal_path is None or causal_sha256 is None:
@@ -249,6 +307,12 @@ def _training_data_identity(metadata):
             "train_cache_manifest_sha256",
             "val_cache_manifest_path",
             "val_cache_manifest_sha256",
+            "bridge_split_path",
+            "bridge_split_sha256",
+            "bridge_motion_root",
+            "bridge_text_root",
+            "bridge_global_embed_root",
+            "bridge_local_embed_root",
             "causal_tae_artifact_path",
             "causal_tae_artifact_sha256",
             "resume_checkpoint_path",
@@ -454,6 +518,10 @@ def _local_training_asset_probe(args):
             args, include_train_manifest=True
         )
         mode = args.msa_data_mode
+        if mode == "babel_sparse_global" and args.phase == 0:
+            raise ValueError(
+                "BABEL sparse-global training supports only Phase 1 or Phase 2"
+            )
         approved_sha256 = None
         if mode == "babel_sparse_global" and args.phase in (1, 2):
             approved_sha256 = _validated_sha256(
@@ -582,6 +650,34 @@ def preflight_msa_training_assets(args, accelerator):
     )
     validate_distributed_msa_envelope(envelope, accelerator)
     return metadata, full_checkpoint, mapped_cnn_state
+
+
+def validate_msa_assets_after_loader(args, expected_metadata, accelerator):
+    """Reject assets replaced after preflight but before dataset construction."""
+    try:
+        causal_identity = None
+        if expected_metadata.get("causal_tae_artifact_path") is not None:
+            causal_identity = {
+                "path": expected_metadata["causal_tae_artifact_path"],
+                "sha256": expected_metadata["causal_tae_artifact_sha256"],
+            }
+        current_metadata = build_msa_checkpoint_metadata(
+            args,
+            include_train_manifest=True,
+            causal_tae_identity=causal_identity,
+        )
+        expected_identity = _training_data_identity(expected_metadata)
+        current_identity = _training_data_identity(current_metadata)
+        if current_identity != expected_identity:
+            raise ValueError("MSA training assets changed after preflight")
+        envelope = {"ok": True, "identity": current_identity, "error": None}
+    except Exception as error:
+        envelope = {
+            "ok": False,
+            "identity": None,
+            "error": "{}: {}".format(type(error).__name__, error),
+        }
+    return validate_distributed_msa_envelope(envelope, accelerator)
 
 
 def prepare_babel_validation_loader(accelerator, val_loader):

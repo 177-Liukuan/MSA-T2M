@@ -132,12 +132,24 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
         np.save(std_path, np.ones(272))
         train_manifest.write_text('{"split": "train"}')
         validation_manifest.write_text('{"split": "val"}')
+        bridge_split = root / "train-ft.txt"
+        bridge_split.write_text("000001\n")
+        bridge_roots = {}
+        for name in ("motion", "text", "global", "local"):
+            path = root / "bridge-{}".format(name)
+            path.mkdir()
+            bridge_roots[name] = path
         return SimpleNamespace(
             msa_data_mode=mode,
             msa_mean_path=str(mean_path),
             msa_std_path=str(std_path),
             babel_train_cache_manifest=str(train_manifest),
             babel_val_cache_manifest=str(validation_manifest),
+            bridge_split_file=str(bridge_split),
+            bridge_motion_dir=str(bridge_roots["motion"]),
+            bridge_text_dir=str(bridge_roots["text"]),
+            bridge_global_embed_dir=str(bridge_roots["global"]),
+            bridge_local_embed_dir=str(bridge_roots["local"]),
             global_align_weight=0.5,
             local_align_weight=0.2,
             phase=phase,
@@ -425,6 +437,15 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             self.assertEqual(
                 metadata["causal_tae_artifact_sha256"],
                 self.APPROVED_SHA256,
+            )
+            self.assertEqual(
+                metadata["bridge_split_path"],
+                str(Path(args.bridge_split_file).resolve()),
+            )
+            self.assertEqual(len(metadata["bridge_split_sha256"]), 64)
+            self.assertEqual(
+                metadata["bridge_global_embed_root"],
+                str(Path(args.bridge_global_embed_dir).resolve()),
             )
             validate_msa_checkpoint_metadata(metadata, args, scope="training")
 
@@ -759,6 +780,43 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "train cache manifest identity"):
                 preflight_msa_training_assets(args, _IdentityAccelerator())
+
+    def test_tagged_babel_resume_rejects_changed_bridge_identity(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            phase_one_args = self._metadata_args(root, phase=1)
+            checkpoint_path = root / "phase-one.pth"
+            torch.save(
+                {
+                    "net": {"weight": torch.tensor([6.0])},
+                    "metadata": self._tagged_metadata(phase_one_args),
+                },
+                checkpoint_path,
+            )
+            phase_two_args = SimpleNamespace(**vars(phase_one_args))
+            phase_two_args.phase = 2
+            phase_two_args.resume_pth = str(checkpoint_path)
+            Path(phase_two_args.bridge_split_file).write_text("000002\n")
+
+            with self.assertRaisesRegex(RuntimeError, "bridge split identity"):
+                preflight_msa_training_assets(
+                    phase_two_args, _IdentityAccelerator()
+                )
+
+    def test_post_loader_revalidation_rejects_asset_replacement(self):
+        from utils.eval_msa_vae_babel import validate_msa_assets_after_loader
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            args = self._metadata_args(Path(temporary_directory), phase=1)
+            metadata = self._tagged_metadata(args)
+            np.save(args.msa_mean_path, np.full(272, 7.0))
+
+            with self.assertRaisesRegex(RuntimeError, "changed after preflight"):
+                validate_msa_assets_after_loader(
+                    args, metadata, _IdentityAccelerator()
+                )
 
     def test_humanml_training_preserves_legacy_untagged_full_resume(self):
         from utils.eval_msa_vae_babel import preflight_msa_training_assets

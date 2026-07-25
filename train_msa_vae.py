@@ -41,6 +41,7 @@ from utils.eval_msa_vae_babel import (
     evaluate_msa_vae_babel,
     preflight_msa_training_assets,
     prepare_babel_validation_loader,
+    validate_msa_assets_after_loader,
 )
 from humanml3d_272 import dataset_msa_vae
 import utils.eval_trans as eval_trans
@@ -209,6 +210,8 @@ logger.info(f'Resolved MSA std path: {os.path.realpath(args.msa_std_path)}')
     validated_cnn_state,
 ) = preflight_msa_training_assets(args, accelerator)
 train_loader, validation_loader, validation_backend = build_msa_training_loaders(args)
+if args.msa_data_mode == 'babel_sparse_global':
+    validate_msa_assets_after_loader(args, checkpoint_metadata, accelerator)
 babel_validation_dataset = (
     validation_loader.dataset
     if args.msa_data_mode == 'babel_sparse_global'

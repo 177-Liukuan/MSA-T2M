@@ -278,7 +278,11 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
     def test_babel_mode_parser_requires_t5_and_768(self):
         from options.option_msa_vae import get_args_parser
 
-        with patch.object(sys, "argv", ["train", "--msa_data_mode", "babel_sparse_global"]):
+        with patch.object(
+            sys,
+            "argv",
+            ["train", "--msa_data_mode", "babel_sparse_global", "--phase", "1"],
+        ):
             args = get_args_parser()
         self.assertEqual(args.text_encoder_type, "t5")
         self.assertEqual(args.text_embed_dim, 768)
@@ -288,14 +292,37 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
         with patch.object(
             sys,
             "argv",
-            ["train", "--msa_data_mode", "babel_sparse_global", "--text_encoder_type", "clip"],
+            [
+                "train",
+                "--msa_data_mode",
+                "babel_sparse_global",
+                "--phase",
+                "1",
+                "--text_encoder_type",
+                "clip",
+            ],
         ):
             with self.assertRaises(SystemExit):
                 get_args_parser()
         with patch.object(
             sys,
             "argv",
-            ["train", "--msa_data_mode", "babel_sparse_global", "--text_embed_dim", "512"],
+            [
+                "train",
+                "--msa_data_mode",
+                "babel_sparse_global",
+                "--phase",
+                "1",
+                "--text_embed_dim",
+                "512",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                get_args_parser()
+        with patch.object(
+            sys,
+            "argv",
+            ["train", "--msa_data_mode", "babel_sparse_global", "--phase", "0"],
         ):
             with self.assertRaises(SystemExit):
                 get_args_parser()
