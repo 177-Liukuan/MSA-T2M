@@ -21,7 +21,6 @@ from models.llama_model import LLaMAHF, LLaMAHFConfig
 from models.llama_rag_model import LLaMARAGWrapper
 from models.rag_training import (
     RAGTwoForwardLoss,
-    estimate_lengths_from_padded_latents,
     get_rag_model,
 )
 from humanml3d_272 import dataset_msa_rag
@@ -317,7 +316,13 @@ def main():
     logger.info('Start training no-RAG ablation MotionStreamer...' if args.disable_rag else 'Start training RAG-guided MotionStreamer...')
 
     while nb_iter <= args.total_iter:
-        text_emb, top3_h_cls, top3_sim_scores, m_tokens = next(train_loader_iter)
+        (
+            text_emb,
+            top3_h_cls,
+            top3_sim_scores,
+            m_tokens,
+            m_tokens_len,
+        ) = next(train_loader_iter)
 
         text_emb = text_emb.to(comp_device, non_blocking=True)
         top3_h_cls = top3_h_cls.to(comp_device, non_blocking=True)
@@ -327,18 +332,18 @@ def main():
             raise ValueError(f'top3_h_cls dim mismatch: got {top3_h_cls.shape[-1]}, expected {args.text_embed_dim}')
         top3_sim_scores = top3_sim_scores.to(comp_device, non_blocking=True)
         m_tokens = m_tokens.to(comp_device, non_blocking=True)
+        m_tokens_len = m_tokens_len.to(comp_device, non_blocking=True)
 
-        # Estimate valid lengths from zero padding, then align with input_latent = m_tokens[:, :-1].
-        m_tokens_len = estimate_lengths_from_padded_latents(m_tokens)
-        input_latent = m_tokens[:, :-1]
-        m_lens = torch.clamp(m_tokens_len, min=1, max=input_latent.shape[1])
+        # The causal condition slice performs target alignment. Keep every
+        # valid token, including EOS, and mask only right padding in the loss.
+        input_latent = m_tokens
 
         # Joint CFG dropout: drop text and retrieval together for 10% samples.
         cfg_drop_mask = torch.rand(text_emb.shape[0], device=comp_device) < args.cfg_dropout_prob
 
         loss = training_model(
             latents=input_latent,
-            m_lens=m_lens,
+            m_lens=m_tokens_len,
             text_emb=text_emb,
             top3_h_cls=top3_h_cls,
             top3_sim_scores=top3_sim_scores,

@@ -6,7 +6,7 @@ This dataset loads precomputed numpy features only:
 - Offline motion latents
 
 Batch output format:
-    (text_emb, topk_h_cls, topk_sim_scores, motion_latents)
+    (text_emb, topk_h_cls, topk_sim_scores, motion_latents, motion_lengths)
 """
 
 import os
@@ -230,13 +230,23 @@ def collate_fn(batch):
     top_hcls_batch = torch.from_numpy(np.stack(top_hcls_list)).float()   # [B, K, D]
     top_scores_batch = torch.from_numpy(np.stack(top_scores_list)).float()  # [B, K]
 
-    max_len = max(seq.shape[0] for seq in motion_list)
+    motion_lengths = torch.tensor(
+        [seq.shape[0] for seq in motion_list],
+        dtype=torch.long,
+    )
+    max_len = int(motion_lengths.max().item())
     latent_dim = motion_list[0].shape[1]
     motion_batch = torch.zeros(len(motion_list), max_len, latent_dim, dtype=torch.float32)
     for i, seq in enumerate(motion_list):
         motion_batch[i, : seq.shape[0]] = torch.from_numpy(seq).float()
 
-    return text_emb_batch, top_hcls_batch, top_scores_batch, motion_batch
+    return (
+        text_emb_batch,
+        top_hcls_batch,
+        top_scores_batch,
+        motion_batch,
+        motion_lengths,
+    )
 
 
 def DATALoader(

@@ -11,12 +11,6 @@ def lengths_to_mask(lengths, max_len):
     )
 
 
-def estimate_lengths_from_padded_latents(m_tokens):
-    valid = m_tokens.abs().sum(dim=-1) > 0
-    lengths = valid.long().sum(dim=1)
-    return torch.clamp(lengths, min=2)
-
-
 def cosine_decay(step, total_steps, start_value=1.0, end_value=0.0):
     step = torch.tensor(step, dtype=torch.float32)
     total_steps = torch.tensor(total_steps, dtype=torch.float32)
@@ -24,20 +18,37 @@ def cosine_decay(step, total_steps, start_value=1.0, end_value=0.0):
     return start_value + (end_value - start_value) * cosine_factor
 
 
-def replace_with_pred(latents, pred_xstart, step, total_steps):
+def replace_with_pred(
+    latents,
+    pred_xstart,
+    step,
+    total_steps,
+    valid_mask,
+):
     decay_factor = cosine_decay(step, total_steps).to(latents.device)
     batch_size, sequence_length, _ = latents.shape
-    num_replace = int(sequence_length * decay_factor)
-    replace_indices = torch.randperm(
-        sequence_length, device=latents.device
-    )[:num_replace]
-    replace_mask = torch.zeros(
+    if valid_mask.shape != (batch_size, sequence_length):
+        raise ValueError(
+            "valid_mask shape {} does not match latent batch shape {}".format(
+                tuple(valid_mask.shape),
+                (batch_size, sequence_length),
+            )
+        )
+
+    random_scores = torch.rand(
         batch_size,
         sequence_length,
-        dtype=torch.bool,
         device=latents.device,
     )
-    replace_mask[:, replace_indices] = 1
+    random_scores = random_scores.masked_fill(~valid_mask, float("inf"))
+    random_ranks = random_scores.argsort(dim=1).argsort(dim=1)
+    replace_counts = torch.floor(
+        valid_mask.sum(dim=1).to(torch.float32) * decay_factor
+    ).to(torch.long)
+    replace_mask = valid_mask & (
+        random_ranks < replace_counts.unsqueeze(1)
+    )
+
     updated_latents = latents.clone()
     updated_latents[replace_mask] = pred_xstart[replace_mask]
     return updated_latents
@@ -64,7 +75,24 @@ class RAGTwoForwardLoss(nn.Module):
         empty_text_emb,
     ):
         batch_size, sequence_length, _ = latents.shape
-        mask = lengths_to_mask(m_lens, sequence_length).reshape(
+        if m_lens.ndim != 1 or m_lens.shape[0] != batch_size:
+            raise ValueError(
+                "m_lens must have shape ({},), got {}".format(
+                    batch_size,
+                    tuple(m_lens.shape),
+                )
+            )
+        if torch.any(m_lens <= 0):
+            raise ValueError("motion latent lengths must be positive")
+        if torch.any(m_lens > sequence_length):
+            raise ValueError(
+                "motion latent length exceeds padded width {}".format(
+                    sequence_length
+                )
+            )
+
+        valid_mask = lengths_to_mask(m_lens, sequence_length)
+        mask = valid_mask.reshape(
             batch_size * sequence_length
         ).repeat(self.diffmlps_batch_mul)
 
@@ -96,7 +124,11 @@ class RAGTwoForwardLoss(nn.Module):
             .reshape(batch_size, sequence_length, -1)
         )
         updated_latents = replace_with_pred(
-            latents, pred_xstart, step, total_steps
+            latents,
+            pred_xstart,
+            step,
+            total_steps,
+            valid_mask,
         )
         updated_conditions = self.rag_model(
             motion_latents=updated_latents,

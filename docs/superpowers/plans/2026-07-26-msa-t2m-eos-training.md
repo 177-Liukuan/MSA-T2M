@@ -100,15 +100,15 @@ Add tests that:
 
 - pass `m_lens=[4]` with a width-three tensor and expect `ValueError`;
 - pass `m_lens=[0]` and expect `ValueError`;
-- call `replace_with_pred` at `step=0` with lengths `[3, 1]` and assert all
+- call `replace_with_pred` at `step=total_steps` with lengths `[3, 1]` and assert all
   four valid positions use `pred_xstart` while both padding positions remain
   unchanged;
 - call it at a half-decay step with lengths `[4, 2]` and assert exactly two
   and one positions, respectively, are replaced.
 
-Set the existing reference loss fixture to `step=0` so every valid position
-has a deterministic replacement and the reference continues to test real
-loss and gradient equivalence.
+Set the existing reference loss fixture to `step=total_steps` so every valid
+position has a deterministic replacement and the reference continues to test
+real loss and gradient equivalence.
 
 - [ ] **Step 2: Run RAG training tests and verify RED**
 
