@@ -16,6 +16,29 @@ def get_args_parser():
                         help='use train_ft.txt (HumanML3D∩BABEL intersection)')
     parser.add_argument('--no_ft_split', dest='use_ft_split', action='store_false',
                         help='use train.txt (full HumanML3D) instead of train_ft.txt')
+    parser.add_argument(
+        '--msa_data_mode',
+        choices=['humanml_full', 'babel_sparse_global'],
+        default='humanml_full',
+        help='MSA-VAE supervision/data contract',
+    )
+    parser.add_argument('--bridge_split_file', default='./humanml3d_272/split/train_ft.txt')
+    parser.add_argument('--bridge_motion_dir', default='./humanml3d_272/motion_data')
+    parser.add_argument('--bridge_text_dir', default='./humanml3d_272/texts')
+    parser.add_argument('--bridge_global_embed_dir', default='./humanml3d_272/text_latents_t5')
+    parser.add_argument('--bridge_local_embed_dir', default='./humanml3d_272/t5_enc_single')
+    parser.add_argument('--babel_train_motion_dir', default='./babel_272_stream/train_stream')
+    parser.add_argument('--babel_train_text_dir', default='./babel_272_stream/train_stream_text')
+    parser.add_argument('--babel_train_t5_cache_dir', default='./babel_272_stream/t5_enc_single/train')
+    parser.add_argument('--babel_train_cache_manifest', default='./babel_272_stream/t5_enc_single/train/manifest.json')
+    parser.add_argument('--babel_val_motion_dir', default='./babel_272_stream/val_stream')
+    parser.add_argument('--babel_val_text_dir', default='./babel_272_stream/val_stream_text')
+    parser.add_argument('--babel_val_t5_cache_dir', default='./babel_272_stream/t5_enc_single/val')
+    parser.add_argument('--babel_val_cache_manifest', default='./babel_272_stream/t5_enc_single/val/manifest.json')
+    parser.add_argument('--msa_mean_path', default='',
+                        help='normalization Mean.npy; empty resolves by msa_data_mode')
+    parser.add_argument('--msa_std_path', default='',
+                        help='normalization Std.npy; empty resolves by msa_data_mode')
 
     # text encoder selection
     parser.add_argument('--text_encoder_type', type=str, default='t5', choices=['clip', 't5'],
@@ -121,4 +144,20 @@ def get_args_parser():
     parser.add_argument('--nb_joints', default=22, type=int, help='number of joints')
     parser.add_argument('--num_gpus', default=1, type=int, help='number of GPUs')
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.msa_data_mode == 'babel_sparse_global':
+        if args.text_encoder_type != 't5':
+            parser.error('babel_sparse_global requires --text_encoder_type t5')
+        if args.text_embed_dim not in (0, 768):
+            parser.error('babel_sparse_global requires --text_embed_dim 768 (or 0 to auto-resolve)')
+        args.text_embed_dim = 768
+        default_mean_path = './babel_272/t2m_babel_mean_std/Mean.npy'
+        default_std_path = './babel_272/t2m_babel_mean_std/Std.npy'
+    else:
+        default_mean_path = './humanml3d_272/mean_std/Mean.npy'
+        default_std_path = './humanml3d_272/mean_std/Std.npy'
+    if not args.msa_mean_path:
+        args.msa_mean_path = default_mean_path
+    if not args.msa_std_path:
+        args.msa_std_path = default_std_path
+    return args
