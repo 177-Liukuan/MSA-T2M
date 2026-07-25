@@ -125,8 +125,9 @@ def generate_latents_active_set(
                 device=candidates.device,
             )
 
+        emitted_eos_cpu = emitted_eos.detach().to(device="cpu").tolist()
         for local_index, sample_index in enumerate(active_indices_cpu.tolist()):
-            if bool(emitted_eos[local_index].item()):
+            if emitted_eos_cpu[local_index]:
                 finished[sample_index] = True
                 stop_steps[sample_index] = step
             else:
