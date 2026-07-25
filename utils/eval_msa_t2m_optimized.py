@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 
@@ -146,3 +147,187 @@ def generate_latents_active_set(
         stop_steps=stop_steps,
         empty_fallback_count=empty_fallback_count,
     )
+
+
+class OptimizedRAGEvalSampler:
+    def __init__(
+        self,
+        rag_model,
+        retriever,
+        empty_text_emb,
+        latent_dim=16,
+        device=torch.device("cuda"),
+        reference_end_latent=None,
+        stop_threshold=3.0,
+        enable_stopping=True,
+        text_source="offline",
+        text_lookup=None,
+        text_encoder=None,
+        text_embed_dim=768,
+        disable_rag=False,
+        use_random_topk_inference=False,
+    ):
+        self.rag_model = rag_model
+        self.retriever = retriever
+        self.empty_text_emb = empty_text_emb
+        self.latent_dim = int(latent_dim)
+        self.device = device
+        self.reference_end_latent = reference_end_latent
+        self.stop_threshold = float(stop_threshold)
+        self.enable_stopping = bool(enable_stopping)
+        self.text_source = text_source
+        self.text_lookup = text_lookup
+        self.text_encoder = text_encoder
+        self.text_embed_dim = int(text_embed_dim)
+        self.disable_rag = bool(disable_rag)
+        self.use_random_topk_inference = bool(use_random_topk_inference)
+
+    def eval(self):
+        self.rag_model.eval()
+        return self
+
+    @torch.no_grad()
+    def sample_batch_for_eval_CFG(
+        self,
+        text,
+        lengths,
+        unit_length=4,
+        cfg=4.0,
+    ):
+        text_list = [text] if isinstance(text, str) else list(text)
+        if len(text_list) == 0:
+            raise ValueError("text batch must not be empty")
+
+        if self.text_source == "online_t5":
+            if self.text_encoder is None:
+                raise RuntimeError(
+                    "text_encoder is required when text_source=online_t5"
+                )
+            text_np = np.asarray(
+                self.text_encoder.encode(text_list),
+                dtype=np.float32,
+            )
+            text_emb = torch.from_numpy(text_np).float().to(self.device)
+        else:
+            if self.text_lookup is None:
+                raise RuntimeError(
+                    "text_lookup is required when text_source=offline"
+                )
+            text_emb = self.text_lookup.batch_lookup(text_list, self.device)
+
+        if text_emb.ndim != 2 or text_emb.shape != (
+            len(text_list),
+            self.text_embed_dim,
+        ):
+            raise ValueError(
+                "text embedding shape mismatch: got {}, expected [{}, {}]".format(
+                    tuple(text_emb.shape),
+                    len(text_list),
+                    self.text_embed_dim,
+                )
+            )
+
+        if self.disable_rag:
+            top_hcls = None
+            top_scores = None
+        else:
+            if self.retriever is None:
+                raise RuntimeError("retriever is required when RAG is enabled")
+            top_hcls, top_scores = self.retriever.retrieve(text_emb)
+            if self.use_random_topk_inference and top_hcls.shape[1] > 1:
+                batch_size, topk, _ = top_hcls.shape
+                selected = torch.randint(
+                    0,
+                    topk,
+                    (batch_size,),
+                    device=top_hcls.device,
+                )
+                rows = torch.arange(batch_size, device=top_hcls.device)
+                top_hcls = top_hcls[rows, selected].unsqueeze(1)
+                top_scores = top_scores[rows, selected].unsqueeze(1)
+
+        lengths_tensor = torch.as_tensor(
+            lengths,
+            dtype=torch.long,
+            device=self.device,
+        )
+        if lengths_tensor.ndim != 1 or lengths_tensor.shape[0] != len(text_list):
+            raise ValueError("lengths must have one value per caption")
+        max_token_lengths = torch.clamp(
+            lengths_tensor // int(unit_length),
+            min=1,
+        )
+
+        return generate_latents_active_set(
+            rag_model=self.rag_model,
+            text_emb=text_emb,
+            empty_text_emb=self.empty_text_emb,
+            top_hcls=top_hcls,
+            top_scores=top_scores,
+            max_token_lengths=max_token_lengths,
+            latent_dim=self.latent_dim,
+            reference_end_latent=self.reference_end_latent,
+            stop_threshold=self.stop_threshold,
+            enable_stopping=self.enable_stopping,
+            cfg_scale=cfg,
+        )
+
+
+@torch.no_grad()
+def decode_equal_length_groups(
+    decoder,
+    latent_sequences,
+    max_motion_length,
+    motion_dim,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if len(latent_sequences) == 0:
+        raise ValueError("latent_sequences must not be empty")
+
+    groups: Dict[int, List[int]] = {}
+    for index, latent in enumerate(latent_sequences):
+        if latent.ndim != 3 or latent.shape[0] != 1:
+            raise ValueError("each latent sequence must have shape [1, T, D]")
+        groups.setdefault(int(latent.shape[1]), []).append(index)
+
+    decoded_by_index = {}
+    pred_lengths = torch.zeros(len(latent_sequences), dtype=torch.long)
+    output_dtype = None
+    output_device = None
+
+    for indices in groups.values():
+        grouped_latents = torch.cat(
+            [latent_sequences[index] for index in indices],
+            dim=0,
+        )
+        decoded = decoder.forward_decoder(grouped_latents)
+        if decoded.ndim != 3 or decoded.shape[0] != len(indices):
+            raise ValueError("decoder output must have shape [batch, frames, dim]")
+        if decoded.shape[-1] != int(motion_dim):
+            raise ValueError(
+                "decoder motion dim mismatch: got {}, expected {}".format(
+                    decoded.shape[-1],
+                    motion_dim,
+                )
+            )
+        output_dtype = decoded.dtype
+        output_device = decoded.device
+        for local_index, original_index in enumerate(indices):
+            decoded_by_index[original_index] = decoded[local_index]
+            pred_lengths[original_index] = min(
+                int(decoded.shape[1]),
+                int(max_motion_length),
+            )
+
+    motions = torch.zeros(
+        len(latent_sequences),
+        int(max_motion_length),
+        int(motion_dim),
+        dtype=output_dtype,
+        device=output_device,
+    )
+    for index in range(len(latent_sequences)):
+        decoded = decoded_by_index[index]
+        copy_length = min(int(decoded.shape[0]), int(max_motion_length))
+        motions[index, :copy_length] = decoded[:copy_length]
+
+    return motions, pred_lengths

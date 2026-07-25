@@ -1,8 +1,13 @@
 import unittest
 
+import numpy as np
 import torch
 
-from utils.eval_msa_t2m_optimized import generate_latents_active_set
+from utils.eval_msa_t2m_optimized import (
+    OptimizedRAGEvalSampler,
+    decode_equal_length_groups,
+    generate_latents_active_set,
+)
 
 
 class DeterministicRAG(torch.nn.Module):
@@ -154,6 +159,109 @@ class OptimizedGenerationTests(unittest.TestCase):
                 enable_stopping=False,
                 cfg_scale=4.0,
             )
+
+
+class RecordingTextEncoder:
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, texts):
+        self.calls.append(list(texts))
+        return np.asarray(
+            [[float(index + 1)] for index in range(len(texts))],
+            dtype=np.float32,
+        )
+
+
+class RecordingRetriever:
+    def __init__(self):
+        self.calls = 0
+
+    def retrieve(self, text_emb):
+        self.calls += 1
+        batch_size = text_emb.shape[0]
+        return (
+            text_emb.unsqueeze(1),
+            torch.ones(batch_size, 1, device=text_emb.device),
+        )
+
+
+class OptimizedSamplerTests(unittest.TestCase):
+    def test_sampler_encodes_and_retrieves_once_per_batch(self):
+        text_encoder = RecordingTextEncoder()
+        retriever = RecordingRetriever()
+        sampler = OptimizedRAGEvalSampler(
+            rag_model=DeterministicRAG(),
+            retriever=retriever,
+            empty_text_emb=torch.zeros(1),
+            latent_dim=2,
+            device=torch.device("cpu"),
+            reference_end_latent=None,
+            stop_threshold=0.1,
+            enable_stopping=False,
+            text_source="online_t5",
+            text_lookup=None,
+            text_encoder=text_encoder,
+            text_embed_dim=1,
+            disable_rag=False,
+        )
+
+        result = sampler.sample_batch_for_eval_CFG(
+            ["one", "two", "three"],
+            torch.tensor([4, 8, 12]),
+            unit_length=4,
+        )
+
+        self.assertEqual(text_encoder.calls, [["one", "two", "three"]])
+        self.assertEqual(retriever.calls, 1)
+        self.assertEqual(
+            [latent.shape[1] for latent in result.latents],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [latent[0, 0, 0].item() for latent in result.latents],
+            [1.0, 2.0, 3.0],
+        )
+
+
+class RecordingDecoder(torch.nn.Module):
+    def __init__(self, motion_dim):
+        super().__init__()
+        self.motion_dim = motion_dim
+        self.calls = []
+
+    def forward_decoder(self, latents):
+        self.calls.append(tuple(latents.shape))
+        frames = latents.shape[1] * 4
+        sample_ids = latents[:, 0, 0].view(-1, 1, 1)
+        return sample_ids.expand(-1, frames, self.motion_dim).clone()
+
+
+class OptimizedDecodeTests(unittest.TestCase):
+    def test_equal_length_groups_restore_original_order(self):
+        decoder = RecordingDecoder(motion_dim=3)
+        latent_sequences = [
+            torch.full((1, 2, 2), 10.0),
+            torch.full((1, 1, 2), 20.0),
+            torch.full((1, 2, 2), 30.0),
+            torch.full((1, 3, 2), 40.0),
+            torch.full((1, 1, 2), 50.0),
+        ]
+
+        motions, lengths = decode_equal_length_groups(
+            decoder,
+            latent_sequences,
+            max_motion_length=12,
+            motion_dim=3,
+        )
+
+        self.assertEqual(
+            decoder.calls,
+            [(2, 2, 2), (2, 1, 2), (1, 3, 2)],
+        )
+        self.assertEqual(motions.shape, (5, 12, 3))
+        self.assertEqual(lengths.tolist(), [8, 4, 8, 12, 4])
+        self.assertEqual(motions[:, 0, 0].tolist(), [10, 20, 30, 40, 50])
 
 
 if __name__ == "__main__":
