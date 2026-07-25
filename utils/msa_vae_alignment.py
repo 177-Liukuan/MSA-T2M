@@ -15,6 +15,25 @@ class AlignmentLossResult:
     valid_count: torch.Tensor
 
 
+def distributed_mask_coverage(sample_mask, tokens_per_sample, accelerator):
+    """Return globally reduced valid-vector count and coverage ratio."""
+    if sample_mask.dim() != 1:
+        raise ValueError("sample_mask must have shape (B,)")
+    if tokens_per_sample <= 0:
+        raise ValueError("tokens_per_sample must be positive")
+    mask = sample_mask.to(dtype=torch.bool)
+    local_valid = mask.sum(dtype=torch.long) * int(tokens_per_sample)
+    local_possible = torch.tensor(
+        mask.numel() * int(tokens_per_sample),
+        device=mask.device,
+        dtype=torch.long,
+    )
+    global_valid = accelerator.reduce(local_valid, reduction="sum")
+    global_possible = accelerator.reduce(local_possible, reduction="sum")
+    ratio = global_valid.float() / global_possible.clamp_min(1).float()
+    return global_valid, ratio
+
+
 def masked_cosine_sum_and_count(feat_a, feat_b, sample_mask):
     """Return the summed cosine distance and valid vector count.
 

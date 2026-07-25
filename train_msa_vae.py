@@ -32,7 +32,10 @@ import models.msa_vae as msa_vae
 import utils.losses as losses
 import options.option_msa_vae as option_msa_vae
 import utils.utils_model as utils_model
-from utils.msa_vae_alignment import distributed_masked_cosine_alignment
+from utils.msa_vae_alignment import (
+    distributed_mask_coverage,
+    distributed_masked_cosine_alignment,
+)
 from utils.eval_msa_vae_babel import (
     build_msa_training_loaders,
     evaluate_msa_vae_babel,
@@ -416,16 +419,19 @@ def compute_losses(batch, net_module):
     # --- Global alignment: h_cls vs Spotlight(global text, local pooled text) ---
     global_backward_loss = out['clip_global_feat'].sum() * 0.0
     global_mean = global_backward_loss.detach()
-    global_valid_count = torch.zeros((), device=comp_device, dtype=torch.long)
-    global_valid_ratio = global_mean
+    if args.use_offline_global_text:
+        valid_global = has_global
+    else:
+        valid_global = torch.ones_like(has_local, dtype=torch.bool)
+    global_valid_count, global_valid_ratio = distributed_mask_coverage(
+        valid_global, tokens_per_sample=1, accelerator=accelerator
+    )
     if args.global_align_weight > 0:
         with torch.no_grad():
             if args.use_offline_global_text:
                 text_feat = global_text_gt
-                valid_global = has_global
             else:
                 text_feat = text_encoder.encode_text(captions, comp_device)
-                valid_global = torch.ones_like(has_local, dtype=torch.bool)
 
             # Compute interpolation alpha
             if args.spotlight_alpha < 0:
@@ -451,11 +457,6 @@ def compute_losses(batch, net_module):
         global_backward_loss = global_alignment.backward_loss
         global_mean = global_alignment.global_mean
         global_valid_count = global_alignment.valid_count
-        global_possible_count = accelerator.reduce(
-            torch.tensor(valid_global.numel(), device=comp_device, dtype=torch.long),
-            reduction='sum',
-        )
-        global_valid_ratio = global_valid_count.float() / global_possible_count.clamp_min(1).float()
     loss_dict['global_align'] = global_mean
     loss_dict['global_valid_count'] = global_valid_count.float()
     loss_dict['global_valid_ratio'] = global_valid_ratio
@@ -463,8 +464,11 @@ def compute_losses(batch, net_module):
     # --- Local alignment: z_i projected vs CLIP(local label) ---
     local_backward_loss = out['clip_local_feat'].sum() * 0.0
     local_mean = local_backward_loss.detach()
-    local_valid_count = torch.zeros((), device=comp_device, dtype=torch.long)
-    local_valid_ratio = local_mean
+    local_valid_count, local_valid_ratio = distributed_mask_coverage(
+        has_local,
+        tokens_per_sample=local_text_gt.shape[1],
+        accelerator=accelerator,
+    )
     if args.local_align_weight > 0:
         local_alignment = distributed_masked_cosine_alignment(
             out['clip_local_feat'], local_text_gt, has_local, accelerator
@@ -472,15 +476,6 @@ def compute_losses(batch, net_module):
         local_backward_loss = local_alignment.backward_loss
         local_mean = local_alignment.global_mean
         local_valid_count = local_alignment.valid_count
-        local_possible_count = accelerator.reduce(
-            torch.tensor(
-                local_text_gt.shape[0] * local_text_gt.shape[1],
-                device=comp_device,
-                dtype=torch.long,
-            ),
-            reduction='sum',
-        )
-        local_valid_ratio = local_valid_count.float() / local_possible_count.clamp_min(1).float()
     loss_dict['local_align'] = local_mean
     loss_dict['local_valid_count'] = local_valid_count.float()
     loss_dict['local_valid_ratio'] = local_valid_ratio
@@ -515,8 +510,7 @@ for nb_iter in range(1, args.warm_up_iter):
     optimizer, current_lr = update_lr_warm_up(optimizer, nb_iter, args.warm_up_iter, args.lr)
 
     batch = next(train_loader_iter)
-    net_module = net.module if args.num_gpus > 1 else net
-    total_loss, loss_dict = compute_losses(batch, net_module)
+    total_loss, loss_dict = compute_losses(batch, net)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
@@ -572,8 +566,7 @@ logger.info(f'  Spotlight alpha: {args.spotlight_alpha} '
 
 for nb_iter in range(1, args.total_iter + 1):
     batch = next(train_loader_iter)
-    net_module = net.module if args.num_gpus > 1 else net
-    total_loss, loss_dict = compute_losses(batch, net_module)
+    total_loss, loss_dict = compute_losses(batch, net)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
