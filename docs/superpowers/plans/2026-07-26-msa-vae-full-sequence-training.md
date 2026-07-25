@@ -481,25 +481,30 @@ git commit -m "feat: add semantic-only MSA-VAE forward"
 - Consumes: objectives and schedule helpers from Task 2.
 - Consumes: semantic-only model forward from Task 3.
 - Produces: explicit full/mixed training routing.
+- Produces: `select_training_batch(step, mode, full_iter, window_iter, replay_interval)`.
+- Produces: `build_global_alignment_target(...)`.
+- Produces: `save_msa_checkpoint(path, model, metadata)`.
 - Produces: `build_msa_checkpoint_metadata(args) -> dict`.
 - Produces: `validate_msa_checkpoint_metadata(metadata, args)`.
 - Extends: `evaluation_msa_vae_multi(..., checkpoint_metadata=None)`.
 
-- [ ] **Step 1: Write failing source-contract and metadata tests**
+- [ ] **Step 1: Write failing routing and metadata behavior tests**
 
-Use AST/source tests without importing the top-level training loop. Assert:
+Add importable helpers to `utils/msa_vae_training.py`. Using real finite
+iterators containing literal sentinel batches, assert:
 
-- the prepared `net` is passed to `compute_losses` rather than `net.module`;
-- Phase 1 calls `semantic_only=True`;
-- full batches pass `motion_lengths`;
-- mixed Phase 2 selects replay with `is_window_replay_step`;
-- global targets use pure global text for non-window modes;
-- the final training path saves `net_last.pth` after the loop;
-- checkpoint payloads include `metadata`.
+- full mode always consumes the full iterator;
+- mixed mode consumes the window iterator only at replay steps;
+- window mode always consumes the window iterator;
+- an invalid mode raises;
+- full/mixed global targets equal normalized global text even when pooled local
+  text is adversarial;
+- legacy window targets retain Spotlight interpolation.
 
-Extract metadata helpers into `utils/msa_vae_training.py` so behavior tests can
-import them directly. Assert required fields and incompatible `down_t`,
-`stride_t`, or `latent_dim` values raise.
+Using a tiny real `nn.Linear`, call `save_msa_checkpoint`, load the file, and
+assert it contains the exact model state and metadata. Assert required
+metadata fields and incompatible `down_t`, `stride_t`, or `latent_dim` values
+raise.
 
 - [ ] **Step 2: Run entrypoint tests and verify RED**
 
@@ -571,9 +576,12 @@ if checkpoint_metadata is not None:
     payload["metadata"] = dict(checkpoint_metadata)
 ```
 
-Use the same payload for best-FID, best-MPJPE, and last checkpoints. After the
-final optimizer step, synchronize ranks and have the main process save an
-unwrapped `net_last.pth` payload so Phase 1 always hands off its final state.
+Use `save_msa_checkpoint` for best-FID, best-MPJPE, and last checkpoints.
+After the final optimizer step, synchronize ranks and have the main process
+save an unwrapped `net_last.pth` payload so Phase 1 always hands off its final
+state. The helper behavior test proves the payload contract; a focused CPU
+smoke invocation of the extracted batch router and objective proves the
+training route without importing the top-level executable.
 
 - [ ] **Step 7: Run entrypoint and regression tests**
 
@@ -630,7 +638,10 @@ self.assertEqual(args.window_replay_interval, 4)
 self.assertEqual(args.length_bucket_size, 256)
 ```
 
-Read both launchers and assert:
+Create a temporary executable named `accelerate` that writes its received
+arguments to a file. Run each real launcher with the temporary directory first
+on `PATH` and controlled environment variables. Assert the captured arguments
+show:
 
 - Phase 1 passes `--sequence_mode full`;
 - Phase 2 passes `--sequence_mode mixed`;
@@ -638,7 +649,7 @@ Read both launchers and assert:
 - Phase 2 passes `--window-replay-interval`;
 - Phase 2 resolves `${PHASE1_DIR}/net_last.pth`;
 - experiment names contain `fullseq` and `fullseq_replay`;
-- variables are overridable and no GPU ID is hard-coded.
+- environment overrides reach the command.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -721,17 +732,16 @@ git commit -m "feat: launch full-sequence MSA-VAE curriculum"
 
 - [ ] **Step 1: Write failing artifact-contract tests**
 
-AST/source tests assert `get_msa_latent.py`:
+With temporary checkpoint and output files, behavior-test pure manifest
+helpers extracted to `utils/msa_vae_training.py`. Assert the generated
+`extraction_metadata.json` records checkpoint path, file size/mtime, sequence
+mode, downsampling, and latent dimension. A matching rerun succeeds; a
+different checkpoint signature raises before any manifest is replaced.
 
-- logs the resolved checkpoint path;
-- reads optional checkpoint metadata;
-- writes one `extraction_metadata.json` manifest to each artifact root;
-- the manifest records checkpoint path, checkpoint file size/mtime,
-  sequence mode, downsampling, and latent dimension;
-- refuses an existing manifest with a different checkpoint signature.
-
-Use temporary files to behavior-test pure manifest helpers extracted to
-`utils/msa_vae_training.py`.
+Extract `prepare_extraction_roots(roots, checkpoint_path, checkpoint_metadata,
+args)` and call it from `get_msa_latent.py` before creating any `.npy` output.
+Test the real helper against three temporary roots rather than checking source
+text.
 
 - [ ] **Step 2: Run artifact tests and verify RED**
 
