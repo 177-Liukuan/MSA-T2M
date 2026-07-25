@@ -63,6 +63,7 @@ previous motion latents ──────────────────�
 | TAE 预训练 | `OFFICIAL` | `TRAIN_causal_TAE.sh` | 三阶段流程的第一阶段 |
 | Semantic AE 训练 | `OFFICIAL` | `TRAIN_msa_vae_phase1.sh` | 冻结 CNN，训练 Transformer AE 与语义对齐 |
 | 联合微调 | `OFFICIAL` | `TRAIN_msa_vae_phase2.sh` | 解冻所有组件并采用差分学习率 |
+| BABEL 表示验证 | `VALIDATION` | `TRAIN_msa_vae_babel_phase1.sh`、`TRAIN_msa_vae_babel_phase2.sh`、`EVAL_msa_vae_babel.sh` | 稀疏全局监督下的 BABEL 重建与局部语义对齐实验 |
 | T5 全局特征 | `OFFICIAL` | `get_text_latent_t5.py` | 预计算 caption 和空文本的 Sentence-T5 特征 |
 | MSA 潜变量库 | `OFFICIAL` | `get_msa_latent.py` | 导出运动潜变量、全局 `[CLS]` 和终止潜变量 |
 | RAG 模型 | `OFFICIAL` | `models/llama_rag_model.py` | 全局 `[CLS]` 检索融合与 RAG 前缀包装 |
@@ -201,6 +202,47 @@ bash TRAIN_msa_vae_phase2.sh <NUM_GPUS> t2m_272
 
 > **不要将 `explorations/representation_experiments/TRAIN_msa_vae.sh`
 > 当作正式入口。** 它是早期一次性训练/CLIP 配置的遗留脚本，没有体现最终的三阶段渐进训练。
+
+### BABEL sparse-global：域内重建与局部对齐验证
+
+HumanML3D 主线保持 `--no_ft_split`：全部 HumanML3D 样本都有全局
+Sentence-T5 监督，只有 HumanML3D–BABEL 交集样本具有局部帧级监督。BABEL
+**sparse-global** 是独立验证实验：交集 bridge 样本同时接受全局和局部
+监督；BABEL stream 样本只接受局部监督（其全局损失掩码为 0）。它使用
+`babel_272/t2m_babel_mean_std/` 的 joint Mean/Std，以及已核验的 joint
+Causal TAE，不可与 HumanML3D 的归一化或 MSA-VAE checkpoint 混用。
+
+首先为 train 和 val stream 构建本地 30 FPS T5 cache。缓存和 manifest 是
+数据产物，默认已被 Git 忽略，不能提交：
+
+```bash
+python scripts/prepare_babel_stream_t5.py --split train \
+  --t5-model-path sentencet5-xxl/
+python scripts/prepare_babel_stream_t5.py --split val \
+  --t5-model-path sentencet5-xxl/
+```
+
+接着按顺序运行 Phase 1、Phase 2 和独立验证。Phase 1 冻结 joint Causal
+TAE，并用 BABEL validation 的 semantic objective 选择
+`net_best_semantic.pth`；Phase 2 必须从它恢复，并按 BABEL reconstruction
+MPJPE 选择 `net_best_mpjpe.pth`：
+
+```bash
+bash TRAIN_msa_vae_babel_phase1.sh <NUM_GPUS>
+
+PHASE1_DIR=Experiments/<babel_sparse_global_phase1_exp> \
+  bash TRAIN_msa_vae_babel_phase2.sh <NUM_GPUS>
+
+BABEL_CKPT=Experiments/<babel_sparse_global_phase2_exp>/net_best_mpjpe.pth \
+  bash EVAL_msa_vae_babel.sh
+```
+
+每个 launcher 都允许通过环境变量覆盖路径；替换 `CNN_CKPT` 时必须同时提供
+对应的 `CNN_CKPT_SHA256`，以保留所加载 joint Causal TAE 的身份。Phase 2
+会将同一 `CNN_CKPT_SHA256` 传给其 Phase-1 full resume 的身份预检；若替换
+Phase-1 checkpoint，也必须在 Phase 2 提供与其 metadata 一致的 digest。BABEL
+结果只报告重建和局部语义对齐，**不用于 BABEL 文本到运动生成**，也不运行
+HumanML3D TMR/FID 协议。
 
 ### 迭代数说明
 
