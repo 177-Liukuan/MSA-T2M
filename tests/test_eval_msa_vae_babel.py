@@ -1,5 +1,6 @@
 """CPU tests for BABEL-only MSA-VAE validation."""
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,8 +44,10 @@ class _IdentityAccelerator(_Accelerator):
     def __init__(self, remote_identity=None):
         super().__init__()
         self.remote_identity = remote_identity
+        self.gather_calls = 0
 
     def gather_object(self, local_identity):
+        self.gather_calls += 1
         remote = local_identity if self.remote_identity is None else self.remote_identity
         return [local_identity, remote]
 
@@ -116,6 +119,8 @@ def _batch():
 
 
 class BabelMSAVAEEvaluationTest(unittest.TestCase):
+    APPROVED_SHA256 = "a" * 64
+
     @staticmethod
     def _metadata_args(root, mode="babel_sparse_global", phase=1):
         root.mkdir(parents=True, exist_ok=True)
@@ -137,8 +142,44 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             local_align_weight=0.2,
             phase=phase,
             resume_cnn_pth=None,
+            resume_cnn_sha256=BabelMSAVAEEvaluationTest.APPROVED_SHA256,
             resume_pth=None,
+            hidden_size=16,
+            down_t=2,
+            stride_t=2,
+            depth=3,
+            dilation_growth_rate=3,
+            latent_dim=4,
         )
+
+    @classmethod
+    def _tagged_metadata(cls, args):
+        from utils.eval_msa_vae_babel import build_msa_checkpoint_metadata
+
+        return build_msa_checkpoint_metadata(
+            args,
+            causal_tae_identity={
+                "path": str(Path(args.msa_mean_path).parent / "approved-joint-tae.pth"),
+                "sha256": args.resume_cnn_sha256,
+            },
+        )
+
+    @staticmethod
+    def _write_official_causal_checkpoint(args, path):
+        from models.tae import Causal_HumanTAE
+
+        model = Causal_HumanTAE(
+            hidden_size=args.hidden_size,
+            down_t=args.down_t,
+            stride_t=args.stride_t,
+            depth=args.depth,
+            dilation_growth_rate=args.dilation_growth_rate,
+            latent_dim=args.latent_dim,
+            clip_range=[-30, 20],
+        )
+        torch.save({"net": model.state_dict()}, path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return model.state_dict(), digest
 
     def test_mode_loader_selection_keeps_babel_independent_of_humanml_tmr_data(self):
         from eval_msa_vae import build_validation_loader
@@ -367,7 +408,7 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             root = Path(temporary_directory)
             args = self._metadata_args(root)
 
-            metadata = build_msa_checkpoint_metadata(args)
+            metadata = self._tagged_metadata(args)
             self.assertEqual(metadata["msa_data_mode"], "babel_sparse_global")
             self.assertEqual(metadata["mean_path"], str(Path(args.msa_mean_path).resolve()))
             self.assertEqual(metadata["std_path"], str(Path(args.msa_std_path).resolve()))
@@ -381,6 +422,10 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             )
             self.assertEqual(len(metadata["train_cache_manifest_sha256"]), 64)
             self.assertEqual(len(metadata["val_cache_manifest_sha256"]), 64)
+            self.assertEqual(
+                metadata["causal_tae_artifact_sha256"],
+                self.APPROVED_SHA256,
+            )
             validate_msa_checkpoint_metadata(metadata, args, scope="training")
 
             wrong_mode = dict(metadata, msa_data_mode="humanml_full")
@@ -396,7 +441,7 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             training_args = self._metadata_args(root)
-            metadata = build_msa_checkpoint_metadata(training_args)
+            metadata = self._tagged_metadata(training_args)
             Path(training_args.babel_train_cache_manifest).unlink()
             standalone_args = SimpleNamespace(**vars(training_args))
             standalone_args.babel_train_cache_manifest = str(root / "not-present.json")
@@ -413,15 +458,63 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             args = self._metadata_args(Path(temporary_directory))
-            metadata = build_msa_checkpoint_metadata(args)
+            metadata = self._tagged_metadata(args)
             remote = dict(
                 metadata,
                 train_cache_manifest_sha256="0" * 64,
             )
+            identity_keys = (
+                "msa_data_mode",
+                "mean_path",
+                "mean_sha256",
+                "std_path",
+                "std_sha256",
+                "train_cache_manifest_path",
+                "train_cache_manifest_sha256",
+                "val_cache_manifest_path",
+                "val_cache_manifest_sha256",
+                "causal_tae_artifact_path",
+                "causal_tae_artifact_sha256",
+                "resume_checkpoint_path",
+                "resume_checkpoint_sha256",
+            )
+            remote_envelope = {
+                "ok": True,
+                "identity": {key: remote.get(key) for key in identity_keys},
+                "error": None,
+            }
             with self.assertRaisesRegex(RuntimeError, "differ across ranks"):
                 validate_distributed_msa_identity(
-                    metadata, _IdentityAccelerator(remote)
+                    metadata, _IdentityAccelerator(remote_envelope)
                 )
+
+    def test_rank_local_asset_failure_reaches_collective_and_fails_both_sides(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        remote_error = {
+            "ok": False,
+            "identity": None,
+            "error": "MSA mean not found on remote rank",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            normal_args = self._metadata_args(root / "normal", phase=0)
+            normal_accelerator = _IdentityAccelerator(remote_error)
+            with self.assertRaisesRegex(RuntimeError, "rank-local asset"):
+                preflight_msa_training_assets(normal_args, normal_accelerator)
+            self.assertEqual(normal_accelerator.gather_calls, 1)
+
+            missing_args = self._metadata_args(root / "missing", phase=0)
+            Path(missing_args.msa_mean_path).unlink()
+            remote_success = {
+                "ok": True,
+                "identity": {"msa_data_mode": "babel_sparse_global"},
+                "error": None,
+            }
+            missing_accelerator = _IdentityAccelerator(remote_success)
+            with self.assertRaisesRegex(RuntimeError, "rank-local asset"):
+                preflight_msa_training_assets(missing_args, missing_accelerator)
+            self.assertEqual(missing_accelerator.gather_calls, 1)
 
     def test_babel_phases_fail_closed_without_required_checkpoints(self):
         from utils.eval_msa_vae_babel import preflight_msa_training_assets
@@ -432,7 +525,7 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
         ):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary_directory:
                 args = self._metadata_args(Path(temporary_directory), phase=phase)
-                with self.assertRaisesRegex(ValueError, expected):
+                with self.assertRaisesRegex(RuntimeError, expected):
                     preflight_msa_training_assets(args, _IdentityAccelerator())
 
     def test_missing_and_structurally_invalid_causal_checkpoints_fail_closed(self):
@@ -442,13 +535,23 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             root = Path(temporary_directory)
             args = self._metadata_args(root)
             args.resume_cnn_pth = str(root / "missing-causal-tae.pth")
-            with self.assertRaisesRegex(FileNotFoundError, "resume CNN checkpoint"):
+            with self.assertRaisesRegex(RuntimeError, "resume CNN checkpoint"):
                 preflight_msa_training_assets(args, _IdentityAccelerator())
 
             malformed = root / "malformed-causal-tae.pth"
-            torch.save({"net": {"unrelated.weight": torch.ones(1)}}, malformed)
+            torch.save(
+                {
+                    "net": {
+                        "tae.encoder.x": torch.ones(1),
+                        "tae.decoder.y": torch.ones(1),
+                        "tae.decode_proj.z": torch.ones(1),
+                    }
+                },
+                malformed,
+            )
             args.resume_cnn_pth = str(malformed)
-            with self.assertRaisesRegex(ValueError, "Causal TAE"):
+            args.resume_cnn_sha256 = hashlib.sha256(malformed.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(RuntimeError, "Causal TAE"):
                 preflight_msa_training_assets(args, _IdentityAccelerator())
 
     def test_phase_one_accepts_a_structurally_valid_causal_tae(self):
@@ -458,23 +561,84 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             root = Path(temporary_directory)
             args = self._metadata_args(root)
             causal_checkpoint = root / "causal-tae.pth"
-            torch.save(
-                {
-                    "net": {
-                        "tae.encoder.input.weight": torch.ones(1),
-                        "tae.decoder.output.weight": torch.ones(1),
-                        "tae.decode_proj.weight": torch.ones(1),
-                    }
-                },
-                causal_checkpoint,
+            official_state, artifact_sha256 = self._write_official_causal_checkpoint(
+                args, causal_checkpoint
             )
             args.resume_cnn_pth = str(causal_checkpoint)
+            args.resume_cnn_sha256 = artifact_sha256
 
-            metadata, full_checkpoint = preflight_msa_training_assets(
+            metadata, full_checkpoint, mapped_cnn_state = preflight_msa_training_assets(
                 args, _IdentityAccelerator()
             )
             self.assertEqual(metadata["phase"], 1)
+            self.assertEqual(len(official_state), 70)
+            self.assertEqual(
+                metadata["causal_tae_artifact_sha256"], artifact_sha256
+            )
             self.assertIsNone(full_checkpoint)
+            self.assertEqual(len(mapped_cnn_state), len(official_state))
+            self.assertTrue(
+                any(
+                    key.startswith("msa_vae.cnn_encoder.")
+                    for key in mapped_cnn_state
+                )
+            )
+
+    def test_causal_tae_shape_mismatch_is_rejected(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = self._metadata_args(root)
+            causal_checkpoint = root / "shape-mismatch.pth"
+            official_state, _ = self._write_official_causal_checkpoint(
+                args, causal_checkpoint
+            )
+            first_key = next(iter(official_state))
+            malformed = dict(official_state)
+            malformed[first_key] = torch.ones(1)
+            torch.save({"net": malformed}, causal_checkpoint)
+            args.resume_cnn_pth = str(causal_checkpoint)
+            args.resume_cnn_sha256 = hashlib.sha256(
+                causal_checkpoint.read_bytes()
+            ).hexdigest()
+
+            with self.assertRaisesRegex(RuntimeError, "shape mismatch"):
+                preflight_msa_training_assets(args, _IdentityAccelerator())
+
+    def test_causal_tae_expected_sha_is_external_and_must_match(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = self._metadata_args(root)
+            causal_checkpoint = root / "causal-tae.pth"
+            self._write_official_causal_checkpoint(args, causal_checkpoint)
+            args.resume_cnn_pth = str(causal_checkpoint)
+            args.resume_cnn_sha256 = "0" * 64
+
+            with self.assertRaisesRegex(RuntimeError, "approved SHA-256"):
+                preflight_msa_training_assets(args, _IdentityAccelerator())
+
+    def test_preflight_returns_snapshot_used_after_causal_path_replacement(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = self._metadata_args(root)
+            causal_checkpoint = root / "causal-tae.pth"
+            official_state, artifact_sha256 = self._write_official_causal_checkpoint(
+                args, causal_checkpoint
+            )
+            args.resume_cnn_pth = str(causal_checkpoint)
+            args.resume_cnn_sha256 = artifact_sha256
+            _, _, mapped_cnn_state = preflight_msa_training_assets(
+                args, _IdentityAccelerator()
+            )
+
+            torch.save({"net": {"replacement": torch.zeros(1)}}, causal_checkpoint)
+            self.assertEqual(len(mapped_cnn_state), len(official_state))
+            self.assertNotIn("replacement", mapped_cnn_state)
 
     def test_training_preflight_rejects_tagged_cross_domain_full_resumes(self):
         from utils.eval_msa_vae_babel import (
@@ -495,7 +659,7 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
                 human_checkpoint,
             )
             babel_args.resume_pth = str(human_checkpoint)
-            with self.assertRaisesRegex(ValueError, "data mode"):
+            with self.assertRaisesRegex(RuntimeError, "data mode"):
                 preflight_msa_training_assets(
                     babel_args, _IdentityAccelerator()
                 )
@@ -504,12 +668,12 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             torch.save(
                 {
                     "net": {"weight": torch.tensor([2.0])},
-                    "metadata": build_msa_checkpoint_metadata(babel_args),
+                    "metadata": self._tagged_metadata(babel_args),
                 },
                 babel_checkpoint,
             )
             human_args.resume_pth = str(babel_checkpoint)
-            with self.assertRaisesRegex(ValueError, "data mode"):
+            with self.assertRaisesRegex(RuntimeError, "data mode"):
                 preflight_msa_training_assets(
                     human_args, _IdentityAccelerator()
                 )
@@ -527,7 +691,7 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             torch.save(
                 {
                     "net": {"weight": torch.tensor([4.0])},
-                    "metadata": build_msa_checkpoint_metadata(phase_one_args),
+                    "metadata": self._tagged_metadata(phase_one_args),
                 },
                 checkpoint_path,
             )
@@ -535,11 +699,12 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             phase_two_args.phase = 2
             phase_two_args.resume_pth = str(checkpoint_path)
 
-            metadata, checkpoint = preflight_msa_training_assets(
+            metadata, checkpoint, cnn_state = preflight_msa_training_assets(
                 phase_two_args, _IdentityAccelerator()
             )
             self.assertEqual(metadata["phase"], 2)
             self.assertEqual(checkpoint["net"]["weight"].item(), 4.0)
+            self.assertIsNone(cnn_state)
 
     def test_tagged_babel_resume_rejects_changed_training_cache_identity(self):
         from utils.eval_msa_vae_babel import (
@@ -554,7 +719,7 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             torch.save(
                 {
                     "net": {"weight": torch.tensor([6.0])},
-                    "metadata": build_msa_checkpoint_metadata(args),
+                    "metadata": self._tagged_metadata(args),
                 },
                 checkpoint_path,
             )
@@ -563,7 +728,7 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             )
             args.resume_pth = str(checkpoint_path)
 
-            with self.assertRaisesRegex(ValueError, "train cache manifest identity"):
+            with self.assertRaisesRegex(RuntimeError, "train cache manifest identity"):
                 preflight_msa_training_assets(args, _IdentityAccelerator())
 
     def test_humanml_training_preserves_legacy_untagged_full_resume(self):
@@ -576,11 +741,12 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             torch.save({"net": {"weight": torch.tensor([5.0])}}, checkpoint_path)
             args.resume_pth = str(checkpoint_path)
 
-            metadata, checkpoint = preflight_msa_training_assets(
+            metadata, checkpoint, cnn_state = preflight_msa_training_assets(
                 args, _IdentityAccelerator()
             )
             self.assertEqual(metadata["msa_data_mode"], "humanml_full")
             self.assertEqual(checkpoint["net"]["weight"].item(), 5.0)
+            self.assertIsNone(cnn_state)
 
 
 if __name__ == "__main__":

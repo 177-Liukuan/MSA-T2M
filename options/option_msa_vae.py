@@ -127,6 +127,12 @@ def get_args_parser():
     parser.add_argument('--resume-pth', type=str, default=None, help='resume pth for MSA-VAE')
     parser.add_argument('--resume-cnn-pth', type=str, default=None,
                         help='resume pth for pretrained Causal CNN VAE (load CNN weights only)')
+    parser.add_argument(
+        '--resume-cnn-sha256',
+        type=str,
+        default=None,
+        help='externally approved SHA-256 for the joint-domain Causal TAE artifact',
+    )
 
     ## output directory
     parser.add_argument('--out-dir', type=str, default='output/', help='output directory')

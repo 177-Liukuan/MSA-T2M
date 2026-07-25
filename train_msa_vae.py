@@ -200,9 +200,11 @@ logger.info(f'Resolved MSA mean path: {os.path.realpath(args.msa_mean_path)}')
 logger.info(f'Resolved MSA std path: {os.path.realpath(args.msa_std_path)}')
 
 ##### ---- Dataloader ---- #####
-checkpoint_metadata, resume_checkpoint = preflight_msa_training_assets(
-    args, accelerator
-)
+(
+    checkpoint_metadata,
+    resume_checkpoint,
+    validated_cnn_state,
+) = preflight_msa_training_assets(args, accelerator)
 train_loader, validation_loader, validation_backend = build_msa_training_loaders(args)
 babel_validation_dataset = (
     validation_loader.dataset
@@ -250,19 +252,9 @@ if args.global_align_weight > 0 and not args.use_offline_global_text:
 # Optionally load pretrained CNN VAE weights
 if args.resume_cnn_pth:
     logger.info(f'Loading pretrained CNN VAE from {args.resume_cnn_pth}')
-    ckpt = torch.load(args.resume_cnn_pth, map_location='cpu')
-    cnn_state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
-    mapped = {}
-    for k, v in cnn_state.items():
-        new_key = k
-        if k.startswith('tae.encoder.'):
-            new_key = k.replace('tae.encoder.', 'msa_vae.cnn_encoder.')
-        elif k.startswith('tae.decoder.'):
-            new_key = k.replace('tae.decoder.', 'msa_vae.cnn_decoder.')
-        elif k.startswith('tae.decode_proj.'):
-            new_key = k.replace('tae.decode_proj.', 'msa_vae.decode_proj.')
-        mapped[new_key] = v
-    missing, unexpected = net.load_state_dict(mapped, strict=False)
+    missing, unexpected = net.load_state_dict(
+        validated_cnn_state, strict=False
+    )
     logger.info(f'CNN weights loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}')
     log_model_params(net, name='MSA-HumanVAE (After CNN weight load)', accelerator=accelerator)
 

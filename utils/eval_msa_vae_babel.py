@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -62,10 +63,44 @@ def _manifest_identity(path, label):
     return str(manifest_path), _file_sha256(manifest_path)
 
 
-def build_msa_checkpoint_metadata(args, include_train_manifest=True):
+def _normalization_identity(path, label, require_nonzero=False):
+    resolved = _resolved_file(path, label)
+    try:
+        values = np.load(str(resolved), allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise ValueError("cannot load {}: {}".format(label, error)) from error
+    if values.shape != (272,):
+        raise ValueError("{} must have shape (272,)".format(label))
+    if require_nonzero and np.any(values == 0):
+        raise ValueError("{} must not contain zero".format(label))
+    return str(resolved), _file_sha256(resolved)
+
+
+def _canonical_recorded_path(path):
+    return str(Path(path).expanduser().resolve())
+
+
+def _validated_sha256(value, label):
+    normalized = "" if value is None else str(value).strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError("{} must be an exact SHA-256 hex digest".format(label))
+    return normalized
+
+
+def build_msa_checkpoint_metadata(
+    args,
+    include_train_manifest=True,
+    causal_tae_identity=None,
+):
     """Build reproducibility metadata without changing checkpoint model keys."""
-    mean_path = _resolved_file(args.msa_mean_path, "MSA mean")
-    std_path = _resolved_file(args.msa_std_path, "MSA std")
+    mean_path, mean_sha256 = _normalization_identity(
+        args.msa_mean_path, "MSA mean"
+    )
+    std_path, std_sha256 = _normalization_identity(
+        args.msa_std_path, "MSA std", require_nonzero=True
+    )
     mode = str(args.msa_data_mode)
     if mode not in ("humanml_full", "babel_sparse_global"):
         raise ValueError("unsupported MSA data mode: {}".format(mode))
@@ -85,14 +120,26 @@ def build_msa_checkpoint_metadata(args, include_train_manifest=True):
             "BABEL validation cache manifest",
         )
 
+    causal_path = None
+    causal_sha256 = None
+    if causal_tae_identity is not None:
+        causal_path = _canonical_recorded_path(causal_tae_identity["path"])
+        causal_sha256 = _validated_sha256(
+            causal_tae_identity["sha256"], "Causal TAE artifact SHA-256"
+        )
+
     return {
         "msa_data_mode": mode,
-        "mean_path": str(mean_path),
-        "std_path": str(std_path),
+        "mean_path": mean_path,
+        "mean_sha256": mean_sha256,
+        "std_path": std_path,
+        "std_sha256": std_sha256,
         "train_cache_manifest_path": train_manifest_path,
         "train_cache_manifest_sha256": train_manifest_sha256,
         "val_cache_manifest_path": validation_manifest_path,
         "val_cache_manifest_sha256": validation_manifest_sha256,
+        "causal_tae_artifact_path": causal_path,
+        "causal_tae_artifact_sha256": causal_sha256,
         "global_align_weight": float(args.global_align_weight),
         "local_align_weight": float(args.local_align_weight),
         "phase": int(args.phase),
@@ -109,7 +156,12 @@ def _metadata_manifest_value(metadata, split, suffix):
     return value
 
 
-def validate_msa_checkpoint_metadata(metadata, args, scope="standalone"):
+def validate_msa_checkpoint_metadata(
+    metadata,
+    args,
+    scope="standalone",
+    expected_causal_sha256=None,
+):
     """Reject checkpoints whose data/normalization identity differs."""
     if scope not in ("standalone", "training"):
         raise ValueError("unsupported checkpoint validation scope: {}".format(scope))
@@ -128,7 +180,18 @@ def validate_msa_checkpoint_metadata(metadata, args, scope="standalone"):
         actual_path = metadata.get(key)
         if actual_path is None or str(Path(actual_path).expanduser().resolve()) != expected[key]:
             raise ValueError("checkpoint {} does not match requested asset".format(label))
+        hash_key = key.replace("_path", "_sha256")
+        actual_sha256 = metadata.get(hash_key)
+        if scope == "training" and actual_sha256 is None:
+            raise ValueError("checkpoint {} identity is missing".format(label))
+        if actual_sha256 is not None and actual_sha256 != expected[hash_key]:
+            raise ValueError("checkpoint {} identity does not match requested asset".format(label))
     if expected["msa_data_mode"] == "babel_sparse_global":
+        if scope == "training" and expected_causal_sha256 is None:
+            expected_causal_sha256 = _validated_sha256(
+                getattr(args, "resume_cnn_sha256", None),
+                "approved Causal TAE SHA-256",
+            )
         splits = ("train", "val") if scope == "training" else ("val",)
         for split in splits:
             actual_path = _metadata_manifest_value(metadata, split, "path")
@@ -151,6 +214,26 @@ def validate_msa_checkpoint_metadata(metadata, args, scope="standalone"):
                         split
                     )
                 )
+        if scope == "training":
+            causal_path = metadata.get("causal_tae_artifact_path")
+            causal_sha256 = metadata.get("causal_tae_artifact_sha256")
+            if causal_path is None or causal_sha256 is None:
+                raise ValueError(
+                    "checkpoint has no inherited approved Causal TAE identity"
+                )
+            if _canonical_recorded_path(causal_path) != causal_path:
+                raise ValueError("checkpoint Causal TAE path is not canonical")
+            causal_sha256 = _validated_sha256(
+                causal_sha256, "checkpoint Causal TAE SHA-256"
+            )
+            if (
+                expected_causal_sha256 is not None
+                and causal_sha256 != expected_causal_sha256
+            ):
+                raise ValueError(
+                    "checkpoint inherited Causal TAE identity does not match "
+                    "the approved SHA-256"
+                )
 
 
 def _training_data_identity(metadata):
@@ -159,29 +242,55 @@ def _training_data_identity(metadata):
         for key in (
             "msa_data_mode",
             "mean_path",
+            "mean_sha256",
             "std_path",
+            "std_sha256",
             "train_cache_manifest_path",
             "train_cache_manifest_sha256",
             "val_cache_manifest_path",
             "val_cache_manifest_sha256",
+            "causal_tae_artifact_path",
+            "causal_tae_artifact_sha256",
+            "resume_checkpoint_path",
+            "resume_checkpoint_sha256",
         )
     }
 
 
-def validate_distributed_msa_identity(metadata, accelerator):
-    """Require every rank to resolve the same training-data identity."""
-    local_identity = _training_data_identity(metadata)
+def _gather_envelopes(local_envelope, accelerator):
     if hasattr(accelerator, "gather_object"):
-        gathered = accelerator.gather_object(local_identity)
+        gathered = accelerator.gather_object(local_envelope)
     else:
         from accelerate.utils import gather_object
 
-        gathered = gather_object([local_identity])
+        gathered = gather_object([local_envelope])
     if not isinstance(gathered, (list, tuple)):
         gathered = [gathered]
+    return list(gathered)
+
+
+def validate_distributed_msa_envelope(local_envelope, accelerator):
+    """Collect local status first, then fail identically on every rank."""
+    gathered = _gather_envelopes(local_envelope, accelerator)
+    failures = []
+    for rank, envelope in enumerate(gathered):
+        if not isinstance(envelope, dict):
+            failures.append("rank {}: malformed preflight envelope".format(rank))
+        elif not envelope.get("ok", False):
+            failures.append(
+                "rank {}: {}".format(
+                    rank, envelope.get("error", "unknown error")
+                )
+            )
+    if failures:
+        raise RuntimeError(
+            "MSA rank-local asset preflight failed: {}".format(
+                " | ".join(failures)
+            )
+        )
     serialized = {
-        json.dumps(identity, sort_keys=True, separators=(",", ":"))
-        for identity in gathered
+        json.dumps(envelope["identity"], sort_keys=True, separators=(",", ":"))
+        for envelope in gathered
     }
     if len(serialized) != 1:
         raise RuntimeError(
@@ -189,15 +298,30 @@ def validate_distributed_msa_identity(metadata, accelerator):
                 " | ".join(sorted(serialized))
             )
         )
-    return local_identity
+    return local_envelope["identity"]
 
 
-def _load_checkpoint_file(path, label):
+def validate_distributed_msa_identity(metadata, accelerator):
+    """Compatibility helper for callers that already built local metadata."""
+    local_identity = _training_data_identity(metadata)
+    envelope = {"ok": True, "identity": local_identity, "error": None}
+    return validate_distributed_msa_envelope(envelope, accelerator)
+
+
+def _load_checkpoint_snapshot(path, label):
     resolved = _resolved_file(path, label)
     try:
-        return torch.load(str(resolved), map_location="cpu", weights_only=False)
+        with resolved.open("rb") as source:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+            source.seek(0)
+            checkpoint = torch.load(
+                source, map_location="cpu", weights_only=False
+            )
     except (OSError, RuntimeError, ValueError) as error:
         raise ValueError("cannot load {}: {}".format(label, error)) from error
+    return checkpoint, str(resolved), digest.hexdigest()
 
 
 def _require_state_mapping(checkpoint, label):
@@ -215,69 +339,249 @@ def _require_state_mapping(checkpoint, label):
     return state
 
 
-def _require_causal_tae_state(checkpoint):
-    state = _require_state_mapping(checkpoint, "resume CNN checkpoint")
-    required_prefixes = (
-        "tae.encoder.",
-        "tae.decoder.",
-        "tae.decode_proj.",
-    )
-    missing = [
-        prefix for prefix in required_prefixes
-        if not any(key.startswith(prefix) for key in state)
-    ]
-    if missing:
-        raise ValueError(
-            "resume CNN checkpoint is not a complete Causal TAE; "
-            "missing key prefixes {}".format(", ".join(missing))
+def _expected_causal_tae_shapes(args):
+    from models.tae import Causal_HumanTAE
+
+    with torch.device("meta"):
+        model = Causal_HumanTAE(
+            hidden_size=args.hidden_size,
+            down_t=args.down_t,
+            stride_t=args.stride_t,
+            depth=args.depth,
+            dilation_growth_rate=args.dilation_growth_rate,
+            latent_dim=args.latent_dim,
+            clip_range=[-30, 20],
         )
-    return state
+    return {
+        key: tuple(value.shape)
+        for key, value in model.state_dict().items()
+    }
+
+
+def _map_causal_tae_state(state):
+    mapped = {}
+    for key, value in state.items():
+        if key.startswith("tae.encoder."):
+            new_key = key.replace("tae.encoder.", "msa_vae.cnn_encoder.", 1)
+        elif key.startswith("tae.decoder."):
+            new_key = key.replace("tae.decoder.", "msa_vae.cnn_decoder.", 1)
+        elif key.startswith("tae.decode_proj."):
+            new_key = key.replace(
+                "tae.decode_proj.", "msa_vae.decode_proj.", 1
+            )
+        else:
+            raise ValueError("unexpected Causal TAE key {}".format(key))
+        mapped[new_key] = value
+    return mapped
+
+
+def _expected_msa_cnn_shapes(args):
+    from models.msa_vae import MSA_HumanVAE
+
+    with torch.device("meta"):
+        model = MSA_HumanVAE(
+            hidden_size=args.hidden_size,
+            down_t=args.down_t,
+            stride_t=args.stride_t,
+            depth=args.depth,
+            dilation_growth_rate=args.dilation_growth_rate,
+            latent_dim=args.latent_dim,
+            clip_range=[-30, 20],
+            trans_d_model=16,
+            trans_nhead=4,
+            trans_enc_layers=1,
+            trans_dec_layers=1,
+            trans_ff_size=32,
+            trans_dropout=0.0,
+            clip_dim=16,
+        )
+    prefixes = (
+        "msa_vae.cnn_encoder.",
+        "msa_vae.cnn_decoder.",
+        "msa_vae.decode_proj.",
+    )
+    return {
+        key: tuple(value.shape)
+        for key, value in model.state_dict().items()
+        if key.startswith(prefixes)
+    }
+
+
+def _require_causal_tae_state(checkpoint, args):
+    state = _require_state_mapping(checkpoint, "resume CNN checkpoint")
+    expected = _expected_causal_tae_shapes(args)
+    missing = sorted(set(expected) - set(state))
+    unexpected = sorted(set(state) - set(expected))
+    shape_mismatches = [
+        "{}: expected {}, got {}".format(
+            key, expected[key], tuple(state[key].shape)
+        )
+        for key in sorted(set(expected) & set(state))
+        if tuple(state[key].shape) != expected[key]
+    ]
+    if missing or unexpected or shape_mismatches:
+        details = []
+        if missing:
+            details.append("missing keys {}".format(", ".join(missing[:8])))
+        if unexpected:
+            details.append(
+                "unexpected keys {}".format(", ".join(unexpected[:8]))
+            )
+        if shape_mismatches:
+            details.append(
+                "shape mismatch {}".format("; ".join(shape_mismatches[:8]))
+            )
+        raise ValueError(
+            "resume CNN checkpoint does not match the official Causal TAE: "
+            + "; ".join(details)
+        )
+    mapped = _map_causal_tae_state(state)
+    expected_mapped = _expected_msa_cnn_shapes(args)
+    mapped_shapes = {
+        key: tuple(value.shape) for key, value in mapped.items()
+    }
+    if mapped_shapes != expected_mapped:
+        raise ValueError(
+            "official Causal TAE mapping does not exactly match the MSA CNN"
+        )
+    return mapped
+
+
+def _local_training_asset_probe(args):
+    """Build an error envelope without raising before the collective."""
+    try:
+        base_metadata = build_msa_checkpoint_metadata(
+            args, include_train_manifest=True
+        )
+        mode = args.msa_data_mode
+        approved_sha256 = None
+        if mode == "babel_sparse_global" and args.phase in (1, 2):
+            approved_sha256 = _validated_sha256(
+                getattr(args, "resume_cnn_sha256", None),
+                "approved Causal TAE SHA-256",
+            )
+
+        mapped_cnn_state = None
+        causal_identity = None
+        if args.resume_cnn_pth:
+            cnn_checkpoint, cnn_path, cnn_sha256 = _load_checkpoint_snapshot(
+                args.resume_cnn_pth, "resume CNN checkpoint"
+            )
+            if (
+                mode == "babel_sparse_global"
+                and approved_sha256 != cnn_sha256
+            ):
+                raise ValueError(
+                    "Causal TAE artifact does not match the approved SHA-256"
+                )
+            mapped_cnn_state = _require_causal_tae_state(
+                cnn_checkpoint, args
+            )
+            causal_identity = {"path": cnn_path, "sha256": cnn_sha256}
+
+        full_checkpoint = None
+        full_path = None
+        full_sha256 = None
+        if args.resume_pth:
+            full_checkpoint, full_path, full_sha256 = _load_checkpoint_snapshot(
+                args.resume_pth, "resume MSA-VAE checkpoint"
+            )
+            _require_state_mapping(
+                full_checkpoint, "resume MSA-VAE checkpoint"
+            )
+            checkpoint_metadata = (
+                full_checkpoint.get("metadata")
+                if isinstance(full_checkpoint, dict)
+                else None
+            )
+            if checkpoint_metadata is None:
+                if mode == "babel_sparse_global":
+                    raise ValueError(
+                        "BABEL training requires a tagged full resume checkpoint"
+                    )
+            else:
+                validate_msa_checkpoint_metadata(
+                    checkpoint_metadata,
+                    args,
+                    scope="training",
+                    expected_causal_sha256=approved_sha256,
+                )
+                inherited_path = checkpoint_metadata.get(
+                    "causal_tae_artifact_path"
+                )
+                if inherited_path is not None:
+                    inherited = {
+                        "path": inherited_path,
+                        "sha256": _validated_sha256(
+                            checkpoint_metadata.get(
+                                "causal_tae_artifact_sha256"
+                            ),
+                            "checkpoint Causal TAE SHA-256",
+                        ),
+                    }
+                    if (
+                        causal_identity is not None
+                        and inherited["sha256"] != causal_identity["sha256"]
+                    ):
+                        raise ValueError(
+                            "direct and inherited Causal TAE identities differ"
+                        )
+                    causal_identity = causal_identity or inherited
+
+        if mode == "babel_sparse_global":
+            if (
+                args.phase == 1
+                and mapped_cnn_state is None
+                and full_checkpoint is None
+            ):
+                raise ValueError(
+                    "BABEL Phase 1 requires --resume-cnn-pth or a tagged full resume"
+                )
+            if args.phase == 2 and full_checkpoint is None:
+                raise ValueError(
+                    "BABEL Phase 2 requires a tagged BABEL Phase-1/full resume"
+                )
+
+        metadata = dict(
+            base_metadata,
+            causal_tae_artifact_path=(
+                None
+                if causal_identity is None
+                else _canonical_recorded_path(causal_identity["path"])
+            ),
+            causal_tae_artifact_sha256=(
+                None if causal_identity is None else causal_identity["sha256"]
+            ),
+        )
+        identity = _training_data_identity(metadata)
+        identity["resume_checkpoint_path"] = full_path
+        identity["resume_checkpoint_sha256"] = full_sha256
+        return (
+            {"ok": True, "identity": identity, "error": None},
+            metadata,
+            full_checkpoint,
+            mapped_cnn_state,
+        )
+    except Exception as error:
+        return (
+            {
+                "ok": False,
+                "identity": None,
+                "error": "{}: {}".format(type(error).__name__, error),
+            },
+            None,
+            None,
+            None,
+        )
 
 
 def preflight_msa_training_assets(args, accelerator):
-    """Validate distributed data and phase-aware checkpoint contracts."""
-    metadata = build_msa_checkpoint_metadata(args, include_train_manifest=True)
-    validate_distributed_msa_identity(metadata, accelerator)
-
-    cnn_checkpoint = None
-    if args.resume_cnn_pth:
-        cnn_checkpoint = _load_checkpoint_file(
-            args.resume_cnn_pth, "resume CNN checkpoint"
-        )
-        _require_causal_tae_state(cnn_checkpoint)
-
-    full_checkpoint = None
-    if args.resume_pth:
-        full_checkpoint = _load_checkpoint_file(
-            args.resume_pth, "resume MSA-VAE checkpoint"
-        )
-        _require_state_mapping(full_checkpoint, "resume MSA-VAE checkpoint")
-        checkpoint_metadata = (
-            full_checkpoint.get("metadata")
-            if isinstance(full_checkpoint, dict)
-            else None
-        )
-        if checkpoint_metadata is None:
-            if args.msa_data_mode == "babel_sparse_global":
-                raise ValueError(
-                    "BABEL training requires a tagged full resume checkpoint"
-                )
-        else:
-            validate_msa_checkpoint_metadata(
-                checkpoint_metadata, args, scope="training"
-            )
-
-    if args.msa_data_mode == "babel_sparse_global":
-        if args.phase == 1 and cnn_checkpoint is None and full_checkpoint is None:
-            raise ValueError(
-                "BABEL Phase 1 requires --resume-cnn-pth or a tagged full resume"
-            )
-        if args.phase == 2 and full_checkpoint is None:
-            raise ValueError(
-                "BABEL Phase 2 requires a tagged BABEL Phase-1/full resume"
-            )
-
-    return metadata, full_checkpoint
+    """Collectively validate assets before dataset/model construction."""
+    envelope, metadata, full_checkpoint, mapped_cnn_state = (
+        _local_training_asset_probe(args)
+    )
+    validate_distributed_msa_envelope(envelope, accelerator)
+    return metadata, full_checkpoint, mapped_cnn_state
 
 
 def prepare_babel_validation_loader(accelerator, val_loader):
