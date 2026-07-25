@@ -2,10 +2,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
 
+from humanml3d_272 import babel_stream_t5_cache
 from humanml3d_272.babel_stream_t5_cache import (
     BabelStreamRecord,
     CacheBuildError,
@@ -28,7 +30,45 @@ class FakeEncoder:
         )
 
 
+class OffsetEncoder:
+    def __init__(self, offset):
+        self.offset = offset
+
+    def encode(self, texts):
+        return np.array(
+            [
+                [float(self.offset + index), float(self.offset + index + 1)]
+                for index, _ in enumerate(texts)
+            ],
+            dtype=np.float32,
+        )
+
+
 class BabelStreamT5CacheTest(unittest.TestCase):
+    def _write_valid_sources(self, root):
+        motion_dir = root / "motion"
+        text_dir = root / "text"
+        motion_dir.mkdir()
+        text_dir.mkdir()
+        np.save(motion_dir / "seq_a.npy", np.zeros((5, 272), dtype=np.float32))
+        np.save(motion_dir / "seq_b.npy", np.zeros((6, 272), dtype=np.float32))
+        (text_dir / "seq_a.txt").write_text(
+            "walk#walk/VERB#0.0#0.0*sit#sit/VERB#0.0#0.0#2\n"
+        )
+        (text_dir / "seq_b.txt").write_text(
+            "sit#sit/VERB#0.0#0.0*jump#jump/VERB#0.0#0.0#3\n"
+        )
+        return motion_dir, text_dir
+
+    def _expected(self, motion_dir, text_dir):
+        return {
+            "split": "train",
+            "model_signature": "fake-t5",
+            "embedding_dim": 2,
+            "motion_dir": str(motion_dir.resolve()),
+            "text_dir": str(text_dir.resolve()),
+        }
+
     def test_cli_help_runs_from_repository_root_without_loading_sentence_transformers(self):
         result = subprocess.run(
             [sys.executable, "scripts/prepare_babel_stream_t5.py", "--help"],
@@ -72,19 +112,8 @@ class BabelStreamT5CacheTest(unittest.TestCase):
     def test_build_cache_encodes_unique_text_and_validates_existing_outputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            motion_dir = root / "motion"
-            text_dir = root / "text"
+            motion_dir, text_dir = self._write_valid_sources(root)
             output_dir = root / "cache"
-            motion_dir.mkdir()
-            text_dir.mkdir()
-            np.save(motion_dir / "seq_a.npy", np.zeros((5, 272), dtype=np.float32))
-            np.save(motion_dir / "seq_b.npy", np.zeros((6, 272), dtype=np.float32))
-            (text_dir / "seq_a.txt").write_text(
-                "walk#walk/VERB#0.0#0.0*sit#sit/VERB#0.0#0.0#2\n"
-            )
-            (text_dir / "seq_b.txt").write_text(
-                "sit#sit/VERB#0.0#0.0*jump#jump/VERB#0.0#0.0#3\n"
-            )
             encoder = FakeEncoder()
 
             manifest = build_cache(
@@ -106,16 +135,94 @@ class BabelStreamT5CacheTest(unittest.TestCase):
             self.assertEqual(
                 validate_cache_manifest(
                     output_dir / "manifest.json",
-                    {
-                        "split": "train",
-                        "model_signature": "fake-t5",
-                        "embedding_dim": 2,
-                        "motion_dir": str(motion_dir.resolve()),
-                        "text_dir": str(text_dir.resolve()),
-                    },
+                    self._expected(motion_dir, text_dir),
                 ),
                 manifest,
             )
+
+    def test_failed_overwrite_is_rejected_instead_of_accepting_mixed_arrays(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            motion_dir, text_dir = self._write_valid_sources(root)
+            output_dir = root / "cache"
+            build_cache(
+                "train", motion_dir, text_dir, output_dir, OffsetEncoder(0), "fake-t5"
+            )
+            original_save = babel_stream_t5_cache._atomic_save_array
+            saved_names = []
+
+            def fail_after_first_replacement(directory, filename, array):
+                if saved_names:
+                    raise OSError("injected overwrite failure")
+                saved_names.append(filename)
+                original_save(directory, filename, array)
+
+            with patch.object(
+                babel_stream_t5_cache,
+                "_atomic_save_array",
+                side_effect=fail_after_first_replacement,
+            ):
+                with self.assertRaisesRegex(OSError, "injected overwrite failure"):
+                    build_cache(
+                        "train",
+                        motion_dir,
+                        text_dir,
+                        output_dir,
+                        OffsetEncoder(100),
+                        "fake-t5",
+                        overwrite=True,
+                    )
+
+            with self.assertRaisesRegex(ValueError, "array content hash mismatch"):
+                validate_cache_manifest(
+                    output_dir / "manifest.json", self._expected(motion_dir, text_dir)
+                )
+
+    def test_validate_rejects_cached_array_with_wrong_shape_or_dtype(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            motion_dir, text_dir = self._write_valid_sources(root)
+            output_dir = root / "cache"
+            build_cache(
+                "train", motion_dir, text_dir, output_dir, FakeEncoder(), "fake-t5"
+            )
+            np.save(output_dir / "seq_a.npy", np.zeros((5, 3), dtype=np.float32))
+            with self.assertRaisesRegex(ValueError, "shape or dtype"):
+                validate_cache_manifest(
+                    output_dir / "manifest.json", self._expected(motion_dir, text_dir)
+                )
+
+            build_cache(
+                "train",
+                motion_dir,
+                text_dir,
+                output_dir,
+                FakeEncoder(),
+                "fake-t5",
+                overwrite=True,
+            )
+            np.save(output_dir / "seq_a.npy", np.zeros((5, 2), dtype=np.float64))
+            with self.assertRaisesRegex(ValueError, "shape or dtype"):
+                validate_cache_manifest(
+                    output_dir / "manifest.json", self._expected(motion_dir, text_dir)
+                )
+
+    def test_validate_rejects_stale_text_source_signature(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            motion_dir, text_dir = self._write_valid_sources(root)
+            output_dir = root / "cache"
+            build_cache(
+                "train", motion_dir, text_dir, output_dir, FakeEncoder(), "fake-t5"
+            )
+            (text_dir / "seq_a.txt").write_text(
+                "walk#walk/VERB#0.0#0.0*turn#turn/VERB#0.0#0.0#2\n"
+            )
+
+            with self.assertRaisesRegex(ValueError, "source records mismatch"):
+                validate_cache_manifest(
+                    output_dir / "manifest.json", self._expected(motion_dir, text_dir)
+                )
 
     def test_build_cache_rejects_malformed_input_before_manifest_publication(self):
         with tempfile.TemporaryDirectory() as temp_dir:

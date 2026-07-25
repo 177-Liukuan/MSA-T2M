@@ -252,8 +252,18 @@ def validate_cache_manifest(manifest_path, expected) -> dict:
         )
         for item in source_records
     }
-    if manifest.get("records") != current_records:
+    cached_records = manifest.get("records")
+    if not isinstance(cached_records, dict) or set(cached_records) != set(current_records):
         raise ValueError("cache source records mismatch")
+    for stem, current_record in current_records.items():
+        cached_record = cached_records[stem]
+        if not isinstance(cached_record, dict):
+            raise ValueError("cache source records mismatch")
+        cached_source = {
+            key: cached_record.get(key) for key in current_record
+        }
+        if cached_source != current_record:
+            raise ValueError("cache source records mismatch")
     if manifest.get("valid_samples") != len(current_records):
         raise ValueError("cache valid sample count mismatch")
     if manifest.get("rejected_samples") != 0:
@@ -271,6 +281,11 @@ def validate_cache_manifest(manifest_path, expected) -> dict:
             raise ValueError("cannot load cache array {}: {}".format(array_path.name, error)) from error
         if array.shape != (record["frames"], embedding_dim) or array.dtype != np.dtype("float32"):
             raise ValueError("cache array shape or dtype mismatch: {}".format(array_path.name))
+        cached_hash = cached_records[stem].get("array_sha256")
+        if not isinstance(cached_hash, str):
+            raise ValueError("cache array content hash missing: {}".format(array_path.name))
+        if _sha256(array_path) != cached_hash:
+            raise ValueError("cache array content hash mismatch: {}".format(array_path.name))
     return manifest
 
 
@@ -312,10 +327,13 @@ def build_cache(
     for item in source_records:
         stem = item["stem"]
         expanded = expand_segment_embeddings(item["record"], item["frames"], embeddings)
-        _atomic_save_array(output_dir, "{}.npy".format(stem), expanded)
-        manifest_records[stem] = _source_signature(
+        filename = "{}.npy".format(stem)
+        _atomic_save_array(output_dir, filename, expanded)
+        manifest_record = _source_signature(
             stem, item["motion_path"], item["text_path"], item["frames"]
         )
+        manifest_record["array_sha256"] = _sha256(output_dir / filename)
+        manifest_records[stem] = manifest_record
 
     manifest = {
         "version": CACHE_VERSION,
