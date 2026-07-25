@@ -171,9 +171,18 @@ def _known_values(raw):
         return {}
     values = {field: raw[field] for field in CONFIG_FIELDS if field in raw}
     text_embed_dim = raw.get("text_embed_dim")
-    if text_embed_dim is not None and int(text_embed_dim) > 0:
-        values.setdefault("clip_dim", text_embed_dim)
-        values.setdefault("trans_d_model", text_embed_dim)
+    if text_embed_dim is not None:
+        try:
+            text_embed_dim = int(text_embed_dim)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "invalid MSA-VAE configuration field text_embed_dim={!r}".format(
+                    raw.get("text_embed_dim")
+                )
+            )
+        if text_embed_dim > 0:
+            values.setdefault("clip_dim", text_embed_dim)
+            values.setdefault("trans_d_model", text_embed_dim)
     return values
 
 
@@ -201,8 +210,8 @@ def _coerce_config(values):
                     if normalized not in ("true", "false"):
                         raise ValueError
                     value = normalized == "true"
-                else:
-                    value = bool(value)
+                elif not isinstance(value, bool):
+                    raise ValueError
         except (TypeError, ValueError):
             raise ValueError("invalid MSA-VAE configuration field {}={!r}".format(
                 field,

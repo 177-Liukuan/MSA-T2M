@@ -159,6 +159,36 @@ class MSAVAEMetricsDatasetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unique"):
             self._dataset()
 
+    def test_rejects_motion_that_truncates_below_three_frames(self):
+        self._write_fixture(
+            split_ids=["truncated"],
+            motions={"truncated": np.zeros((60, 272))},
+            texts={"truncated": ["full motion#tok#0#0"]},
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "truncated.*fewer than 3 frames",
+        ):
+            MSAVAEMetricsDataset(
+                data_root=self.root,
+                split_file=self.split_file,
+                unit_length=64,
+            )
+
+    def test_rejects_non_positive_standard_deviation(self):
+        std = np.ones(272)
+        std[17] = -1.0
+        np.save(self.root / "mean_std" / "Std.npy", std)
+        self._write_fixture(
+            split_ids=["valid"],
+            motions={"valid": np.zeros((64, 272))},
+            texts={"valid": ["full motion#tok#0#0"]},
+        )
+
+        with self.assertRaisesRegex(ValueError, "strictly positive"):
+            self._dataset()
+
 
 if __name__ == "__main__":
     unittest.main()

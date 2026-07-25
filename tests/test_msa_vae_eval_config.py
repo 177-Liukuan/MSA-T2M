@@ -138,6 +138,27 @@ class MSAEvalConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trans_d_model.*trans_nhead"):
             resolve_msa_vae_config(self.checkpoint, payload, {})
 
+    def test_rejects_non_boolean_disable_decoupling_metadata(self):
+        payload = {
+            "net": self.synthetic_state_dict(),
+            "metadata": {"training_args": {"disable_decoupling": 2}},
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "disable_decoupling=2",
+        ):
+            resolve_msa_vae_config(self.checkpoint, payload, {})
+
+    def test_rejects_malformed_text_embed_dim_with_field_name(self):
+        payload = {
+            "net": self.synthetic_state_dict(),
+            "metadata": {"training_args": {"text_embed_dim": "not-a-number"}},
+        }
+
+        with self.assertRaisesRegex(ValueError, "text_embed_dim"):
+            resolve_msa_vae_config(self.checkpoint, payload, {})
+
     def test_load_checkpoint_accepts_wrapped_and_raw_state_dicts(self):
         state = self.synthetic_state_dict()
         torch.save({"net": state}, self.checkpoint)

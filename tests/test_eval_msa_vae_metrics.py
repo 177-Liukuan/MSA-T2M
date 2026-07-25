@@ -1,5 +1,6 @@
 import csv
 import importlib
+import io
 import json
 import sys
 import tempfile
@@ -15,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from eval_msa_vae_metrics import (
+    EvaluationReporter,
     EvaluationPaths,
     build_result_manifest,
     evaluate_msa_vae_metrics,
@@ -23,6 +25,7 @@ from eval_msa_vae_metrics import (
     parse_args,
     preflight_evaluation_assets,
     resolve_cli_paths,
+    resolve_evaluator_legacy_trust,
     validate_runtime_args,
     write_result_artifacts,
 )
@@ -193,6 +196,26 @@ class EvalMSAVAEMetricsTest(unittest.TestCase):
                 SkatingConfig(),
             )
 
+    @mock.patch(
+        "eval_msa_vae_metrics.recover_from_local_position",
+        side_effect=_recover_fixture,
+    )
+    def test_reports_sample_progress_after_each_batch(self, _recover):
+        progress = []
+
+        evaluate_msa_vae_metrics(
+            _FakeMSAVAE(),
+            [_FakeTextEncoder(), _FakeMotionEncoder()],
+            self._loader(batch_size=2),
+            torch.device("cpu"),
+            SkatingConfig(),
+            progress_callback=lambda completed, total: progress.append(
+                (completed, total)
+            ),
+        )
+
+        self.assertEqual(progress, [(2, 3), (3, 3)])
+
 
 class ResultArtifactTest(unittest.TestCase):
     def setUp(self):
@@ -283,6 +306,40 @@ class ResultArtifactTest(unittest.TestCase):
         self.assertEqual(log_text.count("P-MPJPE"), 1)
         self.assertEqual(log_text.count("ACCEL"), 1)
 
+    def test_artifacts_append_final_report_to_existing_progress_log(self):
+        manifest = build_result_manifest(
+            metrics=self.metrics,
+            checkpoint={
+                "path": "/models/net.pth",
+                "size": 100,
+                "mtime_ns": 123,
+                "sha256": "f" * 64,
+            },
+            evaluator={
+                "path": "/evaluator/epoch.ckpt",
+                "size": 200,
+                "mtime_ns": 456,
+                "sha256": "e" * 64,
+            },
+            resolved_config=self.resolved,
+            dataset=self.dataset,
+            seed=123,
+            skating_config=SkatingConfig(),
+        )
+        self.output_dir.mkdir(parents=True)
+        (self.output_dir / "evaluation.log").write_text(
+            "Loading MSA-VAE checkpoint\n",
+            encoding="utf-8",
+        )
+
+        write_result_artifacts(manifest, self.output_dir, append_log=True)
+
+        log_text = (self.output_dir / "evaluation.log").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(log_text.startswith("Loading MSA-VAE checkpoint\n"))
+        self.assertIn("MSA-VAE standard evaluation", log_text)
+
     def test_manifest_rejects_non_finite_requested_metric(self):
         invalid = dict(self.metrics)
         invalid["fid"] = float("nan")
@@ -352,6 +409,53 @@ class EvaluationCLITest(unittest.TestCase):
             / "distilbert-base-uncased",
         )
 
+    def test_only_exact_bundled_evaluator_is_implicitly_trusted(self):
+        default_args = parse_args(["model.pth", "--device", "cpu"])
+        default_paths = resolve_cli_paths(self.root, default_args)
+        custom_args = parse_args(
+            [
+                "model.pth",
+                "--evaluator-root",
+                "custom_evaluator",
+                "--device",
+                "cpu",
+            ]
+        )
+        custom_paths = resolve_cli_paths(self.root, custom_args)
+        opted_in_args = parse_args(
+            [
+                "model.pth",
+                "--evaluator-root",
+                "custom_evaluator",
+                "--trust-evaluator-checkpoint",
+                "--device",
+                "cpu",
+            ]
+        )
+        opted_in_paths = resolve_cli_paths(self.root, opted_in_args)
+
+        self.assertTrue(
+            resolve_evaluator_legacy_trust(
+                self.root,
+                default_args,
+                default_paths,
+            )
+        )
+        self.assertFalse(
+            resolve_evaluator_legacy_trust(
+                self.root,
+                custom_args,
+                custom_paths,
+            )
+        )
+        self.assertTrue(
+            resolve_evaluator_legacy_trust(
+                self.root,
+                opted_in_args,
+                opted_in_paths,
+            )
+        )
+
     def test_preflight_lists_missing_mean_before_model_or_evaluator_loading(self):
         paths = EvaluationPaths(
             checkpoint=self.root / "model.pth",
@@ -372,6 +476,20 @@ class EvaluationCLITest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num-workers"):
             validate_runtime_args(SimpleNamespace(batch_size=1, num_workers=-1))
 
+    def test_reporter_immediately_mirrors_messages_to_terminal_and_file(self):
+        stream = io.StringIO()
+
+        reporter = EvaluationReporter(self.root / "results", stream=stream)
+        reporter.emit("Preflight passed")
+
+        self.assertEqual(stream.getvalue(), "Preflight passed\n")
+        self.assertEqual(
+            (self.root / "results" / "evaluation.log").read_text(
+                encoding="utf-8"
+            ),
+            "Preflight passed\n",
+        )
+
     def test_trusted_lightning_evaluator_payload_accepts_numpy_scalars_without_warning(self):
         checkpoint = self.root / "evaluator.ckpt"
         torch.save(
@@ -384,7 +502,10 @@ class EvaluationCLITest(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            payload = load_evaluator_checkpoint(checkpoint)
+            payload = load_evaluator_checkpoint(
+                checkpoint,
+                trusted_legacy=True,
+            )
 
         self.assertIn("state_dict", payload)
         self.assertFalse(
@@ -420,12 +541,40 @@ class EvaluationCLITest(unittest.TestCase):
         payload = load_evaluator_checkpoint(
             checkpoint,
             evaluator_root=self.root,
+            trusted_legacy=True,
         )
 
         self.assertEqual(payload["legacy"].value, 7)
         self.assertNotIn(str(self.root), sys.path)
         sys.modules.pop("mld.legacy_payload", None)
         sys.modules.pop("mld", None)
+
+    def test_untrusted_evaluator_override_refuses_legacy_pickle_payload(self):
+        checkpoint = self.root / "untrusted_evaluator.ckpt"
+        torch.save(
+            {
+                "state_dict": {"weight": torch.ones(1)},
+                "legacy_scalar": np.float64(1.0),
+            },
+            checkpoint,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--trust-evaluator-checkpoint",
+        ):
+            load_evaluator_checkpoint(checkpoint)
+
+    def test_untrusted_tensor_only_evaluator_checkpoint_loads_safely(self):
+        checkpoint = self.root / "safe_evaluator.ckpt"
+        torch.save(
+            {"state_dict": {"weight": torch.ones(1)}},
+            checkpoint,
+        )
+
+        payload = load_evaluator_checkpoint(checkpoint)
+
+        self.assertTrue(torch.equal(payload["state_dict"]["weight"], torch.ones(1)))
 
     def test_frozen_evaluator_hides_only_known_nested_tensor_warning(self):
         module_sources = {
