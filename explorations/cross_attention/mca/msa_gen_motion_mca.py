@@ -46,27 +46,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # text = "“A person walks forward, turns around, then sits down"
 text = "A man is walking forward while he is punching"
 
-# ------ Choose ONE of the two models ------
-# Model A: optimised (dual CFG training, ca_every_n_layers=4)
-RESUME_TRANS_A = (
-    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
-    "_every2layer_top3_ddpm_cfg/net_Iter100000.pth"
-)
-# Model B: original (joint CFG training, ca_every_n_layers=4 as well)
-RESUME_TRANS_B = (
-    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
+# Built-in demo checkpoint: archived joint-CFG latent-retrieval result.
+resume_trans = (
+    "Experiments/explorations/cross_attention/latent_retrieval/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
     "_6layer_top3_ddpm/net_Iter100000.pth"
 )
 
-# Active checkpoint  ← switch between A and B here
-resume_trans = RESUME_TRANS_A
-
-# For model A (trained with independent retrieval CFG): use dual-CFG (3-forward).
-#   cfg_scale_retr controls retrieval contribution (1.0 = mild, 2.0 = stronger).
-# For model B (trained with JOINT CFG dropout): use_joint_cfg=True.
-#   This uses standard proper 2-forward CFG matching training distribution.
+# The built-in checkpoint uses joint CFG; cfg_scale_retr is ignored.
 cfg_scale      = 6.0   # text CFG strength
-cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=False)
+cfg_scale_retr = 2.0   # unused for the built-in joint-CFG run
 
 # CFG mode flag  ← use True for ALL models (OLD and NEW alike)
 #
@@ -84,7 +72,7 @@ cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=Fa
 #   is an out-of-distribution extrapolation the diffusion head has never seen.
 #   For a 12-CA-block model the difference (z_both - z_retr) is huge, so the
 #   4x amplification pushes z_guided far outside the training manifold.
-use_joint_cfg = False    # True for ALL models — see explanation above
+use_joint_cfg = True     # Matches the built-in archived checkpoint.
 
 # Stop token threshold (L2 distance from generated token to reference_end_latent).
 # Data calibration:
@@ -642,9 +630,10 @@ def main():
         model_dim           = config.n_embd,
         disable_rag         = disable_rag,
         latent_dim          = latent_dim,
-        ca_every_n_layers   = ca_every_n_auto,    # ← KEY FIX
+        ca_every_n_layers   = 4,                  # Matches the archived checkpoint/eval.
         ff_mult             = ff_mult_ckpt,        # ← from checkpoint
         disable_latent_retr = disable_latent_retr,
+        ca_insertion_mode   = "after_sa",
     ).to(device)
     print(f"  [Model] {rag_model.extra_repr()}")
 

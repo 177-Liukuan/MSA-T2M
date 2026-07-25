@@ -78,7 +78,7 @@ accelerate launch --num_processes $NUM_GPUS \
     --batch-size $BATCH_SIZE \
     --lr $LR \
     --total-iter $TOTAL_ITER \
-    --out-dir Experiments \
+    --out-dir Experiments/explorations/rectified_flow \
     --exp-name $EXP_NAME \
     --dataname $DATASET \
     --latent_dir $MOTION_LATENT_DIR \

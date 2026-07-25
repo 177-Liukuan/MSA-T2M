@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 import unittest
 
@@ -55,6 +56,56 @@ MOVED_PYTHON_TARGETS = {
         "explorations.representation_experiments.train_tae_gan_v1",
 }
 
+EXPLORATION_OUTPUT_ROOTS = {
+    "clip/TRAIN_t2m_baseline_clip.sh": "Experiments/explorations/clip",
+    "rectified_flow/Train_t2m_rag_rf.sh": "Experiments/explorations/rectified_flow",
+    "cross_attention/mca/Train_t2m_rag_multi_text_token.sh": (
+        "Experiments/explorations/cross_attention/mca"
+    ),
+    "cross_attention/latent_retrieval/Train_t2m_rag_latent_retr.sh": (
+        "Experiments/explorations/cross_attention/latent_retrieval"
+    ),
+    "cross_attention/local_rag/TRAIN_t2m_rag_local.sh": (
+        "Experiments/explorations/cross_attention/local_rag"
+    ),
+    "cross_attention/local_rag/TRAIN_THEN_EVAL_t2m_rag_local.sh": (
+        "Experiments/explorations/cross_attention/local_rag"
+    ),
+    "qformer/TRAIN_qformer_rag.sh": "Experiments/explorations/qformer",
+    "representation_experiments/TRAIN_sae_v1.sh": (
+        "Experiments/explorations/representation_experiments"
+    ),
+    "representation_experiments/TRAIN_tae_gan_v1.sh": (
+        "Experiments/explorations/representation_experiments/TAE_GAN_Loss_"
+    ),
+    "motionstreamer_baselines/TRAIN_motionstreamer.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+    "motionstreamer_baselines/TRAIN_t2m.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+    "motionstreamer_baselines/Train_t2m_multi.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+    "motionstreamer_baselines/TRAIN_t2m_cached.sh": (
+        "Experiments/explorations/motionstreamer_baselines"
+    ),
+}
+
+MOVED_CHECKPOINT_REFERENCES = {
+    "clip/EVAL_t2m_clip_baseline.sh": (
+        "Experiments/explorations/clip/MotionStreamer_t2m_272_baseline_clip"
+    ),
+    "rectified_flow/EVAL_t2m_rag_t5_rf.sh": (
+        "Experiments/explorations/rectified_flow/"
+        "MotionStreamer_t2m_272_msa_rag_t5_trans662048_rf_100000Iter_addEMA"
+    ),
+    "cross_attention/local_rag/EVAL_t2m_rag_local.sh": (
+        "Experiments/explorations/cross_attention/local_rag/"
+        "MotionStreamer_t2m_272_msa_rag_local_L16_k3_sa_ca"
+    ),
+}
+
 
 class ExplorationLauncherTest(unittest.TestCase):
     def test_shell_launchers_enter_repository_root(self):
@@ -76,6 +127,112 @@ class ExplorationLauncherTest(unittest.TestCase):
             for target in targets:
                 with self.subTest(path=relative_path, target=target):
                     self.assertIn(f"-m {target}", content)
+
+    def test_exploration_training_outputs_stay_under_archive(self):
+        for relative_path, output_root in EXPLORATION_OUTPUT_ROOTS.items():
+            content = (EXPLORATIONS / relative_path).read_text()
+            with self.subTest(path=relative_path):
+                self.assertIn(output_root, content)
+
+    def test_exploration_evaluations_read_archived_checkpoints(self):
+        for relative_path, checkpoint_path in MOVED_CHECKPOINT_REFERENCES.items():
+            content = (EXPLORATIONS / relative_path).read_text()
+            with self.subTest(path=relative_path):
+                self.assertIn(checkpoint_path, content)
+
+    def test_active_cross_attention_defaults_use_archived_results(self):
+        latent_checkpoint = (
+            "Experiments/explorations/cross_attention/latent_retrieval/"
+            "MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr_"
+            "6layer_top3_ddpm/net_Iter100000.pth"
+        )
+        for relative_path in (
+            "cross_attention/latent_retrieval/EVAL_t2m_rag_latent_retr.sh",
+        ):
+            with self.subTest(path=relative_path):
+                content = (EXPLORATIONS / relative_path).read_text()
+                self.assertIn(latent_checkpoint, content)
+                self.assertIn("CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:-4}", content)
+
+        addcfg_content = (
+            EXPLORATIONS
+            / "cross_attention/latent_retrieval/EVAL_t2m_rag_latent_retr_addcfg.sh"
+        ).read_text()
+        self.assertIn("RAG_CKPT=${RAG_CKPT:?", addcfg_content)
+        self.assertIn("CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:?", addcfg_content)
+        self.assertIn("CA_INSERTION_MODE=${CA_INSERTION_MODE:?", addcfg_content)
+
+        for relative_path in (
+            "cross_attention/mca/msa_gen_motion_mca.py",
+            "cross_attention/mca/msa_gen_motion_mca_op.py",
+        ):
+            with self.subTest(path=relative_path):
+                content = (EXPLORATIONS / relative_path).read_text()
+                self.assertNotIn("RESUME_TRANS_A", content)
+                self.assertNotIn("RESUME_TRANS_B", content)
+                resume_trans = next(
+                    statement.value
+                    for statement in ast.parse(content).body
+                    if isinstance(statement, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name)
+                        and target.id == "resume_trans"
+                        for target in statement.targets
+                    )
+                )
+                self.assertEqual(ast.literal_eval(resume_trans), latent_checkpoint)
+                self.assertIn("use_joint_cfg = True", content)
+
+                tree = ast.parse(content)
+                wrapper_call = next(
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "LLaMARAGLatentRetrWrapper"
+                )
+                keyword_values = {
+                    keyword.arg: keyword.value for keyword in wrapper_call.keywords
+                }
+                self.assertIn("ca_every_n_layers", keyword_values)
+                if relative_path.endswith("msa_gen_motion_mca.py"):
+                    self.assertEqual(
+                        ast.literal_eval(keyword_values["ca_every_n_layers"]), 4
+                    )
+                if "ca_insertion_mode" in keyword_values:
+                    insertion_mode = keyword_values["ca_insertion_mode"]
+                    if isinstance(insertion_mode, ast.Name):
+                        insertion_mode = next(
+                            statement.value
+                            for statement in tree.body
+                            if isinstance(statement, ast.Assign)
+                            and any(
+                                isinstance(target, ast.Name)
+                                and target.id == insertion_mode.id
+                                for target in statement.targets
+                            )
+                        )
+                    self.assertEqual(
+                        ast.literal_eval(insertion_mode),
+                        "after_sa",
+                    )
+                else:
+                    self.fail("missing explicit ca_insertion_mode")
+
+        mca_op_content = (
+            EXPLORATIONS / "cross_attention/mca/msa_gen_motion_mca_op.py"
+        ).read_text()
+        self.assertIn("ca_every_n_layers_override = 4", mca_op_content)
+
+        local_content = (
+            EXPLORATIONS / "cross_attention/local_rag/msa_gen_motion_local.py"
+        ).read_text()
+        self.assertIn(
+            "Experiments/explorations/cross_attention/local_rag/"
+            "MotionStreamer_t2m_272_msa_rag_local_L4_k3_crossattn/"
+            "net_Iter100000.pth",
+            local_content,
+        )
 
     def test_cross_archive_imports_use_package_paths(self):
         expected_imports = {

@@ -17,7 +17,7 @@ build_rag_db.py
 使用示例
 --------
   python build_rag_db.py \\
-      --qformer-ckpt Experiments/QFormer_t2m_272_v1/net_best_r1.pth \\
+      --qformer-ckpt Experiments/explorations/qformer/QFormer_t2m_272_v1/net_best_r1.pth \\
       --tae-ckpt Experiments/causal_TAE_t2m_272_h100_20260203/net_best_mpjpe.pth \\
       --split train
 """
@@ -220,7 +220,7 @@ def main():
     print(f'使用设备: {device}')
 
     # ── 确定输出目录（与 qformer checkpoint 实验目录一致）────────────────────
-    # args.qformer_ckpt 形如 Experiments/QFormer_t2m_272_v1/net_best_r1.pth
+    # args.qformer_ckpt 形如 Experiments/explorations/qformer/QFormer_t2m_272_v1/net_best_r1.pth
     # 取倒数第 2 段作为 exp_name
     exp_name = os.path.basename(os.path.dirname(os.path.abspath(args.qformer_ckpt)))
     db_dir   = pjoin(args.db_root, exp_name)

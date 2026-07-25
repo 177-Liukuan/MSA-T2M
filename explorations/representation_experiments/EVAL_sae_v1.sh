@@ -8,7 +8,7 @@ cd "$REPO_ROOT"
 #
 #  Usage:
 #    bash EVAL_sae_v1.sh <checkpoint_path>
-#    e.g.  bash EVAL_sae_v1.sh ../Experiments/SAE_v1_t2m_272/net_best_mpjpe.pth
+#    e.g.  bash EVAL_sae_v1.sh Experiments/explorations/representation_experiments/SAE_v1_t2m_272/net_best_mpjpe.pth
 #
 #  Metrics: FID, MPJPE (mm), first-5-frame jitter (mm)
 # -----------------------------------------------------------
@@ -20,7 +20,7 @@ ln -sf ../models       ./Evaluator_272/models       2>/dev/null || true
 ln -sf ../visualization ./Evaluator_272/visualization 2>/dev/null || true
 
 python -m explorations.representation_experiments.eval_sae_v1 \
-  --resume-pth ../Experiments/SAE_v1_t2m_272/net_best_mpjpe.pth \
+  --resume-pth Experiments/explorations/representation_experiments/SAE_v1_t2m_272/net_best_mpjpe.pth \
   --out-dir Evaluator_272/output \
   --exp-name SAE_v1_eval \
   --down-t 2 \

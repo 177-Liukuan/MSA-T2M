@@ -44,7 +44,7 @@ accelerate launch --num_processes $NUM_GPUS \
   --down-t 2 \
   --depth 3 \
   --dilation-growth-rate 3 \
-  --out-dir Experiments \
+  --out-dir Experiments/explorations/representation_experiments \
   --dataname $dataset_name \
   --exp-name SAE_v1_${dataset_name} \
   --root_loss 7.0 \

@@ -81,7 +81,7 @@ accelerate launch --num_processes $NUM_GPUS \
     --disc-n-layers $DISC_N_LAYERS \
     --disc-freq $DISC_FREQ \
     --disc-clip-grad $DISC_CLIP_GRAD \
-    --out-dir Experiments/TAE_GAN_Loss_ \
+    --out-dir Experiments/explorations/representation_experiments/TAE_GAN_Loss_ \
     --exp-name tae_gan_v1_t2m_272_v2 \
     --print-iter 200 \
     --eval-iter 10000 \

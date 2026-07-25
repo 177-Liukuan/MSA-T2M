@@ -48,7 +48,7 @@ accelerate launch --num_processes $NUM_GPUS \
     --batch-size $BATCH_SIZE \
     --lr 0.0001 \
     --total-iter 100000 \
-    --out-dir Experiments \
+    --out-dir Experiments/explorations/motionstreamer_baselines \
     --exp-name MotionStreamer_t2m_272_cached_embeddings_8gpu_bf16 \
     --dataname t2m_272 \
     --latent_dir humanml3d_272/t2m_latents/causal_TAE_t2m_272_h100_20260203 \

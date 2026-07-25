@@ -46,19 +46,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 text = "A man is walking forward while he is punching"
 
-# ------ Choose ONE of the two models ------
-# Model A: optimised (dual CFG training, ca_every_n_layers=4)
-RESUME_TRANS_A = (
-    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr_after_sa_every1layer_top3_ddpm_cfg_saca_dropout01/net_Iter100000.pth"
-)
-# Model B: original (joint CFG training, ca_every_n_layers=4 as well)
-RESUME_TRANS_B = (
-    "Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
+# Built-in demo checkpoint: archived joint-CFG latent-retrieval result.
+resume_trans = (
+    "Experiments/explorations/cross_attention/latent_retrieval/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr"
     "_6layer_top3_ddpm/net_Iter100000.pth"
 )
-
-# Active checkpoint  ← switch between A and B here
-resume_trans = RESUME_TRANS_A
 
 # CA insertion mode — MUST match the training config of resume_trans.
 # Cannot be auto-detected from checkpoint weights alone.
@@ -75,14 +67,11 @@ ca_insertion_mode = 'after_sa'   # ← change this when switching checkpoints
 # For 'late_after_sa', this is the stride within the second-half layers only.
 # For 'before_sa' / 'after_sa', this is the global stride across all layers.
 # Set to None to auto-detect (reliable for before_sa/after_sa; NOT for late_after_sa).
-ca_every_n_layers_override = 2   # ← set to None to auto-detect
+ca_every_n_layers_override = 4   # Matches the archived Model B checkpoint.
 
-# For model A (trained with independent retrieval CFG): use dual-CFG (3-forward).
-#   cfg_scale_retr controls retrieval contribution (1.0 = mild, 2.0 = stronger).
-# For model B (trained with JOINT CFG dropout): use_joint_cfg=True.
-#   This uses standard proper 2-forward CFG matching training distribution.
+# The built-in checkpoint uses joint CFG; cfg_scale_retr is ignored.
 cfg_scale      = 7.0   # text CFG strength
-cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=False)
+cfg_scale_retr = 2.0   # unused for the built-in joint-CFG run
 
 # CFG mode flag  ← use True for ALL models (OLD and NEW alike)
 #
@@ -100,7 +89,7 @@ cfg_scale_retr = 2.0   # retrieval CFG strength (only used when use_joint_cfg=Fa
 #   is an out-of-distribution extrapolation the diffusion head has never seen.
 #   For a 12-CA-block model the difference (z_both - z_retr) is huge, so the
 #   4x amplification pushes z_guided far outside the training manifold.
-use_joint_cfg = False    # True for ALL models — see explanation above
+use_joint_cfg = True     # Matches the built-in archived checkpoint.
 
 # Stop token threshold (L2 distance from generated token to reference_end_latent).
 # Data calibration:

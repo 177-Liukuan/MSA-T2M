@@ -14,12 +14,15 @@ cd "$REPO_ROOT"
 # All 3 z-vectors are in-distribution — no OOD hidden-space extrapolation.
 #
 # Usage:
+#   RAG_CKPT=<independent-dropout checkpoint> \\
+#   CA_EVERY_N_LAYERS=<training stride> \\
+#   CA_INSERTION_MODE=<training insertion mode> \\
 #   bash EVAL_t2m_rag_latent_retr_addcfg.sh
 # Override scales:
 #   CFG_SCALE_T=7.0 CFG_SCALE_R=2.5 bash EVAL_t2m_rag_latent_retr_addcfg.sh
 
 MSA_VAE_CKPT=${MSA_VAE_CKPT:-Experiments/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right/net_best_mpjpe.pth}
-RAG_CKPT=${RAG_CKPT:-Experiments/MotionStreamer_t2m_272_msa_rag_t5_trans662048_latent_retr_after_sa_every2layer_top3_ddpm_cfg_saca_dropout01/net_Iter100000.pth}
+RAG_CKPT=${RAG_CKPT:?Set RAG_CKPT to an independent-retrieval-dropout checkpoint}
 MOTION_LATENT_DIR=${MOTION_LATENT_DIR:-./humanml3d_272/t2m_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right}
 TEXT_LATENT_DIR=${TEXT_LATENT_DIR:-./humanml3d_272/text_latents_t5}
 HCLS_DIR=${HCLS_DIR:-./humanml3d_272/h_cls_latents_msa_vae/MSA_VAEv6_phase2_t2m_272_phase1_alpha0_t5_trans662048_fulldb_right}
@@ -39,8 +42,8 @@ LATENT_DIM=${LATENT_DIM:-16}
 
 # CA architecture — must match training config
 CA_N_HEAD=${CA_N_HEAD:-0}
-CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:-2}
-CA_INSERTION_MODE=${CA_INSERTION_MODE:-after_sa}   # before_sa | after_sa | late_after_sa
+CA_EVERY_N_LAYERS=${CA_EVERY_N_LAYERS:?Set CA_EVERY_N_LAYERS to match RAG_CKPT}
+CA_INSERTION_MODE=${CA_INSERTION_MODE:?Set CA_INSERTION_MODE to match RAG_CKPT}
 
 # Additive CFG scales (key difference from 2-forward script)
 CFG_SCALE_T=${CFG_SCALE_T:-6.0}   # text guidance strength s_t
