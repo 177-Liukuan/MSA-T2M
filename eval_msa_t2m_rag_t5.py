@@ -293,16 +293,17 @@ class RAGEvalSampler:
                 temperature=1.0,
             )
 
-            next_token = next_token.unsqueeze(1)
-            xs = next_token if xs is None else torch.cat([xs, next_token], dim=1)
-
             # MotionStreamer-style continuous stopping by reference end latent distance.
             if self.enable_stopping and self.reference_end_latent is not None:
-                cur = next_token.squeeze(1)
-                dist_l2 = torch.linalg.norm(cur - self.reference_end_latent.unsqueeze(0), dim=-1)
+                dist_l2 = torch.linalg.norm(
+                    next_token - self.reference_end_latent.unsqueeze(0), dim=-1
+                )
                 finished = finished | (dist_l2 < self.stop_threshold)
                 if torch.all(finished):
                     break
+
+            next_token = next_token.unsqueeze(1)
+            xs = next_token if xs is None else torch.cat([xs, next_token], dim=1)
 
         if xs is None:
             xs = torch.zeros((bsz, 1, self.latent_dim), device=self.device, dtype=torch.float32)
