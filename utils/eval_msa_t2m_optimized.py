@@ -4,6 +4,13 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from utils.eval_trans import (
+    calculate_R_precision,
+    calculate_activation_statistics,
+    calculate_diversity,
+    calculate_frechet_distance,
+)
+
 
 @dataclass(frozen=True)
 class BatchedLatentResult:
@@ -331,3 +338,138 @@ def decode_equal_length_groups(
         motions[index, :copy_length] = decoded[:copy_length]
 
     return motions, pred_lengths
+
+
+@torch.no_grad()
+def evaluation_transformer_272_optimized(
+    val_loader,
+    net,
+    trans,
+    logger,
+    evaluator,
+    cfg=4.0,
+    device=torch.device("cuda"),
+    unit_length=4,
+):
+    textencoder, motionencoder = evaluator
+    trans.eval()
+
+    motion_annotation_list = []
+    motion_pred_list = []
+    r_precision_real = torch.zeros(3, device=device)
+    r_precision_pred = torch.zeros(3, device=device)
+    matching_score_real = torch.tensor(0.0, device=device)
+    matching_score_pred = torch.tensor(0.0, device=device)
+    sample_count = 0
+    empty_fallback_count = 0
+
+    for text, pose, motion_lengths in val_loader:
+        batch_result = trans.sample_batch_for_eval_CFG(
+            text,
+            motion_lengths,
+            unit_length=unit_length,
+            cfg=cfg,
+        )
+        if len(batch_result.latents) != len(text):
+            raise ValueError(
+                "generated sample count {} does not match text batch {}".format(
+                    len(batch_result.latents),
+                    len(text),
+                )
+            )
+        empty_fallback_count += batch_result.empty_fallback_count
+
+        pred_pose_eval, pred_lengths = decode_equal_length_groups(
+            net,
+            batch_result.latents,
+            max_motion_length=pose.shape[1],
+            motion_dim=pose.shape[-1],
+        )
+
+        text_pred = textencoder(text).loc
+        motion_pred = motionencoder(pred_pose_eval, pred_lengths).loc
+
+        pose = pose.to(device).float()
+        text_real = textencoder(text).loc
+        motion_real = motionencoder(pose, motion_lengths).loc
+        motion_annotation_list.append(motion_real)
+        motion_pred_list.append(motion_pred)
+
+        batch_r, batch_matching = calculate_R_precision(
+            text_real.detach().cpu().numpy(),
+            motion_real.detach().cpu().numpy(),
+            top_k=3,
+            sum_all=True,
+        )
+        r_precision_real += torch.as_tensor(
+            batch_r,
+            device=device,
+            dtype=r_precision_real.dtype,
+        )
+        matching_score_real += float(batch_matching)
+
+        batch_r, batch_matching = calculate_R_precision(
+            text_pred.detach().cpu().numpy(),
+            motion_pred.detach().cpu().numpy(),
+            top_k=3,
+            sum_all=True,
+        )
+        r_precision_pred += torch.as_tensor(
+            batch_r,
+            device=device,
+            dtype=r_precision_pred.dtype,
+        )
+        matching_score_pred += float(batch_matching)
+        sample_count += len(text)
+
+    if sample_count == 0:
+        raise ValueError("validation loader produced no samples")
+
+    motion_annotation_np = (
+        torch.cat(motion_annotation_list, dim=0).detach().cpu().numpy()
+    )
+    motion_pred_np = torch.cat(motion_pred_list, dim=0).detach().cpu().numpy()
+
+    gt_mu, gt_cov = calculate_activation_statistics(motion_annotation_np)
+    pred_mu, pred_cov = calculate_activation_statistics(motion_pred_np)
+    diversity_times = 300 if sample_count > 300 else 100
+    diversity_real = calculate_diversity(
+        motion_annotation_np,
+        diversity_times,
+    )
+    diversity_pred = calculate_diversity(
+        motion_pred_np,
+        diversity_times,
+    )
+
+    r_precision_real = r_precision_real / sample_count
+    r_precision_pred = r_precision_pred / sample_count
+    matching_score_real = matching_score_real / sample_count
+    matching_score_pred = matching_score_pred / sample_count
+    fid = calculate_frechet_distance(gt_mu, gt_cov, pred_mu, pred_cov)
+
+    logger.info(
+        "--> \t Eval. :, FID. {:.4f}, Diversity Real. {:.4f}, "
+        "Diversity Pred. {:.4f}, R_precision Real. {}, "
+        "R_precision Pred. {}, MM-dist (matching_score) Real. {}, "
+        "MM-dist (matching_score) Pred. {}, Empty latent fallbacks. {}".format(
+            fid,
+            diversity_real,
+            diversity_pred,
+            r_precision_real,
+            r_precision_pred,
+            matching_score_real,
+            matching_score_pred,
+            empty_fallback_count,
+        )
+    )
+
+    return (
+        fid,
+        diversity_pred,
+        r_precision_pred[0],
+        r_precision_pred[1],
+        r_precision_pred[2],
+        matching_score_pred,
+        logger,
+    )

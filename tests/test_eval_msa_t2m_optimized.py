@@ -1,13 +1,17 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 from utils.eval_msa_t2m_optimized import (
+    BatchedLatentResult,
     OptimizedRAGEvalSampler,
     decode_equal_length_groups,
+    evaluation_transformer_272_optimized,
     generate_latents_active_set,
 )
+from utils.eval_trans import calculate_R_precision
 
 
 class DeterministicRAG(torch.nn.Module):
@@ -262,6 +266,96 @@ class OptimizedDecodeTests(unittest.TestCase):
         self.assertEqual(motions.shape, (5, 12, 3))
         self.assertEqual(lengths.tolist(), [8, 4, 8, 12, 4])
         self.assertEqual(motions[:, 0, 0].tolist(), [10, 20, 30, 40, 50])
+
+
+class IdentityBatchSampler:
+    def eval(self):
+        return self
+
+    def sample_batch_for_eval_CFG(self, text, lengths, unit_length=4, cfg=4.0):
+        del lengths, unit_length, cfg
+        latents = []
+        for caption in text:
+            sample_id = float(caption.split("_")[1])
+            latents.append(torch.tensor([[[sample_id]]], dtype=torch.float32))
+        return BatchedLatentResult(
+            latents=latents,
+            stop_steps=torch.full((len(text),), -1, dtype=torch.long),
+            empty_fallback_count=0,
+        )
+
+
+class IdentityMotionDecoder(torch.nn.Module):
+    def forward_decoder(self, latents):
+        return latents[:, :1].expand(-1, 4, -1).clone()
+
+
+class OneHotTextEncoder(torch.nn.Module):
+    def forward(self, captions):
+        indices = torch.tensor(
+            [int(caption.split("_")[1]) for caption in captions],
+            dtype=torch.long,
+        )
+        return SimpleNamespace(loc=torch.nn.functional.one_hot(indices, 64).float())
+
+
+class OneHotMotionEncoder(torch.nn.Module):
+    def forward(self, motions, lengths):
+        del lengths
+        indices = motions[:, 0, 0].round().long()
+        return SimpleNamespace(loc=torch.nn.functional.one_hot(indices, 64).float())
+
+
+class RecordingLogger:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, message):
+        self.messages.append(str(message))
+
+
+class OptimizedMetricTests(unittest.TestCase):
+    @staticmethod
+    def _make_batch():
+        captions = ["id_{}".format(index) for index in range(64)]
+        pose = torch.zeros(64, 4, 1)
+        pose[:, :, 0] = torch.arange(64, dtype=torch.float32).view(-1, 1)
+        lengths = torch.full((64,), 4, dtype=torch.long)
+        return captions, pose, lengths
+
+    def test_r_precision_keeps_original_loader_batch_boundaries(self):
+        batch_one = self._make_batch()
+        batch_two = self._make_batch()
+        logger = RecordingLogger()
+
+        result = evaluation_transformer_272_optimized(
+            [batch_one, batch_two],
+            IdentityMotionDecoder(),
+            IdentityBatchSampler(),
+            logger,
+            [OneHotTextEncoder(), OneHotMotionEncoder()],
+            cfg=4.0,
+            device=torch.device("cpu"),
+            unit_length=4,
+        )
+
+        self.assertEqual(len(result), 7)
+        self.assertEqual(float(result[2]), 1.0)
+        self.assertEqual(float(result[3]), 1.0)
+        self.assertEqual(float(result[4]), 1.0)
+        self.assertEqual(float(result[5]), 0.0)
+
+        duplicate_embeddings = np.concatenate(
+            [np.eye(64, dtype=np.float32), np.eye(64, dtype=np.float32)],
+            axis=0,
+        )
+        pooled_r_precision, _ = calculate_R_precision(
+            duplicate_embeddings,
+            duplicate_embeddings,
+            top_k=3,
+            sum_all=True,
+        )
+        self.assertLess(pooled_r_precision[0] / 128.0, 1.0)
 
 
 if __name__ == "__main__":
