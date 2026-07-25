@@ -65,7 +65,15 @@ def _full_motion_captions(text_path):
     return captions
 
 
-def _read_manifest(manifest_path, babel_motion_dir, babel_cache_dir, text_embed_dim):
+def _read_manifest(
+    manifest_path,
+    babel_motion_dir,
+    babel_text_dir,
+    babel_cache_dir,
+    babel_split,
+    t5_model_path,
+    text_embed_dim,
+):
     manifest_path = Path(manifest_path).expanduser().resolve()
     try:
         manifest = json.loads(manifest_path.read_text())
@@ -73,7 +81,15 @@ def _read_manifest(manifest_path, babel_motion_dir, babel_cache_dir, text_embed_
         raise RuntimeError("cannot read BABEL cache manifest: {}".format(error)) from error
 
     expected_motion_root = _canonical(babel_motion_dir)
+    expected_text_root = _canonical(babel_text_dir)
     expected_cache_root = _canonical(babel_cache_dir)
+    expected = {
+        "split": str(babel_split),
+        "model_signature": _canonical(t5_model_path),
+        "embedding_dim": int(text_embed_dim),
+        "motion_dir": expected_motion_root,
+        "text_dir": expected_text_root,
+    }
     errors = []
     if manifest_path.parent != Path(expected_cache_root):
         errors.append("cache directory does not match manifest parent")
@@ -81,10 +97,16 @@ def _read_manifest(manifest_path, babel_motion_dir, babel_cache_dir, text_embed_
         errors.append("cache manifest version mismatch")
     if manifest.get("motion_dir") != expected_motion_root:
         errors.append("cache manifest motion_dir mismatch")
-    if manifest.get("embedding_dim") != int(text_embed_dim):
+    if manifest.get("text_dir") != expected_text_root:
+        errors.append("cache manifest text_dir mismatch")
+    if manifest.get("split") != expected["split"]:
+        errors.append("cache manifest split mismatch")
+    if manifest.get("model_signature") != expected["model_signature"]:
+        errors.append("cache manifest model_signature mismatch")
+    if manifest.get("embedding_dim") != expected["embedding_dim"]:
         errors.append("cache manifest embedding dimension mismatch")
-    if not isinstance(manifest.get("text_dir"), str) or not Path(manifest["text_dir"]).is_dir():
-        errors.append("cache manifest text_dir is missing")
+    if not Path(expected_text_root).is_dir():
+        errors.append("requested BABEL text_dir is missing")
     records = manifest.get("records")
     if not isinstance(records, dict):
         errors.append("cache manifest records must be a mapping")
@@ -93,18 +115,11 @@ def _read_manifest(manifest_path, babel_motion_dir, babel_cache_dir, text_embed_
         errors.append("cache manifest sample counts are invalid")
     if errors:
         raise RuntimeError("BABEL cache manifest validation failed: {}".format("; ".join(errors)))
-    return manifest_path, manifest
+    return manifest_path, manifest, expected
 
 
-def _validate_cache_contents(manifest_path, manifest):
+def _validate_cache_contents(manifest_path, expected):
     """Run Task 1's full source/hash validation after useful local diagnostics."""
-    expected = {
-        "split": manifest["split"],
-        "model_signature": manifest["model_signature"],
-        "embedding_dim": manifest["embedding_dim"],
-        "motion_dir": manifest["motion_dir"],
-        "text_dir": manifest["text_dir"],
-    }
     try:
         validate_cache_manifest(manifest_path, expected)
     except (OSError, ValueError) as error:
@@ -135,10 +150,23 @@ def _format_failures(failures, bridge_count, babel_count, has_entries):
 
 class _BabelSourceMixin:
     def _discover_babel_entries(
-        self, babel_motion_dir, babel_cache_dir, babel_cache_manifest, text_embed_dim
+        self,
+        babel_motion_dir,
+        babel_text_dir,
+        babel_cache_dir,
+        babel_cache_manifest,
+        babel_split,
+        t5_model_path,
+        text_embed_dim,
     ):
-        manifest_path, manifest = _read_manifest(
-            babel_cache_manifest, babel_motion_dir, babel_cache_dir, text_embed_dim
+        manifest_path, manifest, expected = _read_manifest(
+            babel_cache_manifest,
+            babel_motion_dir,
+            babel_text_dir,
+            babel_cache_dir,
+            babel_split,
+            t5_model_path,
+            text_embed_dim,
         )
         motion_root = Path(babel_motion_dir).expanduser().resolve()
         cache_root = Path(babel_cache_dir).expanduser().resolve()
@@ -193,7 +221,7 @@ class _BabelSourceMixin:
 
         if not failures:
             try:
-                _validate_cache_contents(manifest_path, manifest)
+                _validate_cache_contents(manifest_path, expected)
             except RuntimeError as error:
                 failures.append("babel cache manifest content validation {}".format(error))
         return entries, failures
@@ -210,8 +238,11 @@ class BabelSparseGlobalMSAVAEDataset(_BabelSourceMixin, data.Dataset):
         bridge_global_embed_dir,
         bridge_local_embed_dir,
         babel_motion_dir,
+        babel_text_dir,
         babel_cache_dir,
         babel_cache_manifest,
+        babel_split,
+        t5_model_path,
         mean_path,
         std_path,
         window_size,
@@ -233,7 +264,13 @@ class BabelSparseGlobalMSAVAEDataset(_BabelSourceMixin, data.Dataset):
             bridge_local_embed_dir,
         )
         babel_entries, babel_failures = self._discover_babel_entries(
-            babel_motion_dir, babel_cache_dir, babel_cache_manifest, self.text_embed_dim
+            babel_motion_dir,
+            babel_text_dir,
+            babel_cache_dir,
+            babel_cache_manifest,
+            babel_split,
+            t5_model_path,
+            self.text_embed_dim,
         )
         failures = bridge_failures + babel_failures
         self.data = bridge_entries + babel_entries
@@ -372,8 +409,11 @@ class BabelSparseGlobalMSAVAEValidationDataset(_BabelSourceMixin, data.Dataset):
     def __init__(
         self,
         babel_motion_dir,
+        babel_text_dir,
         babel_cache_dir,
         babel_cache_manifest,
+        babel_split,
+        t5_model_path,
         mean_path,
         std_path,
         window_size,
@@ -387,13 +427,20 @@ class BabelSparseGlobalMSAVAEValidationDataset(_BabelSourceMixin, data.Dataset):
         self.text_embed_dim = int(text_embed_dim)
         self.mean, self.std = _load_normalization(mean_path, std_path)
         source_entries, failures = self._discover_babel_entries(
-            babel_motion_dir, babel_cache_dir, babel_cache_manifest, self.text_embed_dim
+            babel_motion_dir,
+            babel_text_dir,
+            babel_cache_dir,
+            babel_cache_manifest,
+            babel_split,
+            t5_model_path,
+            self.text_embed_dim,
         )
         if failures or not source_entries:
             raise RuntimeError(_format_failures(failures, 0, len(source_entries), bool(source_entries)))
 
         self.data = []
         self._starts_by_name = {}
+        self._index_by_name = {}
         for source_entry in source_entries:
             motion_frames = source_entry["motion"].shape[0]
             starts = list(range(0, motion_frames - self.window_size + 1, self.window_size))
@@ -401,11 +448,9 @@ class BabelSparseGlobalMSAVAEValidationDataset(_BabelSourceMixin, data.Dataset):
             if starts[-1] != tail_start:
                 starts.append(tail_start)
             self._starts_by_name[source_entry["name"]] = tuple(starts)
+            self._index_by_name[source_entry["name"]] = len(self.data)
             for start in starts:
                 self.data.append((source_entry, start))
-        self._index_by_name = {
-            name: index for index, name in enumerate(self._starts_by_name)
-        }
 
     def __len__(self):
         return len(self.data)

@@ -25,6 +25,7 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
         babel_motion = root / "babel_motion"
         babel_text = root / "babel_text"
         babel_cache = root / "babel_cache"
+        t5_model = root / "sentence-t5"
         for directory in (
             bridge_motion,
             bridge_text,
@@ -33,6 +34,7 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
             babel_motion,
             babel_text,
             babel_cache,
+            t5_model,
         ):
             directory.mkdir()
 
@@ -51,7 +53,12 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
         )
         manifest_path = babel_cache / "manifest.json"
         build_cache(
-            "train", babel_motion, babel_text, babel_cache, _FixedEncoder(), "test-t5"
+            "train",
+            babel_motion,
+            babel_text,
+            babel_cache,
+            _FixedEncoder(),
+            str(t5_model.resolve()),
         )
         np.save(root / "Mean.npy", np.zeros(272, dtype=np.float32))
         np.save(root / "Std.npy", np.ones(272, dtype=np.float32))
@@ -63,6 +70,8 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
             "bridge_local_embed_dir": bridge_local,
             "babel_motion_dir": babel_motion,
             "babel_text_dir": babel_text,
+            "babel_split": "train",
+            "t5_model_path": t5_model,
             "babel_cache_dir": babel_cache,
             "babel_cache_manifest": manifest_path,
             "mean_path": root / "Mean.npy",
@@ -71,11 +80,7 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
 
     @staticmethod
     def _dataset_kwargs(paths):
-        return {
-            key: str(value)
-            for key, value in paths.items()
-            if key != "babel_text_dir"
-        }
+        return {key: str(value) for key, value in paths.items()}
 
     def test_bridge_and_babel_entries_have_sparse_global_masks_and_expected_shapes(self):
         from humanml3d_272.dataset_msa_vae_babel import BabelSparseGlobalMSAVAEDataset
@@ -187,13 +192,16 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
                 paths["babel_text_dir"],
                 paths["babel_cache_dir"],
                 _FixedEncoder(),
-                "test-t5",
+                str(paths["t5_model_path"].resolve()),
                 overwrite=True,
             )
             dataset = BabelSparseGlobalMSAVAEValidationDataset(
                 babel_motion_dir=str(paths["babel_motion_dir"]),
+                babel_text_dir=str(paths["babel_text_dir"]),
                 babel_cache_dir=str(paths["babel_cache_dir"]),
                 babel_cache_manifest=str(paths["babel_cache_manifest"]),
+                babel_split="train",
+                t5_model_path=str(paths["t5_model_path"]),
                 mean_path=str(paths["mean_path"]),
                 std_path=str(paths["std_path"]),
                 window_size=64,
@@ -203,6 +211,69 @@ class BabelSparseGlobalMSAVAEDatasetTest(unittest.TestCase):
             self.assertEqual(dataset.window_starts_for("babel:seq_1"), (0, 64, 86))
             self.assertEqual(len(dataset), 3)
             self.assertEqual(dataset[0][0].shape, (64, 272))
+
+    def test_manifest_rejects_requested_split_model_and_text_root_mismatches(self):
+        from humanml3d_272.dataset_msa_vae_babel import BabelSparseGlobalMSAVAEDataset
+
+        for changed_key, changed_value, expected in (
+            ("babel_split", "val", "cache manifest split mismatch"),
+            ("t5_model_path", "other-sentence-t5", "cache manifest model_signature mismatch"),
+            ("babel_text_dir", "wrong_text_root", "cache manifest text_dir mismatch"),
+        ):
+            with self.subTest(changed_key=changed_key), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory)
+                paths = self._write_sources(root)
+                kwargs = self._dataset_kwargs(paths)
+                if changed_key == "t5_model_path":
+                    wrong_path = root / changed_value
+                    wrong_path.mkdir()
+                    kwargs[changed_key] = str(wrong_path)
+                elif changed_key == "babel_text_dir":
+                    wrong_path = root / changed_value
+                    wrong_path.mkdir()
+                    kwargs[changed_key] = str(wrong_path)
+                else:
+                    kwargs[changed_key] = changed_value
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    BabelSparseGlobalMSAVAEDataset(
+                        **kwargs, window_size=64, unit_length=4, text_embed_dim=768
+                    )
+
+    def test_validation_index_for_returns_first_window_of_later_source(self):
+        from humanml3d_272.dataset_msa_vae_babel import BabelSparseGlobalMSAVAEValidationDataset
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = self._write_sources(Path(temporary_directory))
+            np.save(paths["babel_motion_dir"] / "seq_1.npy", np.zeros((128, 272), dtype=np.float32))
+            np.save(paths["babel_motion_dir"] / "seq_2.npy", np.zeros((64, 272), dtype=np.float32))
+            (paths["babel_text_dir"] / "seq_2.txt").write_text(
+                "sit#sit/VERB#0#0*stand#stand/VERB#0#0#32\n"
+            )
+            build_cache(
+                "train",
+                paths["babel_motion_dir"],
+                paths["babel_text_dir"],
+                paths["babel_cache_dir"],
+                _FixedEncoder(),
+                str(paths["t5_model_path"].resolve()),
+                overwrite=True,
+            )
+            dataset = BabelSparseGlobalMSAVAEValidationDataset(
+                babel_motion_dir=str(paths["babel_motion_dir"]),
+                babel_text_dir=str(paths["babel_text_dir"]),
+                babel_cache_dir=str(paths["babel_cache_dir"]),
+                babel_cache_manifest=str(paths["babel_cache_manifest"]),
+                babel_split="train",
+                t5_model_path=str(paths["t5_model_path"]),
+                mean_path=str(paths["mean_path"]),
+                std_path=str(paths["std_path"]),
+                window_size=64,
+                unit_length=4,
+                text_embed_dim=768,
+            )
+            self.assertEqual(dataset.window_starts_for("babel:seq_1"), (0, 64))
+            self.assertEqual(dataset.index_for("babel:seq_2"), 2)
+            self.assertEqual(dataset.data[dataset.index_for("babel:seq_2")][0]["name"], "babel:seq_2")
 
     def test_babel_mode_parser_requires_t5_and_768(self):
         from options.option_msa_vae import get_args_parser
