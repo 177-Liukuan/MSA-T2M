@@ -185,11 +185,36 @@ TEXT_ENCODER_TYPE=t5 \
 bash TRAIN_msa_vae_phase1.sh <NUM_GPUS> t2m_272
 ```
 
-主要目标为 Transformer latent reconstruction、local T5 alignment 和 global T5 alignment。
+该阶段不再随机裁剪 64 帧，而是把完整运动裁到 4 帧的倍数、按长度分桶并在
+batch 内补零。CNN 只提取确定性的 `mu`，不会执行后验采样或 CNN decoder；
+Transformer latent reconstruction、local T5 alignment 和 global T5
+alignment 都只在有效 token 上计算。全局 `[CLS]` 始终对齐完整 caption，
+不再把局部 pooled text 混入完整序列的全局目标。
+
+完整序列 batch 与长度 bucket 可按显存覆盖：
+
+```bash
+FULL_SEQ_BATCH_SIZE=16 \
+LENGTH_BUCKET_SIZE=256 \
+CNN_CKPT="$CNN_CKPT" \
+bash TRAIN_msa_vae_phase1.sh <NUM_GPUS> t2m_272
+```
+
+Phase 1 的 CNN reconstruction 指标不随 Semantic Transformer 学习而变化，
+因此不能用 `net_best_fid.pth` 选择该阶段。Phase 2 的权威输入是 Phase 1
+训练结束时写出的 `net_last.pth`。
 
 ### Stage 3：联合微调 MSA-VAE
 
-`TRAIN_msa_vae_phase2.sh` 中的“Phase 2”对应整个流程的第三阶段。它从 Stage 2 checkpoint 恢复、解冻所有组件，并为 CNN 使用较小学习率：
+`TRAIN_msa_vae_phase2.sh` 中的“Phase 2”对应整个流程的第三阶段。它从
+Stage 2 最终 checkpoint 恢复、解冻所有组件，并为 CNN 使用较小学习率。
+默认每 4 个 optimizer step 中有 3 个完整序列 batch 和 1 个随机 64 帧
+回放 batch：
+
+- 完整序列 batch 优化 reconstruction、KL、root、Transformer latent、
+  global alignment 和 local alignment；
+- 64 帧回放只优化 reconstruction、KL、root 和 local alignment，用于保持
+  预训练 CNN 的稳定局部表示。
 
 ```bash
 export PHASE1_DIR=Experiments/<msa_vae_phase1_exp>
@@ -198,6 +223,20 @@ PHASE1_DIR="$PHASE1_DIR" \
 TEXT_ENCODER_TYPE=t5 \
 bash TRAIN_msa_vae_phase2.sh <NUM_GPUS> t2m_272
 ```
+
+可通过以下变量覆盖显存和回放频率：
+
+```bash
+FULL_SEQ_BATCH_SIZE=8 \
+WINDOW_REPLAY_INTERVAL=4 \
+LENGTH_BUCKET_SIZE=256 \
+PHASE1_DIR="$PHASE1_DIR" \
+bash TRAIN_msa_vae_phase2.sh <NUM_GPUS> t2m_272
+```
+
+所有 frame/token 级目标先在每条样本的有效位置上取均值，再在 batch
+维取均值，因此长运动、短运动和 padding 不会改变单条样本的隐式权重。
+新训练日志中的 reconstruction/root 数值与旧版求和损失不直接可比。
 
 > **不要将 `explorations/representation_experiments/TRAIN_msa_vae.sh`
 > 当作正式入口。** 它是早期一次性训练/CLIP 配置的遗留脚本，没有体现最终的三阶段渐进训练。
@@ -239,6 +278,13 @@ python get_msa_latent.py \
   --trans_ff_size 2048
 ```
 
+导出目录必须是新的空目录，或已包含由同一个 checkpoint 写入的
+`extraction_metadata.json`。脚本会记录 checkpoint 的绝对路径、文件
+大小、修改时间和 MSA-VAE 结构；若目录中已有来自其他 checkpoint 的
+latent，导出会在写入任何 `.npy` 前停止。建议让 `--exp-name` 和
+`--latent_dir` 都包含 Phase-2 实验名，不要覆盖旧版 64 帧训练得到的
+特征目录。
+
 脚本同时写出：
 
 - `t2m_latents_msa_vae/<exp>/`：用于 RAG-Diffusion-AR 训练的局部运动潜变量；
@@ -272,6 +318,11 @@ REBUILD_RAG_CACHE=true \
 GENERATIVE_HEAD_TYPE=ddpm \
 bash TRAIN_t2m_rag.sh <NUM_GPUS>
 ```
+
+完整序列 MSA-VAE 训练完成后的顺序必须是：选择 Phase-2 checkpoint →
+导出新的 local latent、`mu` 和 `[CLS]` → 重建 packed retrieval cache →
+重新训练或评估 RAG。不得把新版 `[CLS]` 与旧版 motion latent（或反向）
+组合使用。
 
 慢速 reference 路径仍保留用于数值等价性复核和紧急回退：
 

@@ -17,6 +17,7 @@ import json
 import models.msa_vae as msa_vae
 import options.option_msa_vae as option_msa_vae
 import utils.utils_model as utils_model
+from utils.msa_vae_training import prepare_extraction_roots
 from humanml3d_272 import dataset_tae_tokenizer
 import warnings
 from tqdm import tqdm
@@ -80,16 +81,28 @@ net = msa_vae.MSA_HumanVAE(
 
 # Load model checkpoint
 checkpoint_path = args.resume_pth if hasattr(args, 'resume_pth') else None
-if checkpoint_path:
-    logger.info(f'Loading MSA-VAE checkpoint from {checkpoint_path}')
-    ckpt = torch.load(checkpoint_path, map_location='cpu')
-    # Handle both direct and wrapped model state dicts
-    if 'net' in ckpt:
-        net.load_state_dict(ckpt['net'], strict=True)
-    else:
-        net.load_state_dict(ckpt, strict=True)
+if not checkpoint_path:
+    raise ValueError('--resume-pth is required for MSA latent extraction')
+
+logger.info(f'Loading MSA-VAE checkpoint from {checkpoint_path}')
+ckpt = torch.load(checkpoint_path, map_location='cpu')
+# Handle both direct and wrapped model state dicts
+if 'net' in ckpt:
+    net.load_state_dict(ckpt['net'], strict=True)
 else:
-    logger.warning("No checkpoint provided. Using random initialization.")
+    net.load_state_dict(ckpt, strict=True)
+checkpoint_metadata = (
+    ckpt.get('metadata') if isinstance(ckpt, dict) else None
+)
+extraction_metadata = prepare_extraction_roots(
+    [args.latent_dir, args.h_cls_dir, args.mu_latent_dir],
+    checkpoint_path,
+    checkpoint_metadata,
+    args,
+)
+logger.info(
+    f'Extraction metadata: {json.dumps(extraction_metadata, sort_keys=True)}'
+)
 
 net.eval()
 net.cuda()

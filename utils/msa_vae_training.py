@@ -1,6 +1,9 @@
 """Training helpers for variable-length MSA-VAE batches."""
 
 import math
+import json
+import os
+import tempfile
 from typing import NamedTuple
 
 import torch
@@ -308,3 +311,81 @@ def save_msa_checkpoint(path, model, metadata=None):
     if metadata is not None:
         payload['metadata'] = dict(metadata)
     torch.save(payload, path)
+
+
+def checkpoint_signature(path):
+    """Return a stable local identity for an extraction checkpoint."""
+    resolved = os.path.abspath(os.fspath(path))
+    stat = os.stat(resolved)
+    return {
+        'path': resolved,
+        'size': stat.st_size,
+        'mtime_ns': stat.st_mtime_ns,
+    }
+
+
+def _validate_extraction_root(root, payload):
+    root = os.path.abspath(os.fspath(root))
+    if not os.path.exists(root):
+        return
+    manifest_path = os.path.join(root, 'extraction_metadata.json')
+    if os.path.exists(manifest_path):
+        with open(manifest_path, 'r', encoding='utf-8') as handle:
+            existing = json.load(handle)
+        if existing != payload:
+            raise ValueError(
+                f'{root} was prepared from a different checkpoint or '
+                f'MSA-VAE configuration'
+            )
+        return
+    if os.listdir(root):
+        raise ValueError(
+            f'{root} is nonempty but has no extraction manifest'
+        )
+
+
+def _write_extraction_manifest(root, payload):
+    root = os.path.abspath(os.fspath(root))
+    os.makedirs(root, exist_ok=True)
+    manifest_path = os.path.join(root, 'extraction_metadata.json')
+    if os.path.exists(manifest_path):
+        return
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                dir=root,
+                prefix='.extraction_metadata.',
+                suffix='.tmp',
+                delete=False) as handle:
+            temporary_path = handle.name
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, manifest_path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def prepare_extraction_roots(roots, checkpoint_path, checkpoint_metadata,
+                             args):
+    """Validate all output roots, then atomically publish extraction metadata."""
+    metadata = dict(checkpoint_metadata or {})
+    payload = {
+        'format_version': 1,
+        'checkpoint': checkpoint_signature(checkpoint_path),
+        'sequence_mode': metadata.get('sequence_mode', 'legacy'),
+        'down_t': int(metadata.get('down_t', args.down_t)),
+        'stride_t': int(metadata.get('stride_t', args.stride_t)),
+        'latent_dim': int(metadata.get('latent_dim', args.latent_dim)),
+        'checkpoint_metadata': metadata,
+    }
+    root_list = [os.path.abspath(os.fspath(root)) for root in roots]
+    for root in root_list:
+        _validate_extraction_root(root, payload)
+    for root in root_list:
+        _write_extraction_manifest(root, payload)
+    return payload
