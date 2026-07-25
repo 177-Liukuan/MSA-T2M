@@ -429,6 +429,7 @@ def build_cache(
                 text_dir,
             ),
         )
+        _assert_sources_unchanged(source_records)
         _publish_generation(staging_dir, output_dir)
         return manifest
     finally:
