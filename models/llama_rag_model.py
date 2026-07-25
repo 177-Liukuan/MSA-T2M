@@ -275,6 +275,17 @@ class LLaMARAGWrapper(nn.Module):
 
         motion_tokens = self.base_model.transformer.wte(motion_latents.float())
         x = torch.cat([cond_tokens, motion_tokens], dim=1)
+        block_size = self.base_model.config.block_size
+        if x.shape[1] > block_size:
+            raise ValueError(
+                "RAG sequence length {} exceeds block_size {} "
+                "({} condition + {} motion tokens)".format(
+                    x.shape[1],
+                    block_size,
+                    self.num_condition_tokens,
+                    motion_latents.shape[1],
+                )
+            )
 
         for block in self.base_model.transformer.h:
             x = block(x)

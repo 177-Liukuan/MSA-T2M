@@ -26,12 +26,24 @@ except ImportError:
     clip = None
 
 from torch.utils.tensorboard import SummaryWriter
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 
 import models.msa_vae as msa_vae
+import utils.losses as losses
 import options.option_msa_vae as option_msa_vae
 import utils.utils_model as utils_model
-from humanml3d_272 import dataset_msa_vae, dataset_eval_t2m
+from utils.msa_vae_alignment import (
+    distributed_mask_coverage,
+    distributed_masked_cosine_alignment,
+)
+from utils.eval_msa_vae_babel import (
+    build_msa_training_loaders,
+    evaluate_msa_vae_babel,
+    preflight_msa_training_assets,
+    prepare_babel_validation_loader,
+    validate_msa_assets_after_loader,
+)
+from humanml3d_272 import dataset_eval_t2m, dataset_msa_vae
 import utils.eval_trans as eval_trans
 from utils.msa_vae_training import (
     MSAVAELossWeights,
@@ -89,53 +101,6 @@ class FrozenT5TextEncoder(nn.Module):
             normalize_embeddings=False,
         )
         return torch.from_numpy(emb).to(device=device, dtype=torch.float32)
-
-
-# ---------------------------------------------------------------------------
-#   Alignment Losses
-# ---------------------------------------------------------------------------
-class CLIPAlignmentLoss(nn.Module):
-    """Cosine embedding loss for cross-modal alignment."""
-    def __init__(self):
-        super().__init__()
-        self.loss_fn = nn.CosineEmbeddingLoss(margin=0.0)
-
-    def forward(self, feat_a, feat_b, mask=None):
-        """
-        Args:
-            feat_a: (B, D) or (B, T, D)
-            feat_b: same shape as feat_a
-            mask:   (B,) bool - True means this sample is **valid**
-                    If None, all samples are valid.
-        Returns:
-            scalar loss
-        """
-        target = torch.ones(feat_a.size(0), device=feat_a.device)
-
-        if feat_a.dim() == 3:
-            # Per-token alignment: flatten (B, T, D) -> (B*T, D)
-            B, T, D = feat_a.shape
-            feat_a = feat_a.reshape(B * T, D)
-            feat_b = feat_b.reshape(B * T, D)
-            if mask is not None:
-                # Expand mask from (B,) -> (B, T) -> (B*T,)
-                token_mask = mask.unsqueeze(1).expand(-1, T).reshape(B * T)
-                feat_a = feat_a[token_mask]
-                feat_b = feat_b[token_mask]
-            target = torch.ones(feat_a.size(0), device=feat_a.device)
-        else:
-            if mask is not None:
-                feat_a = feat_a[mask]
-                feat_b = feat_b[mask]
-                target = torch.ones(feat_a.size(0), device=feat_a.device)
-
-        if feat_a.size(0) == 0:
-            return torch.tensor(0.0, device=feat_a.device, requires_grad=True)
-
-        # L2 normalize before cosine loss for stability
-        feat_a = F.normalize(feat_a, dim=-1)
-        feat_b = F.normalize(feat_b, dim=-1)
-        return self.loss_fn(feat_a, feat_b, target)
 
 
 # ---------------------------------------------------------------------------
@@ -203,17 +168,22 @@ def log_model_params(model, name="Model", accelerator=None):
 # ---------------------------------------------------------------------------
 #   Main
 # ---------------------------------------------------------------------------
-accelerator = Accelerator()
-comp_device = accelerator.device
-
 args = option_msa_vae.get_args_parser()
+if args.msa_data_mode == 'babel_sparse_global':
+    accelerator = Accelerator(
+        dataloader_config=DataLoaderConfiguration(even_batches=False)
+    )
+else:
+    accelerator = Accelerator()
+comp_device = accelerator.device
 torch.manual_seed(args.seed)
-validate_sequence_training_config(
-    phase=args.phase,
-    mode=args.sequence_mode,
-    full_batch_size=args.full_seq_batch_size,
-    replay_interval=args.window_replay_interval,
-)
+if args.msa_data_mode == 'humanml_full':
+    validate_sequence_training_config(
+        phase=args.phase,
+        mode=args.sequence_mode,
+        full_batch_size=args.full_seq_batch_size,
+        replay_interval=args.window_replay_interval,
+    )
 
 args.out_dir = os.path.join(args.out_dir, f'{args.exp_name}')
 os.makedirs(args.out_dir, exist_ok=True)
@@ -244,45 +214,79 @@ if args.use_offline_global_text:
 logger.info(f'Training MSA-VAE on {args.dataname}, motions are with {args.nb_joints} joints')
 if args.disable_decoupling:
     logger.info('Using z as Transformer AE input/target (decoupling disabled)')
+if args.msa_data_mode == 'babel_sparse_global' and not args.use_offline_global_text:
+    raise ValueError('babel_sparse_global requires offline bridge global targets')
+logger.info(f'MSA data mode: {args.msa_data_mode}')
+logger.info(f'Resolved MSA mean path: {os.path.realpath(args.msa_mean_path)}')
+logger.info(f'Resolved MSA std path: {os.path.realpath(args.msa_std_path)}')
 
 ##### ---- Dataloader ---- #####
-unit_length = args.stride_t ** args.down_t
-train_dataset = dataset_msa_vae.MSAVAEDataset(
-    args.dataname,
-    window_size=args.window_size,
-    unit_length=unit_length,
-    use_ft_split=args.use_ft_split,
-    text_encoder_type=args.text_encoder_type,
-    clip_embed_dir=args.clip_embed_dir,
-    t5_embed_dir=args.t5_embed_dir,
-    text_embed_dim=args.text_embed_dim,
-    use_offline_global_text=args.use_offline_global_text,
-    clip_global_embed_dir=args.clip_global_embed_dir,
-    t5_global_embed_dir=args.t5_global_embed_dir,
-    sequence_mode='window' if args.sequence_mode == 'mixed' else args.sequence_mode,
-)
-
-full_loader = None
-window_loader = None
-if args.sequence_mode in ('full', 'mixed'):
-    full_loader = dataset_msa_vae.make_loader(
-        train_dataset,
-        sequence_mode='full',
-        batch_size=args.full_seq_batch_size,
-        num_workers=8,
-        bucket_size=args.length_bucket_size,
-        drop_last=True,
-        seed=args.seed,
+if args.msa_data_mode == 'babel_sparse_global':
+    (
+        checkpoint_metadata,
+        resume_checkpoint,
+        validated_cnn_state,
+    ) = preflight_msa_training_assets(args, accelerator)
+    train_loader, validation_loader, validation_backend = (
+        build_msa_training_loaders(args)
     )
-if args.sequence_mode in ('window', 'mixed'):
-    window_loader = dataset_msa_vae.make_loader(
-        train_dataset,
-        sequence_mode='window',
-        batch_size=args.batch_size,
-        num_workers=8,
-        drop_last=True,
-        seed=args.seed,
+    validate_msa_assets_after_loader(args, checkpoint_metadata, accelerator)
+    babel_validation_dataset = validation_loader.dataset
+    full_loader = None
+    window_loader = None
+else:
+    checkpoint_metadata = build_msa_checkpoint_metadata(args)
+    resume_checkpoint = None
+    validated_cnn_state = None
+    babel_validation_dataset = None
+    unit_length = args.stride_t ** args.down_t
+    train_dataset = dataset_msa_vae.MSAVAEDataset(
+        args.dataname,
+        window_size=args.window_size,
+        unit_length=unit_length,
+        use_ft_split=args.use_ft_split,
+        text_encoder_type=args.text_encoder_type,
+        clip_embed_dir=args.clip_embed_dir,
+        t5_embed_dir=args.t5_embed_dir,
+        text_embed_dim=args.text_embed_dim,
+        use_offline_global_text=args.use_offline_global_text,
+        clip_global_embed_dir=args.clip_global_embed_dir,
+        t5_global_embed_dir=args.t5_global_embed_dir,
+        sequence_mode=(
+            'window'
+            if args.sequence_mode == 'mixed'
+            else args.sequence_mode
+        ),
     )
+    full_loader = None
+    window_loader = None
+    if args.sequence_mode in ('full', 'mixed'):
+        full_loader = dataset_msa_vae.make_loader(
+            train_dataset,
+            sequence_mode='full',
+            batch_size=args.full_seq_batch_size,
+            num_workers=8,
+            bucket_size=args.length_bucket_size,
+            drop_last=True,
+            seed=args.seed,
+        )
+    if args.sequence_mode in ('window', 'mixed'):
+        window_loader = dataset_msa_vae.make_loader(
+            train_dataset,
+            sequence_mode='window',
+            batch_size=args.batch_size,
+            num_workers=8,
+            drop_last=True,
+            seed=args.seed,
+        )
+    validation_loader = dataset_eval_t2m.DATALoader(
+        args.dataname,
+        False,
+        32,
+        unit_length=unit_length,
+    )
+    validation_backend = 'humanml_tmr'
+logger.info(f'MSA validation backend: {validation_backend}')
 
 ##### ---- Network ---- #####
 clip_range = [-30, 20]
@@ -323,27 +327,48 @@ if args.global_align_weight > 0 and not args.use_offline_global_text:
 # Optionally load pretrained CNN VAE weights
 if args.resume_cnn_pth:
     logger.info(f'Loading pretrained CNN VAE from {args.resume_cnn_pth}')
-    ckpt = torch.load(args.resume_cnn_pth, map_location='cpu')
-    cnn_state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
-    mapped = {}
-    for k, v in cnn_state.items():
-        new_key = k
-        if k.startswith('tae.encoder.'):
-            new_key = k.replace('tae.encoder.', 'msa_vae.cnn_encoder.')
-        elif k.startswith('tae.decoder.'):
-            new_key = k.replace('tae.decoder.', 'msa_vae.cnn_decoder.')
-        elif k.startswith('tae.decode_proj.'):
-            new_key = k.replace('tae.decode_proj.', 'msa_vae.decode_proj.')
-        mapped[new_key] = v
-    missing, unexpected = net.load_state_dict(mapped, strict=False)
+    if args.msa_data_mode == 'humanml_full':
+        cnn_checkpoint = torch.load(
+            args.resume_cnn_pth, map_location='cpu'
+        )
+        cnn_state = (
+            cnn_checkpoint
+            if not isinstance(cnn_checkpoint, dict)
+            or 'net' not in cnn_checkpoint
+            else cnn_checkpoint['net']
+        )
+        validated_cnn_state = {}
+        for key, value in cnn_state.items():
+            mapped_key = key
+            if key.startswith('tae.encoder.'):
+                mapped_key = key.replace(
+                    'tae.encoder.', 'msa_vae.cnn_encoder.'
+                )
+            elif key.startswith('tae.decoder.'):
+                mapped_key = key.replace(
+                    'tae.decoder.', 'msa_vae.cnn_decoder.'
+                )
+            elif key.startswith('tae.decode_proj.'):
+                mapped_key = key.replace(
+                    'tae.decode_proj.', 'msa_vae.decode_proj.'
+                )
+            validated_cnn_state[mapped_key] = value
+    missing, unexpected = net.load_state_dict(
+        validated_cnn_state, strict=False
+    )
     logger.info(f'CNN weights loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}')
     log_model_params(net, name='MSA-HumanVAE (After CNN weight load)', accelerator=accelerator)
 
 if args.resume_pth:
     logger.info(f'Resuming full MSA-VAE from {args.resume_pth}')
-    ckpt = torch.load(args.resume_pth, map_location='cpu')
-    metadata = ckpt.get('metadata') if isinstance(ckpt, dict) else None
-    validate_msa_checkpoint_metadata(metadata, args)
+    if args.msa_data_mode == 'babel_sparse_global':
+        ckpt = resume_checkpoint
+    else:
+        ckpt = torch.load(args.resume_pth, map_location='cpu')
+        metadata = (
+            ckpt.get('metadata') if isinstance(ckpt, dict) else None
+        )
+        validate_msa_checkpoint_metadata(metadata, args)
     state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
     net.load_state_dict(state, strict=True)
 
@@ -384,30 +409,37 @@ log_model_params(net, name=f'MSA-HumanVAE ({phase_desc})', accelerator=accelerat
 net.train()
 
 ##### ---- Evaluator for R_precision / FID ---- #####
-# Text-aware val loader (NOT prepared by accelerator, runs on main only)
-val_loader_t2m = dataset_eval_t2m.DATALoader(
-    args.dataname, False, 32, unit_length=2 ** args.down_t,
-)
-# Load TMR/TEMOS evaluator encoders
-sys.path.insert(0, 'Evaluator_272')
-from mld.models.architectures.temos.textencoder.distillbert_actor import DistilbertActorAgnosticEncoder
-from mld.models.architectures.temos.motionencoder.actor import ActorAgnosticEncoder
+evaluator = None
+if args.msa_data_mode == 'humanml_full':
+    # TMR is deliberately imported and initialized only for HumanML validation.
+    sys.path.insert(0, 'Evaluator_272')
+    from mld.models.architectures.temos.textencoder.distillbert_actor import DistilbertActorAgnosticEncoder
+    from mld.models.architectures.temos.motionencoder.actor import ActorAgnosticEncoder
 
-evaluator_modelpath = 'Evaluator_272/deps/distilbert-base-uncased'
-eval_textencoder = DistilbertActorAgnosticEncoder(evaluator_modelpath, num_layers=4, latent_dim=256)
-eval_motionencoder = ActorAgnosticEncoder(nfeats=272, vae=True, num_layers=4, latent_dim=256, max_len=300)
-
-evaluator_ckpt_path = 'Evaluator_272/experiments/temos/EXP1/checkpoints/epoch=99.ckpt'
-evaluator_ckpt = torch.load(evaluator_ckpt_path, map_location='cpu')
-for prefix, encoder in [('textencoder', eval_textencoder), ('motionencoder', eval_motionencoder)]:
-    state = {k.replace(f'{prefix}.', ''): v for k, v in evaluator_ckpt['state_dict'].items() if k.startswith(f'{prefix}.')}
-    encoder.load_state_dict(state, strict=True)
-    encoder.eval()
-    encoder.to(comp_device)
-    for p in encoder.parameters():
-        p.requires_grad = False
-evaluator = [eval_textencoder, eval_motionencoder]
-logger.info(f'Loaded TMR evaluator from {evaluator_ckpt_path}')
+    evaluator_modelpath = 'Evaluator_272/deps/distilbert-base-uncased'
+    eval_textencoder = DistilbertActorAgnosticEncoder(
+        evaluator_modelpath, num_layers=4, latent_dim=256
+    )
+    eval_motionencoder = ActorAgnosticEncoder(
+        nfeats=272, vae=True, num_layers=4, latent_dim=256, max_len=300
+    )
+    evaluator_ckpt_path = 'Evaluator_272/experiments/temos/EXP1/checkpoints/epoch=99.ckpt'
+    evaluator_ckpt = torch.load(evaluator_ckpt_path, map_location='cpu')
+    for prefix, encoder in [('textencoder', eval_textencoder), ('motionencoder', eval_motionencoder)]:
+        state = {
+            k.replace(f'{prefix}.', ''): v
+            for k, v in evaluator_ckpt['state_dict'].items()
+            if k.startswith(f'{prefix}.')
+        }
+        encoder.load_state_dict(state, strict=True)
+        encoder.eval()
+        encoder.to(comp_device)
+        for p in encoder.parameters():
+            p.requires_grad = False
+    evaluator = [eval_textencoder, eval_motionencoder]
+    logger.info(f'Loaded TMR evaluator from {evaluator_ckpt_path}')
+else:
+    logger.info('BABEL validation selected: HumanML TMR evaluator is not loaded')
 
 ##### ---- Optimizer & Scheduler ---- #####
 if args.phase == 2:
@@ -437,40 +469,187 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer, milestones=args.lr_scheduler, gamma=args.gamma,
 )
 
-if args.sequence_mode == 'mixed':
-    net, optimizer, full_loader, window_loader = accelerator.prepare(
-        net, optimizer, full_loader, window_loader,
+if args.msa_data_mode == 'babel_sparse_global':
+    net, optimizer, train_loader = accelerator.prepare(
+        net, optimizer, train_loader
     )
-elif args.sequence_mode == 'full':
-    net, optimizer, full_loader = accelerator.prepare(
-        net, optimizer, full_loader,
+    validation_loader = prepare_babel_validation_loader(
+        accelerator, validation_loader
     )
+    train_loader_iter = dataset_msa_vae.cycle(train_loader)
+    full_loader_iter = None
+    window_loader_iter = None
 else:
-    net, optimizer, window_loader = accelerator.prepare(
-        net, optimizer, window_loader,
+    if args.sequence_mode == 'mixed':
+        net, optimizer, full_loader, window_loader = accelerator.prepare(
+            net, optimizer, full_loader, window_loader,
+        )
+    elif args.sequence_mode == 'full':
+        net, optimizer, full_loader = accelerator.prepare(
+            net, optimizer, full_loader,
+        )
+    else:
+        net, optimizer, window_loader = accelerator.prepare(
+            net, optimizer, window_loader,
+        )
+    full_loader_iter = (
+        dataset_msa_vae.cycle(full_loader)
+        if full_loader is not None
+        else None
     )
+    window_loader_iter = (
+        dataset_msa_vae.cycle(window_loader)
+        if window_loader is not None
+        else None
+    )
+    train_loader_iter = None
 
-full_loader_iter = (
-    dataset_msa_vae.cycle(full_loader) if full_loader is not None else None
-)
-window_loader_iter = (
-    dataset_msa_vae.cycle(window_loader)
-    if window_loader is not None else None
-)
+##### ---- Losses ---- #####
+Loss = losses.ReConsLoss(motion_dim=272)
+latent_recon_loss_fn = nn.MSELoss()
 loss_weights = MSAVAELossWeights(
     root=args.root_loss,
     latent=args.latent_recon_weight,
     global_align=args.global_align_weight,
     local_align=args.local_align_weight,
 )
-checkpoint_metadata = build_msa_checkpoint_metadata(args)
 net_eval = EvalCompat(accelerator.unwrap_model(net))
 
 ##### ---- Training function (shared by warmup & main) ---- #####
-def compute_losses(batch, batch_kind):
-    """Compute masked losses from one full or replay batch."""
-    (gt_motion, captions, global_text_gt, has_global, local_text_gt,
-     has_local, total_frames, local_text_pooled, motion_lengths) = batch
+def compute_losses(batch, net_module):
+    """Compute fixed-window sparse-supervision BABEL losses.
+
+    Returns: (total_loss, loss_dict)
+    """
+    gt_motion, captions, global_text_gt, has_global, local_text_gt, has_local, total_frames, local_text_pooled = batch
+    gt_motion = gt_motion.to(comp_device).float()
+    global_text_gt = global_text_gt.to(comp_device).float()
+    has_global = has_global.to(comp_device)
+    local_text_gt = local_text_gt.to(comp_device).float()
+    has_local = has_local.to(comp_device)
+    total_frames = total_frames.to(comp_device)
+    local_text_pooled = local_text_pooled.to(comp_device).float()
+
+    out = net_module(gt_motion)
+
+    # --- Reconstruction losses ---
+    # Phase 1: skip recon/kl/root (CNN frozen, these produce zero gradients)
+    if args.phase == 1:
+        zero = torch.tensor(0.0, device=comp_device)
+        loss_motion = zero
+        loss_kl = zero
+        loss_root = zero
+    else:
+        loss_motion = Loss(out['x_recon'], gt_motion)
+        loss_kl = Loss.forward_KL(out['mu'], out['logvar'])
+        loss_root = Loss.forward_root(out['x_recon'], gt_motion)
+    if args.disable_decoupling:
+        loss_latent = latent_recon_loss_fn(out['mu_recon'], out['trans_latent_target'].detach())
+    else:
+        loss_latent = latent_recon_loss_fn(out['mu_recon'], out['mu'].detach())
+
+    loss_dict = {
+        'recon': loss_motion,
+        'kl': loss_kl,
+        'root': loss_root,
+        'latent': loss_latent,
+    }
+
+    # --- Global alignment: h_cls vs Spotlight(global text, local pooled text) ---
+    global_backward_loss = out['clip_global_feat'].sum() * 0.0
+    global_mean = global_backward_loss.detach()
+    if args.use_offline_global_text:
+        valid_global = has_global
+    else:
+        valid_global = torch.ones_like(has_local, dtype=torch.bool)
+    global_valid_count, global_valid_ratio = distributed_mask_coverage(
+        valid_global, tokens_per_sample=1, accelerator=accelerator
+    )
+    if args.global_align_weight > 0:
+        with torch.no_grad():
+            if args.use_offline_global_text:
+                text_feat = global_text_gt
+            else:
+                text_feat = text_encoder.encode_text(captions, comp_device)
+
+            # Compute interpolation alpha
+            if args.spotlight_alpha < 0:
+                alpha = (args.window_size / total_frames.float().to(comp_device)).clamp(0, 1)
+            else:
+                alpha = torch.full((gt_motion.size(0),), args.spotlight_alpha,
+                                   device=comp_device)
+
+            # local pooled text embedding from frame-level labels
+            l_pooled = local_text_pooled
+
+            # Zero out alpha for samples without local embeddings
+            alpha = alpha * has_local.float()
+
+            # G_mixed = (1 - alpha) * global + alpha * local pooled
+            alpha = alpha.unsqueeze(-1)
+            g_mixed = (1 - alpha) * text_feat + alpha * l_pooled
+            g_target = F.normalize(g_mixed, dim=-1)
+
+        global_alignment = distributed_masked_cosine_alignment(
+            out['clip_global_feat'], g_target, valid_global, accelerator
+        )
+        global_backward_loss = global_alignment.backward_loss
+        global_mean = global_alignment.global_mean
+        global_valid_count = global_alignment.valid_count
+    loss_dict['global_align'] = global_mean
+    loss_dict['global_valid_count'] = global_valid_count.float()
+    loss_dict['global_valid_ratio'] = global_valid_ratio
+
+    # --- Local alignment: z_i projected vs CLIP(local label) ---
+    local_backward_loss = out['clip_local_feat'].sum() * 0.0
+    local_mean = local_backward_loss.detach()
+    local_valid_count, local_valid_ratio = distributed_mask_coverage(
+        has_local,
+        tokens_per_sample=local_text_gt.shape[1],
+        accelerator=accelerator,
+    )
+    if args.local_align_weight > 0:
+        local_alignment = distributed_masked_cosine_alignment(
+            out['clip_local_feat'], local_text_gt, has_local, accelerator
+        )
+        local_backward_loss = local_alignment.backward_loss
+        local_mean = local_alignment.global_mean
+        local_valid_count = local_alignment.valid_count
+    loss_dict['local_align'] = local_mean
+    loss_dict['local_valid_count'] = local_valid_count.float()
+    loss_dict['local_valid_ratio'] = local_valid_ratio
+
+    # --- Total loss ---
+    if args.phase == 1:
+        # Phase 1: only latent + alignment losses
+        total_loss = (args.latent_recon_weight * loss_latent
+                      + args.global_align_weight * global_backward_loss
+                      + args.local_align_weight * local_backward_loss)
+    else:
+        # Phase 0/2: all losses
+        total_loss = (loss_motion
+                      + loss_kl
+                      + args.root_loss * loss_root
+                      + args.latent_recon_weight * loss_latent
+                      + args.global_align_weight * global_backward_loss
+                      + args.local_align_weight * local_backward_loss)
+
+    return total_loss, loss_dict
+
+
+def compute_humanml_losses(batch, batch_kind):
+    """Compute masked HumanML losses for full or replay batches."""
+    (
+        gt_motion,
+        captions,
+        global_text_gt,
+        has_global,
+        local_text_gt,
+        has_local,
+        total_frames,
+        local_text_pooled,
+        motion_lengths,
+    ) = batch
     gt_motion = gt_motion.to(comp_device).float()
     global_text_gt = global_text_gt.to(comp_device).float()
     has_global = has_global.to(comp_device)
@@ -522,21 +701,41 @@ def compute_losses(batch, batch_kind):
     )
 
 
-##### ---- Warm-up ---- #####
-avg = {k: 0. for k in ['recon', 'kl', 'root', 'latent', 'global_align', 'local_align']}
-
-logger.info(f'=== Warm-up: {args.warm_up_iter} iterations ===')
-for nb_iter in range(1, args.warm_up_iter):
-    optimizer, current_lr = update_lr_warm_up(optimizer, nb_iter, args.warm_up_iter, args.lr)
-
-    batch, batch_kind = select_training_batch(
-        nb_iter,
+def select_current_training_batch(step):
+    """Route BABEL fixed windows or HumanML full/replay batches."""
+    if args.msa_data_mode == 'babel_sparse_global':
+        return next(train_loader_iter), 'window'
+    return select_training_batch(
+        step,
         args.sequence_mode,
         full_loader_iter,
         window_loader_iter,
         args.window_replay_interval,
     )
-    total_loss, loss_dict = compute_losses(batch, batch_kind)
+
+
+##### ---- Warm-up ---- #####
+loss_log_names = [
+    'recon', 'kl', 'root', 'latent', 'global_align', 'local_align',
+]
+if args.msa_data_mode == 'babel_sparse_global':
+    loss_log_names.extend([
+        'global_valid_count',
+        'local_valid_count',
+        'global_valid_ratio',
+        'local_valid_ratio',
+    ])
+avg = {key: 0.0 for key in loss_log_names}
+
+logger.info(f'=== Warm-up: {args.warm_up_iter} iterations ===')
+for nb_iter in range(1, args.warm_up_iter):
+    optimizer, current_lr = update_lr_warm_up(optimizer, nb_iter, args.warm_up_iter, args.lr)
+
+    batch, batch_kind = select_current_training_batch(nb_iter)
+    if args.msa_data_mode == 'babel_sparse_global':
+        total_loss, loss_dict = compute_losses(batch, net)
+    else:
+        total_loss, loss_dict = compute_humanml_losses(batch, batch_kind)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
@@ -557,17 +756,30 @@ for nb_iter in range(1, args.warm_up_iter):
 
 
 ##### ---- Training ---- #####
-avg = {k: 0. for k in ['recon', 'kl', 'root', 'latent', 'global_align', 'local_align']}
+avg = {key: 0.0 for key in loss_log_names}
 
 # Initial eval
 eval_net = accelerator.unwrap_model(net)
-net_eval.model = eval_net
-best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
-    args.out_dir, val_loader_t2m, net_eval, logger, writer, 0,
-    best_iter=0, best_fid=1e6, best_mpjpe=1000,
-    evaluator=evaluator, device=comp_device, accelerator=accelerator,
-    checkpoint_metadata=checkpoint_metadata,
-)
+best_iter, best_fid = 0, 1e6
+best_semantic, best_mpjpe = float('inf'), float('inf')
+if args.msa_data_mode == 'babel_sparse_global':
+    babel_result = evaluate_msa_vae_babel(
+        args.out_dir, validation_loader, eval_net, babel_validation_dataset,
+        logger, writer, iteration=0, phase=args.phase,
+        best_semantic=best_semantic, best_mpjpe=best_mpjpe,
+        device=comp_device, accelerator=accelerator,
+        metadata=checkpoint_metadata,
+    )
+    best_semantic = babel_result.best_semantic
+    best_mpjpe = babel_result.best_mpjpe
+else:
+    net_eval.model = eval_net
+    best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
+        args.out_dir, validation_loader, net_eval, logger, writer, 0,
+        best_iter=best_iter, best_fid=best_fid, best_mpjpe=best_mpjpe,
+        evaluator=evaluator, device=comp_device, accelerator=accelerator,
+        checkpoint_metadata=checkpoint_metadata,
+    )
 
 logger.info(f'=== Main training: {args.total_iter} iterations ===')
 logger.info(f'  Loss weights: root={args.root_loss}, latent={args.latent_recon_weight}, '
@@ -576,14 +788,11 @@ logger.info(f'  Spotlight alpha: {args.spotlight_alpha} '
             f'({"dynamic: window/total" if args.spotlight_alpha < 0 else "fixed"})')
 
 for nb_iter in range(1, args.total_iter + 1):
-    batch, batch_kind = select_training_batch(
-        nb_iter,
-        args.sequence_mode,
-        full_loader_iter,
-        window_loader_iter,
-        args.window_replay_interval,
-    )
-    total_loss, loss_dict = compute_losses(batch, batch_kind)
+    batch, batch_kind = select_current_training_batch(nb_iter)
+    if args.msa_data_mode == 'babel_sparse_global':
+        total_loss, loss_dict = compute_losses(batch, net)
+    else:
+        total_loss, loss_dict = compute_humanml_losses(batch, batch_kind)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
@@ -610,16 +819,31 @@ for nb_iter in range(1, args.total_iter + 1):
 
     if nb_iter % args.eval_iter == 0:
         eval_net = accelerator.unwrap_model(net)
-        net_eval.model = eval_net
-        best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
-            args.out_dir, val_loader_t2m, net_eval, logger, writer, nb_iter,
-            best_iter, best_fid, best_mpjpe,
-            evaluator=evaluator, device=comp_device, accelerator=accelerator,
-            checkpoint_metadata=checkpoint_metadata,
-        )
+        if args.msa_data_mode == 'babel_sparse_global':
+            babel_result = evaluate_msa_vae_babel(
+                args.out_dir, validation_loader, eval_net,
+                babel_validation_dataset, logger, writer,
+                iteration=nb_iter, phase=args.phase,
+                best_semantic=best_semantic, best_mpjpe=best_mpjpe,
+                device=comp_device, accelerator=accelerator,
+                metadata=checkpoint_metadata,
+            )
+            best_semantic = babel_result.best_semantic
+            best_mpjpe = babel_result.best_mpjpe
+        else:
+            net_eval.model = eval_net
+            best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
+                args.out_dir, validation_loader, net_eval, logger, writer, nb_iter,
+                best_iter, best_fid, best_mpjpe,
+                evaluator=evaluator, device=comp_device, accelerator=accelerator,
+                checkpoint_metadata=checkpoint_metadata,
+            )
 
 accelerator.wait_for_everyone()
-if accelerator.is_main_process:
+if (
+    args.msa_data_mode == 'humanml_full'
+    and accelerator.is_main_process
+):
     final_model = accelerator.unwrap_model(net)
     save_msa_checkpoint(
         os.path.join(args.out_dir, 'net_last.pth'),

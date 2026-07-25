@@ -1,10 +1,17 @@
 import copy
 import unittest
+from types import SimpleNamespace
 
 import torch
 from torch import nn
 
-from models.rag_training import RAGTwoForwardLoss, get_rag_model
+from models.llama_rag_model import LLaMARAGWrapper
+from models.rag_training import (
+    RAGTwoForwardLoss,
+    get_rag_model,
+    lengths_to_mask,
+    replace_with_pred,
+)
 
 
 class FakeDiffusionLoss(nn.Module):
@@ -53,6 +60,23 @@ class FakeRAGModel(nn.Module):
     def motion_condition_slice(self, hidden_states, motion_len):
         start = self.num_condition_tokens - 1
         return hidden_states[:, start : start + motion_len]
+
+
+class TinyTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wte = nn.Linear(2, 4)
+        self.cond_embed = nn.Linear(2, 4)
+        self.h = nn.ModuleList()
+        self.ln_f = nn.Identity()
+
+
+class TinyBaseModel(nn.Module):
+    def __init__(self, block_size):
+        super().__init__()
+        self.config = SimpleNamespace(block_size=block_size)
+        self.transformer = TinyTransformer()
+        self.out_proj = nn.Identity()
 
 
 def reference_lengths_to_mask(lengths, max_len):
@@ -163,7 +187,7 @@ def make_batch():
         "top3_sim_scores": torch.tensor(
             [[0.8, 0.2], [0.5, -0.1]], dtype=torch.float32
         ),
-        "step": 4,
+        "step": 10,
         "total_steps": 10,
         "cfg_drop_mask": torch.tensor([False, True]),
         "empty_text_emb": torch.zeros(2),
@@ -188,6 +212,85 @@ class SchedulerDouble:
 
 
 class RAGTrainingTest(unittest.TestCase):
+    def test_rag_wrapper_enforces_total_context_length(self):
+        rag_model = LLaMARAGWrapper(
+            base_model=TinyBaseModel(block_size=78),
+            model_dim=4,
+            retrieval_dim=2,
+        )
+        conditions = {
+            "text_emb": torch.zeros(1, 2),
+            "top3_h_cls": torch.zeros(1, 1, 2),
+            "top3_sim_scores": torch.zeros(1, 1),
+        }
+
+        output = rag_model(
+            motion_latents=torch.zeros(1, 76, 2),
+            **conditions,
+        )
+        self.assertEqual(tuple(output.shape), (1, 78, 4))
+
+        with self.assertRaisesRegex(ValueError, "block_size 78"):
+            rag_model(
+                motion_latents=torch.zeros(1, 77, 2),
+                **conditions,
+            )
+
+    def test_loss_rejects_non_positive_motion_length(self):
+        batch = make_batch()
+        batch["m_lens"] = torch.tensor([3, 0], dtype=torch.long)
+
+        with self.assertRaisesRegex(ValueError, "positive"):
+            RAGTwoForwardLoss(FakeRAGModel())(**batch)
+
+    def test_loss_rejects_motion_length_beyond_padded_width(self):
+        batch = make_batch()
+        batch["m_lens"] = torch.tensor([4, 2], dtype=torch.long)
+
+        with self.assertRaisesRegex(ValueError, "padded width"):
+            RAGTwoForwardLoss(FakeRAGModel())(**batch)
+
+    def test_replace_with_pred_never_changes_padding(self):
+        latents = torch.zeros(2, 3, 1)
+        pred_xstart = torch.ones_like(latents)
+        valid_mask = lengths_to_mask(torch.tensor([3, 1]), max_len=3)
+
+        updated = replace_with_pred(
+            latents,
+            pred_xstart,
+            step=10,
+            total_steps=10,
+            valid_mask=valid_mask,
+        )
+
+        torch.testing.assert_close(
+            updated,
+            torch.tensor(
+                [
+                    [[1.0], [1.0], [1.0]],
+                    [[1.0], [0.0], [0.0]],
+                ]
+            ),
+        )
+
+    def test_replace_with_pred_uses_each_samples_valid_length(self):
+        latents = torch.zeros(2, 4, 1)
+        pred_xstart = torch.ones_like(latents)
+        valid_mask = lengths_to_mask(torch.tensor([4, 2]), max_len=4)
+
+        torch.manual_seed(23)
+        updated = replace_with_pred(
+            latents,
+            pred_xstart,
+            step=5,
+            total_steps=10,
+            valid_mask=valid_mask,
+        )
+
+        replaced_counts = (updated != latents).squeeze(-1).sum(dim=1)
+        torch.testing.assert_close(replaced_counts, torch.tensor([2, 1]))
+        self.assertTrue(torch.equal(updated[1, 2:], latents[1, 2:]))
+
     def test_loss_and_gradients_match_reference(self):
         torch.manual_seed(19)
         reference_model = FakeRAGModel()

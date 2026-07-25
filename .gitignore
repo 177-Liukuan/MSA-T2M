@@ -26,6 +26,8 @@ demo_output/
 # ========================
 babel_272/
 babel_272_stream/
+babel_272_stream/t5_enc_single/
+babel_272_stream/t5_enc_single/**
 humanml3d_272/motion_data/
 humanml3d_272/mean_std/
 humanml3d_272/split/

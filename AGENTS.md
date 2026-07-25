@@ -38,6 +38,16 @@ allocated multi-GPU machine.
 - MSA-VAE training is progressive. Use `TRAIN_msa_vae_phase1.sh` followed by
   `TRAIN_msa_vae_phase2.sh`; `train_msa_vae.py` contains the shared
   implementation.
+- The HumanML3D MSA-VAE mainline uses full HumanML3D with global supervision
+  for every sample and sparse local supervision only where overlap targets
+  exist. Keep `--no_ft_split` in its official launchers.
+- `TRAIN_msa_vae_babel_phase1.sh`, `TRAIN_msa_vae_babel_phase2.sh`, and
+  `EVAL_msa_vae_babel.sh` are the separate BABEL sparse-global validation
+  workflow. Build both offline caches first with
+  `scripts/prepare_babel_stream_t5.py --split train` and `--split val`.
+  Phase 1 selects `net_best_semantic.pth`; Phase 2 resumes it and selects
+  `net_best_mpjpe.pth`. This workflow validates BABEL reconstruction and local
+  alignment only; it is not a BABEL text-to-motion/TMR evaluation path.
 - Extract MSA-VAE motion and retrieval latents with `get_msa_latent.py`.
 - Train the global retrieval model with `TRAIN_t2m_rag.sh` /
   `train_t2m_rag.py`.
@@ -55,6 +65,12 @@ text embedding dimension, retrieval `top-K`, local-token count, local latent
 dimension, EMA selection, self-attention/cross-attention flags, and generative
 head type. A checkpoint must not be evaluated with a structurally different
 configuration.
+
+The BABEL sparse-global launchers bind the joint BABEL/HumanML normalization,
+train/validation cache manifests, bridge paths, and T5 768-D contract. Do not
+load a HumanML MSA-VAE checkpoint in this mode or mix its Mean/Std with the
+joint statistics. The BABEL SentenceT5 arrays and manifests are local cache
+artifacts and remain ignored by Git.
 
 ## Change guidelines
 
