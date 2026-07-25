@@ -818,6 +818,21 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
                     args, metadata, _IdentityAccelerator()
                 )
 
+    def test_post_loader_revalidation_rejects_manifest_replacement(self):
+        from utils.eval_msa_vae_babel import validate_msa_assets_after_loader
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            args = self._metadata_args(Path(temporary_directory), phase=1)
+            metadata = self._tagged_metadata(args)
+            Path(args.babel_train_cache_manifest).write_text(
+                '{"split": "train", "generation": 2}'
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "changed after preflight"):
+                validate_msa_assets_after_loader(
+                    args, metadata, _IdentityAccelerator()
+                )
+
     def test_humanml_training_preserves_legacy_untagged_full_resume(self):
         from utils.eval_msa_vae_babel import preflight_msa_training_assets
 
