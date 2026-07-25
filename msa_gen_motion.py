@@ -283,11 +283,11 @@ def sample_motion_latents_with_stop(
         )
 
         distance_l2 = torch.sqrt(torch.sum((next_token - reference_end) ** 2))
-        next_token = next_token.unsqueeze(1)
-        xs = next_token if xs is None else torch.cat([xs, next_token], dim=1)
-
         if distance_l2 < stop_threshold:
             break
+
+        next_token = next_token.unsqueeze(1)
+        xs = next_token if xs is None else torch.cat([xs, next_token], dim=1)
 
     if xs is None:
         xs = torch.zeros((1, 1, token_latent_dim), device=device, dtype=torch.float32)
