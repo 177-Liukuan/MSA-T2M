@@ -17,6 +17,36 @@ def get_args_parser():
     parser.add_argument('--no_ft_split', dest='use_ft_split', action='store_false',
                         help='use train.txt (full HumanML3D) instead of train_ft.txt')
 
+    # variable-length sequence training
+    parser.add_argument(
+        '--sequence_mode',
+        type=str,
+        default='window',
+        choices=['window', 'full', 'mixed'],
+        help='motion view: legacy window, complete sequence, or full+replay',
+    )
+    parser.add_argument(
+        '--full-seq-batch-size', '--full_seq_batch_size',
+        dest='full_seq_batch_size',
+        default=32,
+        type=int,
+        help='per-process batch size for complete motion sequences',
+    )
+    parser.add_argument(
+        '--window-replay-interval', '--window_replay_interval',
+        dest='window_replay_interval',
+        default=4,
+        type=int,
+        help='use one 64-frame replay batch every N mixed-mode steps',
+    )
+    parser.add_argument(
+        '--length-bucket-size', '--length_bucket_size',
+        dest='length_bucket_size',
+        default=256,
+        type=int,
+        help='number of sorted samples per shuffled full-sequence bucket',
+    )
+
     # text encoder selection
     parser.add_argument('--text_encoder_type', type=str, default='t5', choices=['clip', 't5'],
                         help='text encoder type for semantic alignment')

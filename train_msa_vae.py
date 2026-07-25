@@ -41,6 +41,7 @@ from utils.msa_vae_training import (
     save_msa_checkpoint,
     select_training_batch,
     validate_msa_checkpoint_metadata,
+    validate_sequence_training_config,
 )
 import sys
 import warnings
@@ -207,6 +208,12 @@ comp_device = accelerator.device
 
 args = option_msa_vae.get_args_parser()
 torch.manual_seed(args.seed)
+validate_sequence_training_config(
+    phase=args.phase,
+    mode=args.sequence_mode,
+    full_batch_size=args.full_seq_batch_size,
+    replay_interval=args.window_replay_interval,
+)
 
 args.out_dir = os.path.join(args.out_dir, f'{args.exp_name}')
 os.makedirs(args.out_dir, exist_ok=True)
