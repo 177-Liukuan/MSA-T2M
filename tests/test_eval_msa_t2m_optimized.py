@@ -1,0 +1,160 @@
+import unittest
+
+import torch
+
+from utils.eval_msa_t2m_optimized import generate_latents_active_set
+
+
+class DeterministicRAG(torch.nn.Module):
+    """Return a token containing the sample id and current prefix length."""
+
+    def sample_next_with_cfg(
+        self,
+        motion_prefix,
+        text_emb,
+        empty_text_emb,
+        top3_h_cls=None,
+        top3_sim_scores=None,
+        cfg_scale=4.0,
+        temperature=1.0,
+    ):
+        del empty_text_emb, top3_h_cls, top3_sim_scores, cfg_scale, temperature
+        step = motion_prefix.shape[1]
+        return torch.stack(
+            (text_emb[:, 0], torch.full_like(text_emb[:, 0], step)),
+            dim=-1,
+        )
+
+
+class ScheduledEOSRAG(torch.nn.Module):
+    """Emit a shared EOS vector at a sample-specific accepted-prefix length."""
+
+    def __init__(self, eos_at):
+        super().__init__()
+        self.eos_at = dict(eos_at)
+
+    def sample_next_with_cfg(
+        self,
+        motion_prefix,
+        text_emb,
+        empty_text_emb,
+        top3_h_cls=None,
+        top3_sim_scores=None,
+        cfg_scale=4.0,
+        temperature=1.0,
+    ):
+        del empty_text_emb, top3_h_cls, top3_sim_scores, cfg_scale, temperature
+        step = motion_prefix.shape[1]
+        rows = []
+        for sample_id in text_emb[:, 0].tolist():
+            if self.eos_at.get(int(sample_id)) == step:
+                rows.append(torch.tensor([99.0, 99.0], device=text_emb.device))
+            else:
+                rows.append(
+                    torch.tensor(
+                        [sample_id, float(step)],
+                        device=text_emb.device,
+                    )
+                )
+        return torch.stack(rows)
+
+
+class OptimizedGenerationTests(unittest.TestCase):
+    def test_active_set_matches_serial_without_eos(self):
+        model = DeterministicRAG()
+        text = torch.tensor([[10.0], [20.0], [30.0]])
+
+        result = generate_latents_active_set(
+            model,
+            text,
+            torch.zeros(1),
+            None,
+            None,
+            torch.tensor([1, 3, 2]),
+            latent_dim=2,
+            reference_end_latent=None,
+            stop_threshold=0.1,
+            enable_stopping=False,
+            cfg_scale=4.0,
+        )
+
+        self.assertEqual(
+            [x.squeeze(0).tolist() for x in result.latents],
+            [
+                [[10.0, 0.0]],
+                [[20.0, 0.0], [20.0, 1.0], [20.0, 2.0]],
+                [[30.0, 0.0], [30.0, 1.0]],
+            ],
+        )
+        self.assertEqual(result.stop_steps.tolist(), [-1, -1, -1])
+        self.assertEqual(result.empty_fallback_count, 0)
+
+    def test_eos_candidate_is_excluded_and_other_samples_continue(self):
+        model = ScheduledEOSRAG({10: 1, 20: 2})
+        text = torch.tensor([[10.0], [20.0], [30.0]])
+
+        result = generate_latents_active_set(
+            model,
+            text,
+            torch.zeros(1),
+            None,
+            None,
+            torch.tensor([4, 4, 3]),
+            latent_dim=2,
+            reference_end_latent=torch.tensor([99.0, 99.0]),
+            stop_threshold=0.1,
+            enable_stopping=True,
+            cfg_scale=4.0,
+        )
+
+        self.assertEqual(
+            [x.squeeze(0).tolist() for x in result.latents],
+            [
+                [[10.0, 0.0]],
+                [[20.0, 0.0], [20.0, 1.0]],
+                [[30.0, 0.0], [30.0, 1.0], [30.0, 2.0]],
+            ],
+        )
+        self.assertEqual(result.stop_steps.tolist(), [1, 2, -1])
+        for latent in result.latents:
+            self.assertFalse(torch.any(torch.all(latent == 99.0, dim=-1)))
+
+    def test_first_candidate_eos_uses_single_zero_latent_fallback(self):
+        result = generate_latents_active_set(
+            ScheduledEOSRAG({10: 0}),
+            torch.tensor([[10.0]]),
+            torch.zeros(1),
+            None,
+            None,
+            torch.tensor([4]),
+            latent_dim=2,
+            reference_end_latent=torch.tensor([99.0, 99.0]),
+            stop_threshold=0.1,
+            enable_stopping=True,
+            cfg_scale=4.0,
+        )
+
+        self.assertEqual(result.latents[0].shape, (1, 1, 2))
+        self.assertTrue(torch.equal(result.latents[0], torch.zeros(1, 1, 2)))
+        self.assertEqual(result.stop_steps.tolist(), [0])
+        self.assertEqual(result.empty_fallback_count, 1)
+
+    def test_rejects_nonpositive_token_ceiling(self):
+        with self.assertRaisesRegex(ValueError, "positive"):
+            generate_latents_active_set(
+                DeterministicRAG(),
+                torch.tensor([[10.0]]),
+                torch.zeros(1),
+                None,
+                None,
+                torch.tensor([0]),
+                latent_dim=2,
+                reference_end_latent=None,
+                stop_threshold=0.1,
+                enable_stopping=False,
+                cfg_scale=4.0,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
