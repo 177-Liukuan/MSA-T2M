@@ -21,6 +21,9 @@ fi
 PHASE1_DIR=${PHASE1_DIR:?"ERROR: set PHASE1_DIR to the BABEL sparse-global phase-1 directory"}
 RESUME_PTH="${PHASE1_DIR}/net_best_semantic.pth"
 ACCELERATE_BIN=${ACCELERATE_BIN:-accelerate}
+# Preserve the approved Causal TAE identity inherited by the full Phase-1 resume.
+# Override this only together with a Phase-1 checkpoint carrying that identity.
+CNN_CKPT_SHA256=${CNN_CKPT_SHA256:-c819493606aacba0b4d126871ddef7195ff45bca1b4b13792d11a13894154387}
 T5_MODEL_PATH=${T5_MODEL_PATH:-sentencet5-xxl/}
 
 MSA_MEAN_PATH=${MSA_MEAN_PATH:-babel_272/t2m_babel_mean_std/Mean.npy}
@@ -46,6 +49,7 @@ echo "========== BABEL sparse-global MSA-VAE Phase 2 =========="
 echo "GPUs            : $NUM_GPUS"
 echo "Batch per GPU   : $BATCH_SIZE"
 echo "Phase 1 checkpoint: $RESUME_PTH"
+echo "Causal TAE SHA  : $CNN_CKPT_SHA256"
 echo "Train cache     : $BABEL_TRAIN_MANIFEST"
 echo "Validation cache: $BABEL_VAL_MANIFEST"
 
@@ -101,6 +105,7 @@ echo "Validation cache: $BABEL_VAL_MANIFEST"
   --local_align_weight 0.001 \
   --num_gpus "$NUM_GPUS" \
   --resume-pth "$RESUME_PTH" \
+  --resume-cnn-sha256 "$CNN_CKPT_SHA256" \
   --eval-iter 500 \
   --print-iter 200 \
   --spotlight_alpha 0.0

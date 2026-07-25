@@ -706,6 +706,35 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
             self.assertEqual(checkpoint["net"]["weight"].item(), 4.0)
             self.assertIsNone(cnn_state)
 
+    def test_phase_two_preflight_reaches_tagged_resume_with_approved_identity(self):
+        """A launcher-supplied SHA lets Phase 2 pass its earliest identity gate."""
+        from utils.eval_msa_vae_babel import _local_training_asset_probe
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            phase_one_args = self._metadata_args(root, phase=1)
+            checkpoint_path = root / "phase-one.pth"
+            torch.save(
+                {
+                    "net": {"weight": torch.tensor([7.0])},
+                    "metadata": self._tagged_metadata(phase_one_args),
+                },
+                checkpoint_path,
+            )
+            phase_two_args = SimpleNamespace(**vars(phase_one_args))
+            phase_two_args.phase = 2
+            phase_two_args.resume_pth = str(checkpoint_path)
+            phase_two_args.resume_cnn_sha256 = self.APPROVED_SHA256
+
+            envelope, metadata, checkpoint, cnn_state = _local_training_asset_probe(
+                phase_two_args
+            )
+
+            self.assertTrue(envelope["ok"], envelope["error"])
+            self.assertEqual(metadata["phase"], 2)
+            self.assertEqual(checkpoint["net"]["weight"].item(), 7.0)
+            self.assertIsNone(cnn_state)
+
     def test_tagged_babel_resume_rejects_changed_training_cache_identity(self):
         from utils.eval_msa_vae_babel import (
             build_msa_checkpoint_metadata,

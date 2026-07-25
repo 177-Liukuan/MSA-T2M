@@ -65,7 +65,12 @@ class BabelMSAVAELauncherTest(unittest.TestCase):
         content = self.read(PHASE2)
         self.assertIn("PHASE1_DIR=${PHASE1_DIR:?", content)
         self.assertIn('RESUME_PTH="${PHASE1_DIR}/net_best_semantic.pth"', content)
+        self.assertIn(
+            "CNN_CKPT_SHA256=${CNN_CKPT_SHA256:-" + APPROVED_JOINT_TAE_SHA256 + "}",
+            content,
+        )
         self.assertIn('--resume-pth "$RESUME_PTH"', content)
+        self.assertIn('--resume-cnn-sha256 "$CNN_CKPT_SHA256"', content)
         self.assertNotIn("net_best_fid.pth", content)
 
     def test_evaluation_is_babel_validation_only(self):
@@ -167,6 +172,7 @@ class BabelMSAVAELauncherTest(unittest.TestCase):
                     "ACCELERATE_BIN",
                     {
                         "PHASE1_DIR": space_value("PHASE1_DIR"),
+                        "CNN_CKPT_SHA256": "b" * 64,
                         "BABEL_TRAIN_MANIFEST": matching_glob(
                             "BABEL_TRAIN_MANIFEST"
                         ),
@@ -222,6 +228,11 @@ class BabelMSAVAELauncherTest(unittest.TestCase):
                         option, expected = "--resume-pth", extra["BABEL_CKPT"]
                     index = arguments.index(option)
                     self.assertEqual(arguments[index + 1], expected)
+                    if launcher == PHASE2:
+                        index = arguments.index("--resume-cnn-sha256")
+                        self.assertEqual(
+                            arguments[index + 1], extra["CNN_CKPT_SHA256"]
+                        )
 
 
 if __name__ == "__main__":

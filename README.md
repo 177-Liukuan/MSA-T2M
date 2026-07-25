@@ -238,7 +238,9 @@ BABEL_CKPT=Experiments/<babel_sparse_global_phase2_exp>/net_best_mpjpe.pth \
 ```
 
 每个 launcher 都允许通过环境变量覆盖路径；替换 `CNN_CKPT` 时必须同时提供
-对应的 `CNN_CKPT_SHA256`，以保留所加载 joint Causal TAE 的身份。BABEL
+对应的 `CNN_CKPT_SHA256`，以保留所加载 joint Causal TAE 的身份。Phase 2
+会将同一 `CNN_CKPT_SHA256` 传给其 Phase-1 full resume 的身份预检；若替换
+Phase-1 checkpoint，也必须在 Phase 2 提供与其 metadata 一致的 digest。BABEL
 结果只报告重建和局部语义对齐，**不用于 BABEL 文本到运动生成**，也不运行
 HumanML3D TMR/FID 协议。
 
