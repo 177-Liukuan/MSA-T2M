@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +101,19 @@ def _source_signature(stem: str, motion_path: Path, text_path: Path, frames: int
     }
 
 
+def _captured_source_signature(
+    motion_path: Path,
+    text_bytes: bytes,
+    frames: int,
+) -> dict:
+    return {
+        "frames": int(frames),
+        "text_sha256": hashlib.sha256(text_bytes).hexdigest(),
+        "motion_size": int(motion_path.stat().st_size),
+        "motion_sha256": _sha256(motion_path),
+    }
+
+
 def _discover_source_paths(motion_dir: Path, text_dir: Path) -> Tuple[Path, Path, Tuple[str, ...]]:
     motion_root = Path(motion_dir).expanduser().resolve()
     text_root = Path(text_dir).expanduser().resolve()
@@ -128,22 +142,27 @@ def _read_records(motion_dir: Path, text_dir: Path, stems: Iterable[str]):
         motion_path = motion_dir / "{}.npy".format(stem)
         text_path = text_dir / "{}.txt".format(stem)
         try:
-            record = parse_babel_stream_text(text_path.read_text())
+            text_bytes = text_path.read_bytes()
+            record = parse_babel_stream_text(text_bytes.decode("utf-8"))
             motion = np.load(motion_path, mmap_mode="r", allow_pickle=False)
             if motion.ndim != 2 or motion.shape[1] != MOTION_DIM:
                 raise ValueError("motion must have shape (T, {})".format(MOTION_DIM))
             if motion.shape[0] <= record.boundary:
                 raise ValueError("boundary must lie inside motion frames")
+            frames = int(motion.shape[0])
             records.append(
                 {
                     "stem": stem,
                     "record": record,
                     "motion_path": motion_path,
                     "text_path": text_path,
-                    "frames": int(motion.shape[0]),
+                    "frames": frames,
+                    "source_signature": _captured_source_signature(
+                        motion_path, text_bytes, frames
+                    ),
                 }
             )
-        except (OSError, ValueError) as error:
+        except (OSError, UnicodeError, ValueError) as error:
             rejections.append("{}: {}".format(stem, error))
     if rejections:
         raise CacheBuildError(tuple(sorted(rejections)))
@@ -217,6 +236,47 @@ def _manifest_expected_from_sources(split, model_signature, embedding_dim, motio
     }
 
 
+def _assert_sources_unchanged(records) -> None:
+    changed = []
+    for item in records:
+        try:
+            current = _source_signature(
+                item["stem"],
+                item["motion_path"],
+                item["text_path"],
+                item["frames"],
+            )
+        except OSError as error:
+            changed.append("{}: {}".format(item["stem"], error))
+            continue
+        if current != item["source_signature"]:
+            changed.append("{}: changed during cache build".format(item["stem"]))
+    if changed:
+        raise CacheBuildError(tuple(changed))
+
+
+def _publish_generation(staging_dir: Path, output_dir: Path) -> None:
+    """Replace a complete cache generation and roll back on swap failure."""
+    backup_dir = None
+    if output_dir.exists():
+        backup_dir = Path(
+            tempfile.mkdtemp(
+                dir=str(output_dir.parent),
+                prefix=".{}-backup-".format(output_dir.name),
+            )
+        )
+        backup_dir.rmdir()
+        os.replace(str(output_dir), str(backup_dir))
+    try:
+        os.replace(str(staging_dir), str(output_dir))
+    except Exception:
+        if backup_dir is not None and backup_dir.exists():
+            os.replace(str(backup_dir), str(output_dir))
+        raise
+    if backup_dir is not None:
+        shutil.rmtree(str(backup_dir))
+
+
 def validate_cache_manifest(manifest_path, expected) -> dict:
     """Validate a published BABEL cache against its exact source signatures."""
     manifest_path = Path(manifest_path).expanduser().resolve()
@@ -247,10 +307,7 @@ def validate_cache_manifest(manifest_path, expected) -> dict:
     )
     source_records = _read_records(motion_dir, text_dir, stems)
     current_records = {
-        item["stem"]: _source_signature(
-            item["stem"], item["motion_path"], item["text_path"], item["frames"]
-        )
-        for item in source_records
+        item["stem"]: item["source_signature"] for item in source_records
     }
     cached_records = manifest.get("records")
     if not isinstance(cached_records, dict) or set(cached_records) != set(current_records):
@@ -270,6 +327,13 @@ def validate_cache_manifest(manifest_path, expected) -> dict:
         raise ValueError("cache contains rejected samples")
 
     output_dir = manifest_path.parent
+    cache_members = {
+        path.stem
+        for path in output_dir.iterdir()
+        if path.is_file() and path.suffix == ".npy"
+    }
+    if cache_members != set(current_records):
+        raise ValueError("cache array membership mismatch")
     embedding_dim = int(expected["embedding_dim"])
     for stem, record in current_records.items():
         array_path = output_dir / "{}.npy".format(stem)
@@ -322,29 +386,51 @@ def build_cache(
     source_records = _read_records(motion_dir, text_dir, stems)
     embeddings, embedding_dim = _encode_unique_texts(source_records, encoder, batch_size)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    manifest_records = {}
-    for item in source_records:
-        stem = item["stem"]
-        expanded = expand_segment_embeddings(item["record"], item["frames"], embeddings)
-        filename = "{}.npy".format(stem)
-        _atomic_save_array(output_dir, filename, expanded)
-        manifest_record = _source_signature(
-            stem, item["motion_path"], item["text_path"], item["frames"]
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            dir=str(output_dir.parent),
+            prefix=".{}-generation-".format(output_dir.name),
         )
-        manifest_record["array_sha256"] = _sha256(output_dir / filename)
-        manifest_records[stem] = manifest_record
+    )
+    try:
+        manifest_records = {}
+        for item in source_records:
+            stem = item["stem"]
+            expanded = expand_segment_embeddings(
+                item["record"], item["frames"], embeddings
+            )
+            filename = "{}.npy".format(stem)
+            _atomic_save_array(staging_dir, filename, expanded)
+            manifest_record = dict(item["source_signature"])
+            manifest_record["array_sha256"] = _sha256(staging_dir / filename)
+            manifest_records[stem] = manifest_record
 
-    manifest = {
-        "version": CACHE_VERSION,
-        "split": str(split),
-        "model_signature": str(model_signature),
-        "embedding_dim": embedding_dim,
-        "motion_dir": _canonical(motion_dir),
-        "text_dir": _canonical(text_dir),
-        "valid_samples": len(source_records),
-        "rejected_samples": 0,
-        "records": manifest_records,
-    }
-    _atomic_write_manifest(output_dir, manifest)
-    return manifest
+        _assert_sources_unchanged(source_records)
+        manifest = {
+            "version": CACHE_VERSION,
+            "split": str(split),
+            "model_signature": str(model_signature),
+            "embedding_dim": embedding_dim,
+            "motion_dir": _canonical(motion_dir),
+            "text_dir": _canonical(text_dir),
+            "valid_samples": len(source_records),
+            "rejected_samples": 0,
+            "records": manifest_records,
+        }
+        _atomic_write_manifest(staging_dir, manifest)
+        validate_cache_manifest(
+            staging_dir / "manifest.json",
+            _manifest_expected_from_sources(
+                split,
+                model_signature,
+                embedding_dim,
+                motion_dir,
+                text_dir,
+            ),
+        )
+        _publish_generation(staging_dir, output_dir)
+        return manifest
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(str(staging_dir))

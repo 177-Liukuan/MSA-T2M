@@ -148,6 +148,7 @@ class BabelStreamT5CacheTest(unittest.TestCase):
             build_cache(
                 "train", motion_dir, text_dir, output_dir, OffsetEncoder(0), "fake-t5"
             )
+            original_seq_a = np.load(output_dir / "seq_a.npy").copy()
             original_save = babel_stream_t5_cache._atomic_save_array
             saved_names = []
 
@@ -173,10 +174,93 @@ class BabelStreamT5CacheTest(unittest.TestCase):
                         overwrite=True,
                     )
 
-            with self.assertRaisesRegex(ValueError, "array content hash mismatch"):
+            # A failed overwrite must leave the complete previous generation
+            # usable rather than replacing one array under the old manifest.
+            validate_cache_manifest(
+                output_dir / "manifest.json", self._expected(motion_dir, text_dir)
+            )
+            np.testing.assert_array_equal(
+                np.load(output_dir / "seq_a.npy"),
+                original_seq_a,
+            )
+
+    def test_overwrite_after_source_deletion_publishes_exact_clean_membership(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            motion_dir, text_dir = self._write_valid_sources(root)
+            output_dir = root / "cache"
+            build_cache(
+                "train", motion_dir, text_dir, output_dir, FakeEncoder(), "fake-t5"
+            )
+            (motion_dir / "seq_b.npy").unlink()
+            (text_dir / "seq_b.txt").unlink()
+
+            manifest = build_cache(
+                "train",
+                motion_dir,
+                text_dir,
+                output_dir,
+                FakeEncoder(),
+                "fake-t5",
+                overwrite=True,
+            )
+
+            self.assertEqual(set(manifest["records"]), {"seq_a"})
+            self.assertEqual(
+                {path.name for path in output_dir.glob("*.npy")},
+                {"seq_a.npy"},
+            )
+            validate_cache_manifest(
+                output_dir / "manifest.json", self._expected(motion_dir, text_dir)
+            )
+
+    def test_validator_rejects_extra_array_not_declared_by_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            motion_dir, text_dir = self._write_valid_sources(root)
+            output_dir = root / "cache"
+            build_cache(
+                "train", motion_dir, text_dir, output_dir, FakeEncoder(), "fake-t5"
+            )
+            np.save(output_dir / "stale.npy", np.zeros((4, 2), dtype=np.float32))
+
+            with self.assertRaisesRegex(ValueError, "cache array membership mismatch"):
                 validate_cache_manifest(
                     output_dir / "manifest.json", self._expected(motion_dir, text_dir)
                 )
+
+    def test_source_mutation_during_build_is_rejected_before_publication(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            motion_dir, text_dir = self._write_valid_sources(root)
+            output_dir = root / "cache"
+            original_save = babel_stream_t5_cache._atomic_save_array
+            mutated = []
+
+            def mutate_after_first_array(directory, filename, array):
+                original_save(directory, filename, array)
+                if not mutated:
+                    mutated.append(filename)
+                    (text_dir / "seq_a.txt").write_text(
+                        "jump#jump/VERB#0.0#0.0*sit#sit/VERB#0.0#0.0#2\n"
+                    )
+
+            with patch.object(
+                babel_stream_t5_cache,
+                "_atomic_save_array",
+                side_effect=mutate_after_first_array,
+            ):
+                with self.assertRaisesRegex(CacheBuildError, "changed during cache build"):
+                    build_cache(
+                        "train",
+                        motion_dir,
+                        text_dir,
+                        output_dir,
+                        FakeEncoder(),
+                        "fake-t5",
+                    )
+
+            self.assertFalse((output_dir / "manifest.json").exists())
 
     def test_validate_rejects_cached_array_with_wrong_shape_or_dtype(self):
         with tempfile.TemporaryDirectory() as temp_dir:
