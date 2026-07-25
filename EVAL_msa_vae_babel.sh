@@ -34,27 +34,27 @@ EXP_NAME=${EXP_NAME:-MSA_VAEv6_babel_sparse_global_eval}
 
 "$PYTHON_BIN" eval_msa_vae.py \
   --phase 2 \
-  --resume-pth $BABEL_CKPT \
+  --resume-pth "$BABEL_CKPT" \
   --out-dir Experiments \
   --exp-name "$EXP_NAME" \
   --dataname t2m_babel_272 \
   --batch-size "$BATCH_SIZE" \
   --msa_data_mode babel_sparse_global \
-  --msa_mean_path $MSA_MEAN_PATH \
-  --msa_std_path $MSA_STD_PATH \
-  --bridge_split_file $BRIDGE_SPLIT_FILE \
-  --bridge_motion_dir $BRIDGE_MOTION_DIR \
-  --bridge_text_dir $BRIDGE_TEXT_DIR \
-  --bridge_global_embed_dir $BRIDGE_GLOBAL_EMBED_DIR \
-  --bridge_local_embed_dir $BRIDGE_LOCAL_EMBED_DIR \
-  --babel_train_motion_dir $BABEL_TRAIN_MOTION_DIR \
-  --babel_train_text_dir $BABEL_TRAIN_TEXT_DIR \
-  --babel_train_t5_cache_dir $BABEL_TRAIN_CACHE_DIR \
-  --babel_train_cache_manifest $BABEL_TRAIN_MANIFEST \
-  --babel_val_motion_dir $BABEL_VAL_MOTION_DIR \
-  --babel_val_text_dir $BABEL_VAL_TEXT_DIR \
-  --babel_val_t5_cache_dir $BABEL_VAL_CACHE_DIR \
-  --babel_val_cache_manifest $BABEL_VAL_MANIFEST \
+  --msa_mean_path "$MSA_MEAN_PATH" \
+  --msa_std_path "$MSA_STD_PATH" \
+  --bridge_split_file "$BRIDGE_SPLIT_FILE" \
+  --bridge_motion_dir "$BRIDGE_MOTION_DIR" \
+  --bridge_text_dir "$BRIDGE_TEXT_DIR" \
+  --bridge_global_embed_dir "$BRIDGE_GLOBAL_EMBED_DIR" \
+  --bridge_local_embed_dir "$BRIDGE_LOCAL_EMBED_DIR" \
+  --babel_train_motion_dir "$BABEL_TRAIN_MOTION_DIR" \
+  --babel_train_text_dir "$BABEL_TRAIN_TEXT_DIR" \
+  --babel_train_t5_cache_dir "$BABEL_TRAIN_CACHE_DIR" \
+  --babel_train_cache_manifest "$BABEL_TRAIN_MANIFEST" \
+  --babel_val_motion_dir "$BABEL_VAL_MOTION_DIR" \
+  --babel_val_text_dir "$BABEL_VAL_TEXT_DIR" \
+  --babel_val_t5_cache_dir "$BABEL_VAL_CACHE_DIR" \
+  --babel_val_cache_manifest "$BABEL_VAL_MANIFEST" \
   --down-t 2 \
   --depth 3 \
   --dilation-growth-rate 3 \
@@ -69,9 +69,9 @@ EXP_NAME=${EXP_NAME:-MSA_VAEv6_babel_sparse_global_eval}
   --clip_dim 768 \
   --text_encoder_type t5 \
   --text_embed_dim 768 \
-  --t5_embed_dir $BRIDGE_LOCAL_EMBED_DIR \
+  --t5_embed_dir "$BRIDGE_LOCAL_EMBED_DIR" \
   --use_offline_global_text \
-  --t5_global_embed_dir $BRIDGE_GLOBAL_EMBED_DIR \
-  --t5_model_path $T5_MODEL_PATH \
+  --t5_global_embed_dir "$BRIDGE_GLOBAL_EMBED_DIR" \
+  --t5_model_path "$T5_MODEL_PATH" \
   --global_align_weight 0.1 \
   --local_align_weight 0.001
