@@ -80,9 +80,41 @@ class MSARAGDatasetTest(unittest.TestCase):
 
         for actual, expected in zip(packed_batch, reference_batch):
             torch.testing.assert_close(actual, expected)
-            self.assertEqual(actual.dtype, torch.float32)
-        self.assertEqual(tuple(packed_batch[-1].shape), (2, 5, 2))
-        torch.testing.assert_close(packed_batch[-1][0, 3:], torch.zeros(2, 2))
+        motion_batch, motion_lengths = packed_batch[-2:]
+        self.assertEqual(motion_batch.dtype, torch.float32)
+        self.assertEqual(motion_lengths.dtype, torch.long)
+        self.assertEqual(tuple(motion_batch.shape), (2, 5, 2))
+        torch.testing.assert_close(motion_batch[0, 3:], torch.zeros(2, 2))
+        torch.testing.assert_close(
+            motion_lengths,
+            torch.tensor([3, 5], dtype=torch.long),
+        )
+
+    def test_collate_counts_valid_all_zero_latent_from_sequence_shape(self):
+        text = np.zeros(2, dtype=np.float32)
+        top_hcls = np.zeros((1, 2), dtype=np.float32)
+        top_scores = np.zeros(1, dtype=np.float32)
+        sequence_with_zero_terminal = np.array(
+            [[1.0, 2.0], [0.0, 0.0]],
+            dtype=np.float32,
+        )
+        one_token_sequence = np.array([[3.0, 4.0]], dtype=np.float32)
+
+        _, _, _, motion_batch, motion_lengths = collate_fn(
+            [
+                (text, top_hcls, top_scores, sequence_with_zero_terminal),
+                (text, top_hcls, top_scores, one_token_sequence),
+            ]
+        )
+
+        torch.testing.assert_close(
+            motion_lengths,
+            torch.tensor([2, 1], dtype=torch.long),
+        )
+        torch.testing.assert_close(
+            motion_batch[0, 1],
+            torch.zeros(2, dtype=torch.float32),
+        )
 
     def test_rejects_unknown_cache_mode(self):
         with working_directory(self.root):
