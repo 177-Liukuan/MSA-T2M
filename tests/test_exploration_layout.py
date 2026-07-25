@@ -27,6 +27,8 @@ OFFICIAL_ROOT_ENTRYPOINTS = {
     "TRAIN_t2m_rag.sh",
     "eval_msa_t2m_rag_t5.py",
     "EVAL_t2m_rag_t5.sh",
+    "eval_msa_t2m_rag_t5_optimized.py",
+    "EVAL_t2m_rag_t5_optimized.sh",
     "msa_gen_motion.py",
     "output_vis.py",
 }
