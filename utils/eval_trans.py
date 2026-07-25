@@ -4,6 +4,7 @@ from scipy import linalg
 from utils.face_z_align_util import rotation_6d_to_matrix
 import visualization.plot_3d_global as plot_3d
 import os
+from utils.msa_vae_training import save_msa_checkpoint
 
 def tensorborad_add_video_xyz(writer, xyz, nb_iter, tag, title_batch=None, outname=None, fps=30):
     xyz = xyz[:1]   
@@ -415,7 +416,8 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
                               evaluator,
                               draw=True, save=True, savegif=True,
                               device=torch.device('cuda'),
-                              accelerator=None):
+                              accelerator=None,
+                              checkpoint_metadata=None):
     """MSA-VAE evaluation with MPJPE + FID + R_precision@1/2/3 + MM-dist.
 
     Args:
@@ -550,12 +552,24 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
         if fid < best_fid:
             logger.info(f"--> --> \t FID improved from {best_fid:.4f} to {fid:.4f}")
             best_fid = fid
-            torch.save({'net': net.state_dict()}, os.path.join(out_dir, 'net_best_fid.pth'))
+            save_msa_checkpoint(
+                os.path.join(out_dir, 'net_best_fid.pth'),
+                net,
+                checkpoint_metadata,
+            )
         if mpjpe < best_mpjpe:
             logger.info(f"--> --> \t MPJPE improved from {best_mpjpe:.5f} to {mpjpe:.5f}")
             best_mpjpe = mpjpe
-            torch.save({'net': net.state_dict()}, os.path.join(out_dir, 'net_best_mpjpe.pth'))
-        torch.save({'net': net.state_dict()}, os.path.join(out_dir, 'net_last.pth'))
+            save_msa_checkpoint(
+                os.path.join(out_dir, 'net_best_mpjpe.pth'),
+                net,
+                checkpoint_metadata,
+            )
+        save_msa_checkpoint(
+            os.path.join(out_dir, 'net_last.pth'),
+            net,
+            checkpoint_metadata,
+        )
 
     # Synchronize all ranks
     if accelerator is not None:

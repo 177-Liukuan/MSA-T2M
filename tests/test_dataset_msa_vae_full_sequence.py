@@ -227,6 +227,24 @@ class LengthBucketBatchSamplerTest(unittest.TestCase):
         )
         self.assertEqual(full_lengths, [68, 196])
 
+    def test_cycle_advances_loader_epoch_before_each_pass(self):
+        class EpochIterable:
+            def __init__(self):
+                self.epochs = []
+
+            def set_epoch(self, epoch):
+                self.epochs.append(epoch)
+
+            def __iter__(self):
+                return iter(["batch"])
+
+        iterable = EpochIterable()
+        iterator = dataset_msa_vae.cycle(iterable)
+
+        self.assertEqual(next(iterator), "batch")
+        self.assertEqual(next(iterator), "batch")
+        self.assertEqual(iterable.epochs, [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

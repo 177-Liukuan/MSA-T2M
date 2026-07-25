@@ -437,6 +437,13 @@ def DATALoader(dataset_name, batch_size, num_workers=8,
 
 
 def cycle(iterable):
+    epoch = 0
     while True:
+        if hasattr(iterable, 'set_epoch'):
+            iterable.set_epoch(epoch)
+        elif hasattr(iterable, 'batch_sampler') and hasattr(
+                iterable.batch_sampler, 'set_epoch'):
+            iterable.batch_sampler.set_epoch(epoch)
         for x in iterable:
             yield x
+        epoch += 1

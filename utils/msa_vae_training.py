@@ -226,3 +226,85 @@ def compute_msa_vae_objective(outputs, targets, phase, batch_kind, weights,
         + weights.local_align * local_loss
     )
     return total, loss_dict
+
+
+def select_training_batch(step, mode, full_iter, window_iter,
+                          replay_interval):
+    """Select a rank-deterministic full or window batch."""
+    if mode == 'full':
+        return next(full_iter), 'full'
+    if mode == 'window':
+        return next(window_iter), 'window'
+    if mode == 'mixed':
+        if is_window_replay_step(step, replay_interval):
+            return next(window_iter), 'window'
+        return next(full_iter), 'full'
+    raise ValueError(f'unknown sequence mode: {mode}')
+
+
+def build_global_alignment_target(global_text, local_pooled, has_local,
+                                  total_frames, window_size, sequence_mode,
+                                  spotlight_alpha):
+    """Build full-caption targets or preserve legacy window Spotlight."""
+    if sequence_mode in ('full', 'mixed'):
+        return F.normalize(global_text, dim=-1)
+    if sequence_mode != 'window':
+        raise ValueError(f'unknown sequence mode: {sequence_mode}')
+
+    if spotlight_alpha < 0:
+        alpha = (
+            float(window_size) / total_frames.to(global_text.device).float()
+        ).clamp(0, 1)
+    else:
+        alpha = torch.full(
+            (global_text.size(0),),
+            float(spotlight_alpha),
+            device=global_text.device,
+        )
+    alpha = alpha * has_local.to(global_text.device).float()
+    alpha = alpha.unsqueeze(-1)
+    mixed = (1 - alpha) * global_text + alpha * local_pooled
+    return F.normalize(mixed, dim=-1)
+
+
+def build_msa_checkpoint_metadata(args):
+    """Record sequence-training structure without changing tensor keys."""
+    return {
+        'format_version': 1,
+        'phase': int(args.phase),
+        'sequence_mode': str(args.sequence_mode),
+        'window_size': int(args.window_size),
+        'full_seq_batch_size': int(args.full_seq_batch_size),
+        'window_replay_interval': int(args.window_replay_interval),
+        'down_t': int(args.down_t),
+        'stride_t': int(args.stride_t),
+        'latent_dim': int(args.latent_dim),
+        'normalized_loss_version': 1,
+    }
+
+
+def validate_msa_checkpoint_metadata(metadata, args):
+    """Reject structural checkpoint mismatches; accept legacy payloads."""
+    if metadata is None:
+        return
+    if metadata.get('format_version') != 1:
+        raise ValueError(
+            f'unsupported checkpoint metadata format: '
+            f'{metadata.get("format_version")}'
+        )
+    for field in ('down_t', 'stride_t', 'latent_dim'):
+        expected = int(getattr(args, field))
+        actual = int(metadata[field])
+        if actual != expected:
+            raise ValueError(
+                f'checkpoint {field}={actual} does not match requested '
+                f'{field}={expected}'
+            )
+
+
+def save_msa_checkpoint(path, model, metadata=None):
+    """Save a compatible MSA-VAE payload with optional training metadata."""
+    payload = {'net': model.state_dict()}
+    if metadata is not None:
+        payload['metadata'] = dict(metadata)
+    torch.save(payload, path)

@@ -29,11 +29,19 @@ from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator
 
 import models.msa_vae as msa_vae
-import utils.losses as losses
 import options.option_msa_vae as option_msa_vae
 import utils.utils_model as utils_model
-from humanml3d_272 import dataset_msa_vae, dataset_eval_tae, dataset_eval_t2m
+from humanml3d_272 import dataset_msa_vae, dataset_eval_t2m
 import utils.eval_trans as eval_trans
+from utils.msa_vae_training import (
+    MSAVAELossWeights,
+    build_global_alignment_target,
+    build_msa_checkpoint_metadata,
+    compute_msa_vae_objective,
+    save_msa_checkpoint,
+    select_training_batch,
+    validate_msa_checkpoint_metadata,
+)
 import sys
 import warnings
 warnings.filterwarnings('ignore')
@@ -231,9 +239,11 @@ if args.disable_decoupling:
     logger.info('Using z as Transformer AE input/target (decoupling disabled)')
 
 ##### ---- Dataloader ---- #####
-train_loader = dataset_msa_vae.DATALoader(
-    args.dataname, args.batch_size,
-    window_size=args.window_size, unit_length=2 ** args.down_t,
+unit_length = args.stride_t ** args.down_t
+train_dataset = dataset_msa_vae.MSAVAEDataset(
+    args.dataname,
+    window_size=args.window_size,
+    unit_length=unit_length,
     use_ft_split=args.use_ft_split,
     text_encoder_type=args.text_encoder_type,
     clip_embed_dir=args.clip_embed_dir,
@@ -242,10 +252,30 @@ train_loader = dataset_msa_vae.DATALoader(
     use_offline_global_text=args.use_offline_global_text,
     clip_global_embed_dir=args.clip_global_embed_dir,
     t5_global_embed_dir=args.t5_global_embed_dir,
+    sequence_mode='window' if args.sequence_mode == 'mixed' else args.sequence_mode,
 )
-val_loader = dataset_eval_tae.DATALoader(
-    args.dataname, False, 32, unit_length=2 ** args.down_t,
-)
+
+full_loader = None
+window_loader = None
+if args.sequence_mode in ('full', 'mixed'):
+    full_loader = dataset_msa_vae.make_loader(
+        train_dataset,
+        sequence_mode='full',
+        batch_size=args.full_seq_batch_size,
+        num_workers=8,
+        bucket_size=args.length_bucket_size,
+        drop_last=True,
+        seed=args.seed,
+    )
+if args.sequence_mode in ('window', 'mixed'):
+    window_loader = dataset_msa_vae.make_loader(
+        train_dataset,
+        sequence_mode='window',
+        batch_size=args.batch_size,
+        num_workers=8,
+        drop_last=True,
+        seed=args.seed,
+    )
 
 ##### ---- Network ---- #####
 clip_range = [-30, 20]
@@ -305,6 +335,8 @@ if args.resume_cnn_pth:
 if args.resume_pth:
     logger.info(f'Resuming full MSA-VAE from {args.resume_pth}')
     ckpt = torch.load(args.resume_pth, map_location='cpu')
+    metadata = ckpt.get('metadata') if isinstance(ckpt, dict) else None
+    validate_msa_checkpoint_metadata(metadata, args)
     state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
     net.load_state_dict(state, strict=True)
 
@@ -343,7 +375,6 @@ phase_desc = 'Phase 1, CNN frozen' if args.phase == 1 else ('Phase 2, all unfroz
 log_model_params(net, name=f'MSA-HumanVAE ({phase_desc})', accelerator=accelerator)
 
 net.train()
-net_eval = EvalCompat(net)
 
 ##### ---- Evaluator for R_precision / FID ---- #####
 # Text-aware val loader (NOT prepared by accelerator, runs on main only)
@@ -399,24 +430,40 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer, milestones=args.lr_scheduler, gamma=args.gamma,
 )
 
-net, optimizer, train_loader, val_loader = accelerator.prepare(
-    net, optimizer, train_loader, val_loader,
-)
-train_loader_iter = dataset_msa_vae.cycle(train_loader)
+if args.sequence_mode == 'mixed':
+    net, optimizer, full_loader, window_loader = accelerator.prepare(
+        net, optimizer, full_loader, window_loader,
+    )
+elif args.sequence_mode == 'full':
+    net, optimizer, full_loader = accelerator.prepare(
+        net, optimizer, full_loader,
+    )
+else:
+    net, optimizer, window_loader = accelerator.prepare(
+        net, optimizer, window_loader,
+    )
 
-##### ---- Losses ---- #####
-Loss = losses.ReConsLoss(motion_dim=272)
-latent_recon_loss_fn = nn.MSELoss()
-global_align_loss_fn = CLIPAlignmentLoss()
-local_align_loss_fn = CLIPAlignmentLoss()
+full_loader_iter = (
+    dataset_msa_vae.cycle(full_loader) if full_loader is not None else None
+)
+window_loader_iter = (
+    dataset_msa_vae.cycle(window_loader)
+    if window_loader is not None else None
+)
+loss_weights = MSAVAELossWeights(
+    root=args.root_loss,
+    latent=args.latent_recon_weight,
+    global_align=args.global_align_weight,
+    local_align=args.local_align_weight,
+)
+checkpoint_metadata = build_msa_checkpoint_metadata(args)
+net_eval = EvalCompat(accelerator.unwrap_model(net))
 
 ##### ---- Training function (shared by warmup & main) ---- #####
-def compute_losses(batch, net_module):
-    """Compute all MSA-VAE losses from one batch.
-
-    Returns: (total_loss, loss_dict)
-    """
-    gt_motion, captions, global_text_gt, has_global, local_text_gt, has_local, total_frames, local_text_pooled = batch
+def compute_losses(batch, batch_kind):
+    """Compute masked losses from one full or replay batch."""
+    (gt_motion, captions, global_text_gt, has_global, local_text_gt,
+     has_local, total_frames, local_text_pooled, motion_lengths) = batch
     gt_motion = gt_motion.to(comp_device).float()
     global_text_gt = global_text_gt.to(comp_device).float()
     has_global = has_global.to(comp_device)
@@ -424,89 +471,48 @@ def compute_losses(batch, net_module):
     has_local = has_local.to(comp_device)
     total_frames = total_frames.to(comp_device)
     local_text_pooled = local_text_pooled.to(comp_device).float()
+    motion_lengths = motion_lengths.to(comp_device)
 
-    out = net_module(gt_motion)
+    out = net(
+        gt_motion,
+        lengths=motion_lengths,
+        semantic_only=args.phase == 1,
+    )
 
-    # --- Reconstruction losses ---
-    # Phase 1: skip recon/kl/root (CNN frozen, these produce zero gradients)
-    if args.phase == 1:
-        zero = torch.tensor(0.0, device=comp_device)
-        loss_motion = zero
-        loss_kl = zero
-        loss_root = zero
-    else:
-        loss_motion = Loss(out['x_recon'], gt_motion)
-        loss_kl = Loss.forward_KL(out['mu'], out['logvar'])
-        loss_root = Loss.forward_root(out['x_recon'], gt_motion)
-    if args.disable_decoupling:
-        loss_latent = latent_recon_loss_fn(out['mu_recon'], out['trans_latent_target'].detach())
-    else:
-        loss_latent = latent_recon_loss_fn(out['mu_recon'], out['mu'].detach())
-
-    loss_dict = {
-        'recon': loss_motion,
-        'kl': loss_kl,
-        'root': loss_root,
-        'latent': loss_latent,
-    }
-
-    # --- Global alignment: h_cls vs Spotlight(global text, local pooled text) ---
-    loss_global = torch.tensor(0.0, device=comp_device, requires_grad=True)
-    if args.global_align_weight > 0:
-        with torch.no_grad():
-            if args.use_offline_global_text:
-                text_feat = global_text_gt
-                valid_global = has_global
-            else:
-                text_feat = text_encoder.encode_text(captions, comp_device)
-                valid_global = torch.ones_like(has_local, dtype=torch.bool)
-
-            # Compute interpolation alpha
-            if args.spotlight_alpha < 0:
-                alpha = (args.window_size / total_frames.float().to(comp_device)).clamp(0, 1)
-            else:
-                alpha = torch.full((gt_motion.size(0),), args.spotlight_alpha,
-                                   device=comp_device)
-
-            # local pooled text embedding from frame-level labels
-            l_pooled = local_text_pooled
-
-            # Zero out alpha for samples without local embeddings
-            alpha = alpha * has_local.float()
-
-            # G_mixed = (1 - alpha) * global + alpha * local pooled
-            alpha = alpha.unsqueeze(-1)
-            g_mixed = (1 - alpha) * text_feat + alpha * l_pooled
-            g_target = F.normalize(g_mixed, dim=-1)
-
-        if valid_global.any():
-            loss_global = global_align_loss_fn(out['clip_global_feat'], g_target, mask=valid_global)
-    loss_dict['global_align'] = loss_global
-
-    # --- Local alignment: z_i projected vs CLIP(local label) ---
-    loss_local = torch.tensor(0.0, device=comp_device, requires_grad=True)
-    if args.local_align_weight > 0 and has_local.any():
-        loss_local = local_align_loss_fn(
-            out['clip_local_feat'], local_text_gt, mask=has_local
+    with torch.no_grad():
+        if args.use_offline_global_text:
+            text_feat = global_text_gt
+            valid_global = has_global
+        else:
+            text_feat = text_encoder.encode_text(captions, comp_device)
+            valid_global = torch.ones_like(has_local, dtype=torch.bool)
+        global_target = build_global_alignment_target(
+            global_text=text_feat,
+            local_pooled=local_text_pooled,
+            has_local=has_local,
+            total_frames=total_frames,
+            window_size=args.window_size,
+            sequence_mode=args.sequence_mode,
+            spotlight_alpha=args.spotlight_alpha,
         )
-    loss_dict['local_align'] = loss_local
 
-    # --- Total loss ---
-    if args.phase == 1:
-        # Phase 1: only latent + alignment losses
-        total_loss = (args.latent_recon_weight * loss_latent
-                      + args.global_align_weight * loss_global
-                      + args.local_align_weight * loss_local)
-    else:
-        # Phase 0/2: all losses
-        total_loss = (loss_motion
-                      + loss_kl
-                      + args.root_loss * loss_root
-                      + args.latent_recon_weight * loss_latent
-                      + args.global_align_weight * loss_global
-                      + args.local_align_weight * loss_local)
-
-    return total_loss, loss_dict
+    targets = {
+        'motion': gt_motion,
+        'motion_lengths': motion_lengths,
+        'global_text': global_target,
+        'has_global': valid_global,
+        'local_text': local_text_gt,
+        'has_local': has_local,
+    }
+    return compute_msa_vae_objective(
+        out,
+        targets,
+        phase=args.phase,
+        batch_kind=batch_kind,
+        weights=loss_weights,
+        stride_t=args.stride_t,
+        down_t=args.down_t,
+    )
 
 
 ##### ---- Warm-up ---- #####
@@ -516,16 +522,22 @@ logger.info(f'=== Warm-up: {args.warm_up_iter} iterations ===')
 for nb_iter in range(1, args.warm_up_iter):
     optimizer, current_lr = update_lr_warm_up(optimizer, nb_iter, args.warm_up_iter, args.lr)
 
-    batch = next(train_loader_iter)
-    net_module = net.module if args.num_gpus > 1 else net
-    total_loss, loss_dict = compute_losses(batch, net_module)
+    batch, batch_kind = select_training_batch(
+        nb_iter,
+        args.sequence_mode,
+        full_loader_iter,
+        window_loader_iter,
+        args.window_replay_interval,
+    )
+    total_loss, loss_dict = compute_losses(batch, batch_kind)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
     optimizer.step()
 
     for k in avg:
-        avg[k] += loss_dict[k].item()
+        if k in loss_dict:
+            avg[k] += loss_dict[k].item()
 
     if nb_iter % args.print_iter == 0:
         if accelerator.is_main_process:
@@ -541,12 +553,13 @@ for nb_iter in range(1, args.warm_up_iter):
 avg = {k: 0. for k in ['recon', 'kl', 'root', 'latent', 'global_align', 'local_align']}
 
 # Initial eval
-eval_net = net.module if args.num_gpus > 1 else net
+eval_net = accelerator.unwrap_model(net)
 net_eval.model = eval_net
 best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
     args.out_dir, val_loader_t2m, net_eval, logger, writer, 0,
     best_iter=0, best_fid=1e6, best_mpjpe=1000,
     evaluator=evaluator, device=comp_device, accelerator=accelerator,
+    checkpoint_metadata=checkpoint_metadata,
 )
 
 logger.info(f'=== Main training: {args.total_iter} iterations ===')
@@ -556,9 +569,14 @@ logger.info(f'  Spotlight alpha: {args.spotlight_alpha} '
             f'({"dynamic: window/total" if args.spotlight_alpha < 0 else "fixed"})')
 
 for nb_iter in range(1, args.total_iter + 1):
-    batch = next(train_loader_iter)
-    net_module = net.module if args.num_gpus > 1 else net
-    total_loss, loss_dict = compute_losses(batch, net_module)
+    batch, batch_kind = select_training_batch(
+        nb_iter,
+        args.sequence_mode,
+        full_loader_iter,
+        window_loader_iter,
+        args.window_replay_interval,
+    )
+    total_loss, loss_dict = compute_losses(batch, batch_kind)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
@@ -584,10 +602,21 @@ for nb_iter in range(1, args.total_iter + 1):
         avg = {k: 0. for k in avg}
 
     if nb_iter % args.eval_iter == 0:
-        eval_net = net.module if args.num_gpus > 1 else net
+        eval_net = accelerator.unwrap_model(net)
         net_eval.model = eval_net
         best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
             args.out_dir, val_loader_t2m, net_eval, logger, writer, nb_iter,
             best_iter, best_fid, best_mpjpe,
             evaluator=evaluator, device=comp_device, accelerator=accelerator,
+            checkpoint_metadata=checkpoint_metadata,
         )
+
+accelerator.wait_for_everyone()
+if accelerator.is_main_process:
+    final_model = accelerator.unwrap_model(net)
+    save_msa_checkpoint(
+        os.path.join(args.out_dir, 'net_last.pth'),
+        final_model,
+        checkpoint_metadata,
+    )
+    logger.info('Saved final Phase checkpoint to net_last.pth')
