@@ -190,6 +190,16 @@ class RecordingRetriever:
         )
 
 
+class RecordingTextLookup:
+    def __init__(self):
+        self.calls = []
+
+    def batch_lookup(self, texts, device):
+        self.calls.append(list(texts))
+        values = [[float(index + 5)] for index in range(len(texts))]
+        return torch.tensor(values, dtype=torch.float32, device=device)
+
+
 class OptimizedSamplerTests(unittest.TestCase):
     def test_sampler_encodes_and_retrieves_once_per_batch(self):
         text_encoder = RecordingTextEncoder()
@@ -226,6 +236,61 @@ class OptimizedSamplerTests(unittest.TestCase):
             [latent[0, 0, 0].item() for latent in result.latents],
             [1.0, 2.0, 3.0],
         )
+
+    def test_offline_no_rag_batches_lookup_and_clamps_short_length(self):
+        text_lookup = RecordingTextLookup()
+        sampler = OptimizedRAGEvalSampler(
+            rag_model=DeterministicRAG(),
+            retriever=None,
+            empty_text_emb=torch.zeros(1),
+            latent_dim=2,
+            device=torch.device("cpu"),
+            reference_end_latent=None,
+            stop_threshold=0.1,
+            enable_stopping=False,
+            text_source="offline",
+            text_lookup=text_lookup,
+            text_encoder=None,
+            text_embed_dim=1,
+            disable_rag=True,
+        )
+
+        result = sampler.sample_batch_for_eval_CFG(
+            ["short", "normal"],
+            torch.tensor([1, 8]),
+            unit_length=4,
+        )
+
+        self.assertEqual(text_lookup.calls, [["short", "normal"]])
+        self.assertEqual(
+            [latent.shape[1] for latent in result.latents],
+            [1, 2],
+        )
+        self.assertEqual(
+            [latent[0, 0, 0].item() for latent in result.latents],
+            [5.0, 6.0],
+        )
+
+    def test_sampler_rejects_wrong_text_embedding_dimension(self):
+        sampler = OptimizedRAGEvalSampler(
+            rag_model=DeterministicRAG(),
+            retriever=RecordingRetriever(),
+            empty_text_emb=torch.zeros(1),
+            latent_dim=2,
+            device=torch.device("cpu"),
+            reference_end_latent=None,
+            enable_stopping=False,
+            text_source="online_t5",
+            text_encoder=RecordingTextEncoder(),
+            text_embed_dim=2,
+            disable_rag=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "embedding shape mismatch"):
+            sampler.sample_batch_for_eval_CFG(
+                ["wrong-dimension"],
+                torch.tensor([4]),
+            )
 
 
 class RecordingDecoder(torch.nn.Module):

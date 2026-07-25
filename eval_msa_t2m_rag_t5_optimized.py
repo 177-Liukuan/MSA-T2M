@@ -27,6 +27,7 @@ from utils.eval_msa_t2m_optimized import (
 
 
 DEFAULT_OPTIMIZED_EXPERIMENT = "MotionStreamer_t2m_272_msa_rag_t5_optimized"
+DEFAULT_EVALUATOR_CHECKPOINT = "../Evaluator_272/epoch=99.ckpt"
 
 
 def build_optimized_parser(argv=None):
@@ -81,6 +82,84 @@ def _resolve_runtime_paths(args):
     return args
 
 
+def _require_file(path, label):
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError("{} not found: {}".format(label, path))
+
+
+def _require_directory(path, label):
+    if not path or not os.path.isdir(path):
+        raise FileNotFoundError("{} not found: {}".format(label, path))
+
+
+def validate_runtime_assets(
+    args,
+    data_root,
+    evaluator_checkpoint=DEFAULT_EVALUATOR_CHECKPOINT,
+):
+    _require_file(args.resume_pth, "MSA-VAE checkpoint")
+    _require_file(args.resume_trans, "RAG checkpoint")
+    _require_directory(args.latent_dir, "motion latent directory")
+    _require_directory(args.text_latent_dir, "text latent directory")
+    _require_directory(data_root, "HumanML3D-272 data directory")
+    _require_directory(os.path.join(data_root, "texts"), "caption directory")
+    _require_directory(os.path.join(data_root, "split"), "split directory")
+
+    if not args.disable_rag:
+        _require_directory(args.hcls_dir, "RAG h_cls directory")
+    if args.text_source == "online_t5":
+        _require_directory(args.t5_model_path, "Sentence-T5 model directory")
+
+    empty_candidates = [
+        args.empty_text_path,
+        os.path.join(args.text_latent_dir, "empty_text_embedding.npy"),
+        os.path.join(args.text_latent_dir, "empty_cfg_text_t5.npy"),
+        os.path.join(args.text_latent_dir, "empty_cfg_text_clip.npy"),
+    ]
+    if not any(path and os.path.isfile(path) for path in empty_candidates):
+        raise FileNotFoundError(
+            "empty CFG text embedding not found; checked: {}".format(
+                ", ".join(empty_candidates)
+            )
+        )
+
+    if args.enable_stopping:
+        reference_candidates = [
+            args.reference_end_latent_path,
+            os.path.join(
+                args.latent_dir,
+                "reference_end_latent_msa_vae_{}.npy".format(args.dataname),
+            ),
+            "reference_end_latent_msa_vae_{}.npy".format(args.dataname),
+            "reference_end_latent_{}.npy".format(args.dataname),
+        ]
+        if not any(
+            path and os.path.isfile(path)
+            for path in reference_candidates
+        ):
+            raise FileNotFoundError(
+                "reference end latent not found; checked: {}".format(
+                    ", ".join(reference_candidates)
+                )
+            )
+
+    _require_file(evaluator_checkpoint, "TEMOS evaluator checkpoint")
+
+
+def select_rag_checkpoint_keys(checkpoint, use_ema, disable_rag):
+    trans_key = (
+        "trans_ema"
+        if use_ema and "trans_ema" in checkpoint
+        else "trans"
+    )
+    rag_key = "rag_ema" if use_ema and "rag_ema" in checkpoint else "rag"
+    if trans_key not in checkpoint:
+        raise KeyError("RAG checkpoint missing key: trans/trans_ema")
+    if rag_key not in checkpoint and not disable_rag:
+        raise KeyError("RAG checkpoint missing key: rag/rag_ema")
+    return trans_key, rag_key
+
+
 def _build_msa_vae(args, device):
     net = msa_vae.MSA_HumanVAE(
         hidden_size=args.hidden_size,
@@ -132,15 +211,11 @@ def _build_rag_model(args, device, logger):
     print("loading RAG checkpoint from {}".format(args.resume_trans))
     checkpoint = torch.load(args.resume_trans, map_location="cpu")
 
-    trans_key = (
-        "trans_ema"
-        if args.use_ema and "trans_ema" in checkpoint
-        else "trans"
+    trans_key, rag_key = select_rag_checkpoint_keys(
+        checkpoint,
+        use_ema=args.use_ema,
+        disable_rag=args.disable_rag,
     )
-    rag_key = "rag_ema" if args.use_ema and "rag_ema" in checkpoint else "rag"
-
-    if trans_key not in checkpoint:
-        raise KeyError("RAG checkpoint missing key: trans/trans_ema")
     rag_model.base_model.load_state_dict(
         load_state_strip_module(checkpoint[trans_key]),
         strict=False,
@@ -151,8 +226,6 @@ def _build_rag_model(args, device, logger):
             load_state_strip_module(checkpoint[rag_key]),
             strict=False,
         )
-    elif not args.disable_rag:
-        raise KeyError("RAG checkpoint missing key: rag/rag_ema")
     else:
         logger.info(
             "Checkpoint has no rag key, continue in no-RAG ablation mode."
@@ -254,7 +327,11 @@ def _load_reference_end_latent(args, device, logger):
     return reference
 
 
-def _load_evaluator(device):
+def _load_evaluator(
+    device,
+    logger,
+    checkpoint_path=DEFAULT_EVALUATOR_CHECKPOINT,
+):
     from mld.models.architectures.temos.motionencoder.actor import (
         ActorAgnosticEncoder,
     )
@@ -275,8 +352,8 @@ def _load_evaluator(device):
         max_len=300,
     )
 
-    checkpoint_path = "../Evaluator_272/epoch=99.ckpt"
     print("Loading evaluator checkpoint from {}".format(checkpoint_path))
+    logger.info("Evaluator checkpoint: {}".format(checkpoint_path))
     checkpoint = torch.load(checkpoint_path)
     text_state = {
         key.replace("textencoder.", ""): value
@@ -303,6 +380,7 @@ def main(argv=None):
     args = build_optimized_parser(argv)
     args = _resolve_runtime_paths(args)
     data_root = resolve_data_root()
+    validate_runtime_assets(args, data_root)
     torch.manual_seed(args.seed)
 
     args.out_dir = os.path.join(args.out_dir, args.exp_name)
@@ -350,7 +428,7 @@ def main(argv=None):
         disable_rag=args.disable_rag,
         use_random_topk_inference=args.use_random_topk_inference,
     )
-    evaluator = _load_evaluator(device)
+    evaluator = _load_evaluator(device, logger)
 
     fid, diversity, top1, top2, top3, matching, logger = (
         evaluation_transformer_272_optimized(
