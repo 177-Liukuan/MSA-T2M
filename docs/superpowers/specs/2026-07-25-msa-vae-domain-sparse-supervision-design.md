@@ -1,7 +1,7 @@
 # MSA-VAE Domain-Specific Sparse Supervision Design
 
 **Date:** 2026-07-25
-**Status:** Draft for user review; verbal design approved
+**Status:** Approved
 
 ## Objective
 
@@ -227,8 +227,12 @@ normalization and offline local cache. Report:
 - local alignment loss;
 - global and local supervision coverage.
 
-Select `net_best_mpjpe.pth` by BABEL validation MPJPE and retain
-`net_last.pth`. Do not use HumanML3D TMR/FID to select this checkpoint.
+During Phase 1, the CNN reconstruction path is frozen, so MPJPE cannot
+meaningfully select the Transformer/semantic checkpoint. Select
+`net_best_semantic.pth` by the validation latent-plus-local-alignment
+objective. During Phase 2, select `net_best_mpjpe.pth` by BABEL validation
+MPJPE. Retain `net_last.pth` in both phases. Do not use HumanML3D TMR/FID to
+select BABEL checkpoints.
 
 Checkpoint payloads keep the existing `net` state dict. Additional metadata
 records the data mode, normalization paths, cache manifest identity,
