@@ -6,6 +6,7 @@ supervised by the BABEL local-action stream.
 """
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +57,12 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
-def build_msa_checkpoint_metadata(args):
+def _manifest_identity(path, label):
+    manifest_path = _resolved_file(path, label)
+    return str(manifest_path), _file_sha256(manifest_path)
+
+
+def build_msa_checkpoint_metadata(args, include_train_manifest=True):
     """Build reproducibility metadata without changing checkpoint model keys."""
     mean_path = _resolved_file(args.msa_mean_path, "MSA mean")
     std_path = _resolved_file(args.msa_std_path, "MSA std")
@@ -64,20 +70,29 @@ def build_msa_checkpoint_metadata(args):
     if mode not in ("humanml_full", "babel_sparse_global"):
         raise ValueError("unsupported MSA data mode: {}".format(mode))
 
-    manifest_path = None
-    manifest_sha256 = None
+    train_manifest_path = None
+    train_manifest_sha256 = None
+    validation_manifest_path = None
+    validation_manifest_sha256 = None
     if mode == "babel_sparse_global":
-        manifest_path = _resolved_file(
-            args.babel_val_cache_manifest, "BABEL validation cache manifest"
+        if include_train_manifest:
+            train_manifest_path, train_manifest_sha256 = _manifest_identity(
+                args.babel_train_cache_manifest,
+                "BABEL training cache manifest",
+            )
+        validation_manifest_path, validation_manifest_sha256 = _manifest_identity(
+            args.babel_val_cache_manifest,
+            "BABEL validation cache manifest",
         )
-        manifest_sha256 = _file_sha256(manifest_path)
 
     return {
         "msa_data_mode": mode,
         "mean_path": str(mean_path),
         "std_path": str(std_path),
-        "cache_manifest_path": None if manifest_path is None else str(manifest_path),
-        "cache_manifest_sha256": manifest_sha256,
+        "train_cache_manifest_path": train_manifest_path,
+        "train_cache_manifest_sha256": train_manifest_sha256,
+        "val_cache_manifest_path": validation_manifest_path,
+        "val_cache_manifest_sha256": validation_manifest_sha256,
         "global_align_weight": float(args.global_align_weight),
         "local_align_weight": float(args.local_align_weight),
         "phase": int(args.phase),
@@ -85,11 +100,24 @@ def build_msa_checkpoint_metadata(args):
     }
 
 
-def validate_msa_checkpoint_metadata(metadata, args):
+def _metadata_manifest_value(metadata, split, suffix):
+    key = "{}_cache_manifest_{}".format(split, suffix)
+    value = metadata.get(key)
+    if value is None and split == "val":
+        # Task 4's first checkpoint generation used a validation-only alias.
+        value = metadata.get("cache_manifest_{}".format(suffix))
+    return value
+
+
+def validate_msa_checkpoint_metadata(metadata, args, scope="standalone"):
     """Reject checkpoints whose data/normalization identity differs."""
+    if scope not in ("standalone", "training"):
+        raise ValueError("unsupported checkpoint validation scope: {}".format(scope))
     if not isinstance(metadata, dict):
         raise ValueError("checkpoint has no MSA metadata")
-    expected = build_msa_checkpoint_metadata(args)
+    expected = build_msa_checkpoint_metadata(
+        args, include_train_manifest=(scope == "training")
+    )
     if metadata.get("msa_data_mode") != expected["msa_data_mode"]:
         raise ValueError(
             "checkpoint data mode {!r} does not match requested {!r}".format(
@@ -101,8 +129,155 @@ def validate_msa_checkpoint_metadata(metadata, args):
         if actual_path is None or str(Path(actual_path).expanduser().resolve()) != expected[key]:
             raise ValueError("checkpoint {} does not match requested asset".format(label))
     if expected["msa_data_mode"] == "babel_sparse_global":
-        if metadata.get("cache_manifest_sha256") != expected["cache_manifest_sha256"]:
-            raise ValueError("checkpoint cache manifest identity does not match requested cache")
+        splits = ("train", "val") if scope == "training" else ("val",)
+        for split in splits:
+            actual_path = _metadata_manifest_value(metadata, split, "path")
+            expected_path = expected["{}_cache_manifest_path".format(split)]
+            if (
+                actual_path is None
+                or str(Path(actual_path).expanduser().resolve()) != expected_path
+            ):
+                raise ValueError(
+                    "checkpoint {} cache manifest path does not match requested cache".format(
+                        split
+                    )
+                )
+            actual_sha256 = _metadata_manifest_value(metadata, split, "sha256")
+            if actual_sha256 != expected[
+                "{}_cache_manifest_sha256".format(split)
+            ]:
+                raise ValueError(
+                    "checkpoint {} cache manifest identity does not match requested cache".format(
+                        split
+                    )
+                )
+
+
+def _training_data_identity(metadata):
+    return {
+        key: metadata.get(key)
+        for key in (
+            "msa_data_mode",
+            "mean_path",
+            "std_path",
+            "train_cache_manifest_path",
+            "train_cache_manifest_sha256",
+            "val_cache_manifest_path",
+            "val_cache_manifest_sha256",
+        )
+    }
+
+
+def validate_distributed_msa_identity(metadata, accelerator):
+    """Require every rank to resolve the same training-data identity."""
+    local_identity = _training_data_identity(metadata)
+    if hasattr(accelerator, "gather_object"):
+        gathered = accelerator.gather_object(local_identity)
+    else:
+        from accelerate.utils import gather_object
+
+        gathered = gather_object([local_identity])
+    if not isinstance(gathered, (list, tuple)):
+        gathered = [gathered]
+    serialized = {
+        json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        for identity in gathered
+    }
+    if len(serialized) != 1:
+        raise RuntimeError(
+            "MSA data identities differ across ranks: {}".format(
+                " | ".join(sorted(serialized))
+            )
+        )
+    return local_identity
+
+
+def _load_checkpoint_file(path, label):
+    resolved = _resolved_file(path, label)
+    try:
+        return torch.load(str(resolved), map_location="cpu", weights_only=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("cannot load {}: {}".format(label, error)) from error
+
+
+def _require_state_mapping(checkpoint, label):
+    state = (
+        checkpoint["net"]
+        if isinstance(checkpoint, dict) and "net" in checkpoint
+        else checkpoint
+    )
+    if (
+        not isinstance(state, dict)
+        or not state
+        or not all(torch.is_tensor(value) for value in state.values())
+    ):
+        raise ValueError("{} does not contain a valid model state dict".format(label))
+    return state
+
+
+def _require_causal_tae_state(checkpoint):
+    state = _require_state_mapping(checkpoint, "resume CNN checkpoint")
+    required_prefixes = (
+        "tae.encoder.",
+        "tae.decoder.",
+        "tae.decode_proj.",
+    )
+    missing = [
+        prefix for prefix in required_prefixes
+        if not any(key.startswith(prefix) for key in state)
+    ]
+    if missing:
+        raise ValueError(
+            "resume CNN checkpoint is not a complete Causal TAE; "
+            "missing key prefixes {}".format(", ".join(missing))
+        )
+    return state
+
+
+def preflight_msa_training_assets(args, accelerator):
+    """Validate distributed data and phase-aware checkpoint contracts."""
+    metadata = build_msa_checkpoint_metadata(args, include_train_manifest=True)
+    validate_distributed_msa_identity(metadata, accelerator)
+
+    cnn_checkpoint = None
+    if args.resume_cnn_pth:
+        cnn_checkpoint = _load_checkpoint_file(
+            args.resume_cnn_pth, "resume CNN checkpoint"
+        )
+        _require_causal_tae_state(cnn_checkpoint)
+
+    full_checkpoint = None
+    if args.resume_pth:
+        full_checkpoint = _load_checkpoint_file(
+            args.resume_pth, "resume MSA-VAE checkpoint"
+        )
+        _require_state_mapping(full_checkpoint, "resume MSA-VAE checkpoint")
+        checkpoint_metadata = (
+            full_checkpoint.get("metadata")
+            if isinstance(full_checkpoint, dict)
+            else None
+        )
+        if checkpoint_metadata is None:
+            if args.msa_data_mode == "babel_sparse_global":
+                raise ValueError(
+                    "BABEL training requires a tagged full resume checkpoint"
+                )
+        else:
+            validate_msa_checkpoint_metadata(
+                checkpoint_metadata, args, scope="training"
+            )
+
+    if args.msa_data_mode == "babel_sparse_global":
+        if args.phase == 1 and cnn_checkpoint is None and full_checkpoint is None:
+            raise ValueError(
+                "BABEL Phase 1 requires --resume-cnn-pth or a tagged full resume"
+            )
+        if args.phase == 2 and full_checkpoint is None:
+            raise ValueError(
+                "BABEL Phase 2 requires a tagged BABEL Phase-1/full resume"
+            )
+
+    return metadata, full_checkpoint
 
 
 def prepare_babel_validation_loader(accelerator, val_loader):

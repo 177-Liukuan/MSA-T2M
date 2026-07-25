@@ -39,6 +39,16 @@ class _Accelerator:
         pass
 
 
+class _IdentityAccelerator(_Accelerator):
+    def __init__(self, remote_identity=None):
+        super().__init__()
+        self.remote_identity = remote_identity
+
+    def gather_object(self, local_identity):
+        remote = local_identity if self.remote_identity is None else self.remote_identity
+        return [local_identity, remote]
+
+
 class _Writer:
     def __init__(self):
         self.values = {}
@@ -106,6 +116,30 @@ def _batch():
 
 
 class BabelMSAVAEEvaluationTest(unittest.TestCase):
+    @staticmethod
+    def _metadata_args(root, mode="babel_sparse_global", phase=1):
+        root.mkdir(parents=True, exist_ok=True)
+        mean_path = root / "Mean.npy"
+        std_path = root / "Std.npy"
+        train_manifest = root / "train-manifest.json"
+        validation_manifest = root / "val-manifest.json"
+        np.save(mean_path, np.zeros(272))
+        np.save(std_path, np.ones(272))
+        train_manifest.write_text('{"split": "train"}')
+        validation_manifest.write_text('{"split": "val"}')
+        return SimpleNamespace(
+            msa_data_mode=mode,
+            msa_mean_path=str(mean_path),
+            msa_std_path=str(std_path),
+            babel_train_cache_manifest=str(train_manifest),
+            babel_val_cache_manifest=str(validation_manifest),
+            global_align_weight=0.5,
+            local_align_weight=0.2,
+            phase=phase,
+            resume_cnn_pth=None,
+            resume_pth=None,
+        )
+
     def test_mode_loader_selection_keeps_babel_independent_of_humanml_tmr_data(self):
         from eval_msa_vae import build_validation_loader
 
@@ -331,32 +365,222 @@ class BabelMSAVAEEvaluationTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            mean_path = root / "Mean.npy"
-            std_path = root / "Std.npy"
-            manifest_path = root / "manifest.json"
-            np.save(mean_path, np.zeros(272))
-            np.save(std_path, np.ones(272))
-            manifest_path.write_text('{"cache": "identity"}')
-            args = SimpleNamespace(
-                msa_data_mode="babel_sparse_global",
-                msa_mean_path=str(mean_path),
-                msa_std_path=str(std_path),
-                babel_val_cache_manifest=str(manifest_path),
-                global_align_weight=0.5,
-                local_align_weight=0.2,
-                phase=1,
-            )
+            args = self._metadata_args(root)
 
             metadata = build_msa_checkpoint_metadata(args)
             self.assertEqual(metadata["msa_data_mode"], "babel_sparse_global")
-            self.assertEqual(metadata["mean_path"], str(mean_path.resolve()))
-            self.assertEqual(metadata["std_path"], str(std_path.resolve()))
-            self.assertEqual(len(metadata["cache_manifest_sha256"]), 64)
-            validate_msa_checkpoint_metadata(metadata, args)
+            self.assertEqual(metadata["mean_path"], str(Path(args.msa_mean_path).resolve()))
+            self.assertEqual(metadata["std_path"], str(Path(args.msa_std_path).resolve()))
+            self.assertEqual(
+                metadata["train_cache_manifest_path"],
+                str(Path(args.babel_train_cache_manifest).resolve()),
+            )
+            self.assertEqual(
+                metadata["val_cache_manifest_path"],
+                str(Path(args.babel_val_cache_manifest).resolve()),
+            )
+            self.assertEqual(len(metadata["train_cache_manifest_sha256"]), 64)
+            self.assertEqual(len(metadata["val_cache_manifest_sha256"]), 64)
+            validate_msa_checkpoint_metadata(metadata, args, scope="training")
 
             wrong_mode = dict(metadata, msa_data_mode="humanml_full")
             with self.assertRaisesRegex(ValueError, "data mode"):
-                validate_msa_checkpoint_metadata(wrong_mode, args)
+                validate_msa_checkpoint_metadata(wrong_mode, args, scope="training")
+
+    def test_standalone_validation_requires_only_the_actual_validation_cache_identity(self):
+        from utils.eval_msa_vae_babel import (
+            build_msa_checkpoint_metadata,
+            validate_msa_checkpoint_metadata,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            training_args = self._metadata_args(root)
+            metadata = build_msa_checkpoint_metadata(training_args)
+            Path(training_args.babel_train_cache_manifest).unlink()
+            standalone_args = SimpleNamespace(**vars(training_args))
+            standalone_args.babel_train_cache_manifest = str(root / "not-present.json")
+
+            validate_msa_checkpoint_metadata(
+                metadata, standalone_args, scope="standalone"
+            )
+
+    def test_distributed_identity_rejects_a_rank_with_different_cache_hash(self):
+        from utils.eval_msa_vae_babel import (
+            build_msa_checkpoint_metadata,
+            validate_distributed_msa_identity,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            args = self._metadata_args(Path(temporary_directory))
+            metadata = build_msa_checkpoint_metadata(args)
+            remote = dict(
+                metadata,
+                train_cache_manifest_sha256="0" * 64,
+            )
+            with self.assertRaisesRegex(RuntimeError, "differ across ranks"):
+                validate_distributed_msa_identity(
+                    metadata, _IdentityAccelerator(remote)
+                )
+
+    def test_babel_phases_fail_closed_without_required_checkpoints(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        for phase, expected in (
+            (1, "Phase 1 requires"),
+            (2, "Phase 2 requires"),
+        ):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary_directory:
+                args = self._metadata_args(Path(temporary_directory), phase=phase)
+                with self.assertRaisesRegex(ValueError, expected):
+                    preflight_msa_training_assets(args, _IdentityAccelerator())
+
+    def test_missing_and_structurally_invalid_causal_checkpoints_fail_closed(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = self._metadata_args(root)
+            args.resume_cnn_pth = str(root / "missing-causal-tae.pth")
+            with self.assertRaisesRegex(FileNotFoundError, "resume CNN checkpoint"):
+                preflight_msa_training_assets(args, _IdentityAccelerator())
+
+            malformed = root / "malformed-causal-tae.pth"
+            torch.save({"net": {"unrelated.weight": torch.ones(1)}}, malformed)
+            args.resume_cnn_pth = str(malformed)
+            with self.assertRaisesRegex(ValueError, "Causal TAE"):
+                preflight_msa_training_assets(args, _IdentityAccelerator())
+
+    def test_phase_one_accepts_a_structurally_valid_causal_tae(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = self._metadata_args(root)
+            causal_checkpoint = root / "causal-tae.pth"
+            torch.save(
+                {
+                    "net": {
+                        "tae.encoder.input.weight": torch.ones(1),
+                        "tae.decoder.output.weight": torch.ones(1),
+                        "tae.decode_proj.weight": torch.ones(1),
+                    }
+                },
+                causal_checkpoint,
+            )
+            args.resume_cnn_pth = str(causal_checkpoint)
+
+            metadata, full_checkpoint = preflight_msa_training_assets(
+                args, _IdentityAccelerator()
+            )
+            self.assertEqual(metadata["phase"], 1)
+            self.assertIsNone(full_checkpoint)
+
+    def test_training_preflight_rejects_tagged_cross_domain_full_resumes(self):
+        from utils.eval_msa_vae_babel import (
+            build_msa_checkpoint_metadata,
+            preflight_msa_training_assets,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            babel_args = self._metadata_args(root / "babel")
+            human_args = self._metadata_args(root / "human", mode="humanml_full")
+            human_checkpoint = root / "human.pth"
+            torch.save(
+                {
+                    "net": {"weight": torch.tensor([1.0])},
+                    "metadata": build_msa_checkpoint_metadata(human_args),
+                },
+                human_checkpoint,
+            )
+            babel_args.resume_pth = str(human_checkpoint)
+            with self.assertRaisesRegex(ValueError, "data mode"):
+                preflight_msa_training_assets(
+                    babel_args, _IdentityAccelerator()
+                )
+
+            babel_checkpoint = root / "babel.pth"
+            torch.save(
+                {
+                    "net": {"weight": torch.tensor([2.0])},
+                    "metadata": build_msa_checkpoint_metadata(babel_args),
+                },
+                babel_checkpoint,
+            )
+            human_args.resume_pth = str(babel_checkpoint)
+            with self.assertRaisesRegex(ValueError, "data mode"):
+                preflight_msa_training_assets(
+                    human_args, _IdentityAccelerator()
+                )
+
+    def test_phase_two_accepts_a_matching_tagged_babel_full_resume(self):
+        from utils.eval_msa_vae_babel import (
+            build_msa_checkpoint_metadata,
+            preflight_msa_training_assets,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            phase_one_args = self._metadata_args(root, phase=1)
+            checkpoint_path = root / "phase-one.pth"
+            torch.save(
+                {
+                    "net": {"weight": torch.tensor([4.0])},
+                    "metadata": build_msa_checkpoint_metadata(phase_one_args),
+                },
+                checkpoint_path,
+            )
+            phase_two_args = SimpleNamespace(**vars(phase_one_args))
+            phase_two_args.phase = 2
+            phase_two_args.resume_pth = str(checkpoint_path)
+
+            metadata, checkpoint = preflight_msa_training_assets(
+                phase_two_args, _IdentityAccelerator()
+            )
+            self.assertEqual(metadata["phase"], 2)
+            self.assertEqual(checkpoint["net"]["weight"].item(), 4.0)
+
+    def test_tagged_babel_resume_rejects_changed_training_cache_identity(self):
+        from utils.eval_msa_vae_babel import (
+            build_msa_checkpoint_metadata,
+            preflight_msa_training_assets,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = self._metadata_args(root, phase=2)
+            checkpoint_path = root / "phase-one.pth"
+            torch.save(
+                {
+                    "net": {"weight": torch.tensor([6.0])},
+                    "metadata": build_msa_checkpoint_metadata(args),
+                },
+                checkpoint_path,
+            )
+            Path(args.babel_train_cache_manifest).write_text(
+                '{"split": "train", "generation": 2}'
+            )
+            args.resume_pth = str(checkpoint_path)
+
+            with self.assertRaisesRegex(ValueError, "train cache manifest identity"):
+                preflight_msa_training_assets(args, _IdentityAccelerator())
+
+    def test_humanml_training_preserves_legacy_untagged_full_resume(self):
+        from utils.eval_msa_vae_babel import preflight_msa_training_assets
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            args = self._metadata_args(root, mode="humanml_full", phase=2)
+            checkpoint_path = root / "legacy-humanml.pth"
+            torch.save({"net": {"weight": torch.tensor([5.0])}}, checkpoint_path)
+            args.resume_pth = str(checkpoint_path)
+
+            metadata, checkpoint = preflight_msa_training_assets(
+                args, _IdentityAccelerator()
+            )
+            self.assertEqual(metadata["msa_data_mode"], "humanml_full")
+            self.assertEqual(checkpoint["net"]["weight"].item(), 5.0)
 
 
 if __name__ == "__main__":

@@ -34,9 +34,9 @@ import options.option_msa_vae as option_msa_vae
 import utils.utils_model as utils_model
 from utils.msa_vae_alignment import distributed_masked_cosine_alignment
 from utils.eval_msa_vae_babel import (
-    build_msa_checkpoint_metadata,
     build_msa_training_loaders,
     evaluate_msa_vae_babel,
+    preflight_msa_training_assets,
     prepare_babel_validation_loader,
 )
 from humanml3d_272 import dataset_msa_vae
@@ -200,20 +200,16 @@ logger.info(f'Resolved MSA mean path: {os.path.realpath(args.msa_mean_path)}')
 logger.info(f'Resolved MSA std path: {os.path.realpath(args.msa_std_path)}')
 
 ##### ---- Dataloader ---- #####
+checkpoint_metadata, resume_checkpoint = preflight_msa_training_assets(
+    args, accelerator
+)
 train_loader, validation_loader, validation_backend = build_msa_training_loaders(args)
 babel_validation_dataset = (
     validation_loader.dataset
     if args.msa_data_mode == 'babel_sparse_global'
     else None
 )
-checkpoint_metadata = build_msa_checkpoint_metadata(args)
 logger.info(f'MSA validation backend: {validation_backend}')
-for checkpoint_label, checkpoint_path in (
-    ('resume CNN checkpoint', args.resume_cnn_pth),
-    ('resume MSA-VAE checkpoint', args.resume_pth),
-):
-    if checkpoint_path and not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(f'{checkpoint_label} not found: {os.path.realpath(checkpoint_path)}')
 
 ##### ---- Network ---- #####
 clip_range = [-30, 20]
@@ -272,7 +268,7 @@ if args.resume_cnn_pth:
 
 if args.resume_pth:
     logger.info(f'Resuming full MSA-VAE from {args.resume_pth}')
-    ckpt = torch.load(args.resume_pth, map_location='cpu')
+    ckpt = resume_checkpoint
     state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
     net.load_state_dict(state, strict=True)
 
