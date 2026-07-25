@@ -143,6 +143,40 @@ class MaskedDenseLossTest(unittest.TestCase):
             ),
         )
 
+    def test_sigma_estimation_weights_short_and_long_samples_equally(self):
+        target = torch.zeros(2, 3, 2)
+        short_first = torch.tensor(
+            [
+                [[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]],
+                [[2.0, 2.0], [2.0, 2.0], [2.0, 2.0]],
+            ]
+        )
+        repeated_first = torch.tensor(
+            [
+                [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+                [[2.0, 2.0], [2.0, 2.0], [2.0, 2.0]],
+            ]
+        )
+        short_mask = torch.tensor(
+            [[True, False, False], [True, True, True]]
+        )
+        repeated_mask = torch.ones(2, 3, dtype=torch.bool)
+
+        short_loss = masked_optimal_sigma_nll(
+            short_first,
+            target,
+            short_mask,
+            feature_slice=slice(None),
+        )
+        repeated_loss = masked_optimal_sigma_nll(
+            repeated_first,
+            target,
+            repeated_mask,
+            feature_slice=slice(None),
+        )
+
+        torch.testing.assert_close(short_loss, repeated_loss)
+
 
 class MaskedAlignmentTest(unittest.TestCase):
     def test_sample_alignment_uses_only_valid_samples(self):
@@ -172,6 +206,30 @@ class MaskedAlignmentTest(unittest.TestCase):
         )
 
         torch.testing.assert_close(loss, torch.tensor(0.0))
+
+    def test_token_alignment_weights_short_and_long_samples_equally(self):
+        pred = torch.tensor(
+            [
+                [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+                [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            ]
+        )
+        target = torch.tensor(
+            [
+                [[-1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+                [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            ]
+        )
+        mask = torch.tensor(
+            [
+                [True, False, False],
+                [True, True, True],
+            ]
+        )
+
+        loss = masked_cosine_alignment(pred, target, mask)
+
+        torch.testing.assert_close(loss, torch.tensor(1.0))
 
     def test_empty_alignment_mask_returns_differentiable_zero(self):
         pred = torch.randn(2, 3, requires_grad=True)
@@ -302,6 +360,25 @@ class ObjectiveCompositionTest(unittest.TestCase):
             outputs["clip_global_feat"].grad,
             torch.zeros_like(outputs["clip_global_feat"]),
         )
+
+    def test_latent_reconstruction_honors_decoupling_ablation_target(self):
+        outputs, targets, weights = self._fixture()
+        outputs["trans_latent_target"] = torch.full_like(
+            outputs["mu"],
+            2.0,
+        )
+
+        _, losses = compute_msa_vae_objective(
+            outputs,
+            targets,
+            phase=1,
+            batch_kind="full",
+            weights=weights,
+            stride_t=2,
+            down_t=2,
+        )
+
+        torch.testing.assert_close(losses["latent"], torch.tensor(4.0))
 
     def test_replay_schedule_is_deterministic(self):
         replay_steps = [

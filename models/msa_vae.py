@@ -337,12 +337,16 @@ class MSA_VAE(nn.Module):
         """Run deterministic CNN statistics and the semantic hierarchy only."""
         mu, logvar = self.encode_cnn_stats(x)
         key_padding_mask = self._latent_padding_mask(lengths, mu.size(1))
+        trans_latent_target = (
+            self.cnn_encoder.reparameterize(mu, logvar)
+            if self.disable_decoupling else mu
+        )
         h_cls, _ = self.encode_transformer(
-            mu, key_padding_mask=key_padding_mask
+            trans_latent_target, key_padding_mask=key_padding_mask
         )
         mu_recon = self.decode_transformer(
             h_cls,
-            seq_len=mu.size(1),
+            seq_len=trans_latent_target.size(1),
             tgt_key_padding_mask=key_padding_mask,
         )
         return {
@@ -350,7 +354,7 @@ class MSA_VAE(nn.Module):
             'logvar': logvar,
             'h_cls': h_cls,
             'mu_recon': mu_recon,
-            'trans_latent_target': mu,
+            'trans_latent_target': trans_latent_target,
             'clip_global_feat': self.global_proj(h_cls),
             'clip_local_feat': self.local_proj(mu),
         }

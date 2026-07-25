@@ -32,7 +32,7 @@ class CausalEncoderStatsTest(unittest.TestCase):
 
 class SemanticOnlyForwardTest(unittest.TestCase):
     @staticmethod
-    def _model():
+    def _model(disable_decoupling=False):
         return MSA_HumanVAE(
             hidden_size=16,
             down_t=2,
@@ -48,6 +48,7 @@ class SemanticOnlyForwardTest(unittest.TestCase):
             trans_ff_size=32,
             trans_dropout=0.0,
             clip_dim=16,
+            disable_decoupling=disable_decoupling,
         )
 
     def test_semantic_only_skips_cnn_decoder_and_masks_padded_latents(self):
@@ -90,6 +91,29 @@ class SemanticOnlyForwardTest(unittest.TestCase):
             second["h_cls"][0],
             atol=1e-5,
             rtol=1e-5,
+        )
+
+    def test_semantic_only_preserves_sampled_target_ablation(self):
+        class RaisingDecoder(nn.Module):
+            def forward(self, _):
+                raise AssertionError("CNN decoder must not run")
+
+        model = self._model(disable_decoupling=True)
+        model.msa_vae.cnn_decoder = RaisingDecoder()
+        model.eval()
+        torch.manual_seed(9)
+
+        output = model(
+            torch.randn(1, 64, 272),
+            lengths=torch.tensor([64]),
+            semantic_only=True,
+        )
+
+        self.assertFalse(
+            torch.allclose(
+                output["trans_latent_target"],
+                output["mu"],
+            )
         )
 
     def test_legacy_forward_and_state_dict_remain_compatible(self):

@@ -61,12 +61,17 @@ def _masked_per_sample_mean(values, valid_mask):
     return means.mean()
 
 
-def _masked_global_mean(values, valid_mask):
+def _masked_per_sample_values(values, valid_mask):
     mask = _expanded_mask(valid_mask, values)
-    count = mask.sum()
-    if count.item() == 0:
-        return values.sum() * 0.0
-    return (values * mask.to(values.dtype)).sum() / count.to(values.dtype)
+    reduce_dims = tuple(range(1, values.dim()))
+    counts = mask.sum(dim=reduce_dims)
+    valid_samples = counts > 0
+    totals = (values * mask.to(values.dtype)).sum(dim=reduce_dims)
+    means = torch.zeros_like(totals)
+    means[valid_samples] = (
+        totals[valid_samples] / counts[valid_samples].to(values.dtype)
+    )
+    return means, valid_samples
 
 
 def masked_mse(pred, target, valid_mask):
@@ -85,8 +90,13 @@ def masked_optimal_sigma_nll(pred, target, valid_mask, feature_slice):
     selected_pred = pred[..., feature_slice]
     selected_target = target[..., feature_slice]
     squared_error = (selected_target - selected_pred).pow(2)
-    mean_squared_error = _masked_global_mean(squared_error, valid_mask)
+    mean_squared_error, _ = _masked_per_sample_values(
+        squared_error, valid_mask
+    )
     sigma = mean_squared_error.sqrt().clamp_min(math.exp(-6))
+    sigma = sigma.view(
+        sigma.size(0), *([1] * (selected_pred.dim() - 1))
+    )
     log_sigma = sigma.log()
     nll = 0.5 * ((selected_target - selected_pred) / sigma).pow(2)
     nll = nll + log_sigma + 0.5 * math.log(2 * math.pi)
@@ -104,6 +114,8 @@ def masked_cosine_alignment(pred, target, valid_mask):
         )
     if not torch.any(mask):
         return pred.sum() * 0.0
+    if losses.dim() > 1:
+        return _masked_per_sample_mean(losses, mask)
     return losses[mask].mean()
 
 
@@ -148,8 +160,11 @@ def compute_msa_vae_objective(outputs, targets, phase, batch_kind, weights,
     )
     local_mask = latent_mask & targets['has_local'].bool().unsqueeze(1)
 
+    latent_target = outputs.get(
+        'trans_latent_target', outputs['mu']
+    ).detach()
     latent_loss = masked_mse(
-        outputs['mu_recon'], outputs['mu'].detach(), latent_mask
+        outputs['mu_recon'], latent_target, latent_mask
     )
     global_loss = masked_cosine_alignment(
         outputs['clip_global_feat'],
