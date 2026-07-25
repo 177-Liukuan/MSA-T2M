@@ -1,7 +1,9 @@
 import unittest
 
+import numpy as np
 import torch
 
+from utils.eval_trans import calculate_msa_length_bin_metrics
 from utils.msa_vae_training import (
     MSAVAELossWeights,
     compute_msa_vae_objective,
@@ -11,12 +13,23 @@ from utils.msa_vae_training import (
     masked_kl,
     masked_mse,
     masked_optimal_sigma_nll,
+    summarize_motion_length_bins,
     validate_sequence_training_config,
     valid_mask_from_lengths,
 )
 
 
 class MaskHelperTest(unittest.TestCase):
+    def test_motion_length_bins_follow_reporting_contract(self):
+        self.assertEqual(
+            summarize_motion_length_bins([4, 64, 65, 128, 129, 300]),
+            {
+                "up_to_64": 2,
+                "65_to_128": 2,
+                "over_128": 2,
+            },
+        )
+
     def test_latent_lengths_use_repeated_floor_division(self):
         lengths = torch.tensor([64, 68, 70])
 
@@ -50,6 +63,25 @@ class MaskHelperTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "nonnegative"):
             valid_mask_from_lengths(torch.tensor([-1]), 3)
+
+
+class LengthBinMetricTest(unittest.TestCase):
+    def test_single_sample_bin_reports_available_metrics_only(self):
+        text = [np.array([0.0, 0.0], dtype=np.float32)]
+        annotation = [np.array([0.0, 0.0], dtype=np.float32)]
+        prediction = [np.array([1.0, 0.0], dtype=np.float32)]
+
+        metrics = calculate_msa_length_bin_metrics(
+            text,
+            annotation,
+            prediction,
+        )
+
+        self.assertEqual(metrics["count"], 1)
+        self.assertTrue(np.isnan(metrics["fid"]))
+        np.testing.assert_allclose(metrics["r_pred"][0], 1.0)
+        self.assertTrue(np.isnan(metrics["r_pred"][1:]).all())
+        np.testing.assert_allclose(metrics["matching_pred"], 1.0)
 
 
 class MaskedDenseLossTest(unittest.TestCase):

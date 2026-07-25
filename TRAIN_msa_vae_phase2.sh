@@ -27,7 +27,7 @@ TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-t5}
 T5_EMBED_DIR=${T5_EMBED_DIR:-./humanml3d_272/t5_enc_single}
 CLIP_EMBED_DIR=${CLIP_EMBED_DIR:-./humanml3d_272/clip_enc_single}
 T5_MODEL_PATH=${T5_MODEL_PATH:-sentencet5-xxl/}
-PHASE1_DIR=${PHASE1_DIR:-Experiments/MSA_VAEv7_phase1_fullseq_t2m_272_t5_fulldb}
+PHASE1_DIR=${PHASE1_DIR:-Experiments/MSA_VAEv7_phase1_fullseq_${dataset_name}_${TEXT_ENCODER_TYPE}_fulldb}
 
 if [ "$TEXT_ENCODER_TYPE" = "t5" ]; then
   TEXT_EMBED_DIM=768

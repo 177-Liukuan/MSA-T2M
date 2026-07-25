@@ -4,7 +4,11 @@ from scipy import linalg
 from utils.face_z_align_util import rotation_6d_to_matrix
 import visualization.plot_3d_global as plot_3d
 import os
-from utils.msa_vae_training import save_msa_checkpoint
+from utils.msa_vae_training import (
+    MOTION_LENGTH_BIN_NAMES,
+    motion_length_bin,
+    save_msa_checkpoint,
+)
 
 def tensorborad_add_video_xyz(writer, xyz, nb_iter, tag, title_batch=None, outname=None, fps=30):
     xyz = xyz[:1]   
@@ -407,6 +411,43 @@ def calculate_frechet_feature_distance(feature_list1, feature_list2):
     return dist
 
 
+def calculate_msa_length_bin_metrics(text, annotation, prediction):
+    """Compute retrieval metrics inside one non-empty motion-length bin."""
+    count = len(prediction)
+    text = np.stack(text)
+    annotation = np.stack(annotation)
+    prediction = np.stack(prediction)
+
+    top_k = min(3, count)
+    r_real, matching_real = calculate_R_precision(
+        text, annotation, top_k=top_k, sum_all=True,
+    )
+    r_pred, matching_pred = calculate_R_precision(
+        text, prediction, top_k=top_k, sum_all=True,
+    )
+    padded_r_real = np.full(3, np.nan)
+    padded_r_pred = np.full(3, np.nan)
+    padded_r_real[:top_k] = r_real / count
+    padded_r_pred[:top_k] = r_pred / count
+
+    fid = np.nan
+    if count >= 2:
+        gt_mu, gt_cov = calculate_activation_statistics(annotation)
+        pred_mu, pred_cov = calculate_activation_statistics(prediction)
+        fid = calculate_frechet_distance(
+            gt_mu, gt_cov, pred_mu, pred_cov,
+        )
+
+    return {
+        'count': count,
+        'fid': fid,
+        'r_real': padded_r_real,
+        'r_pred': padded_r_pred,
+        'matching_real': matching_real / count,
+        'matching_pred': matching_pred / count,
+    }
+
+
 # ---------------------------------------------------------------------------
 #  MSA-VAE evaluation: MPJPE + FID + R_precision + Matching Score
 # ---------------------------------------------------------------------------
@@ -439,6 +480,16 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
         R_precision_pred = np.zeros(3)
         matching_score_real = 0.0
         matching_score_pred = 0.0
+        length_bins = {
+            name: {
+                'mpjpe_sum': 0.0,
+                'num_poses': 0,
+                'text': [],
+                'annotation': [],
+                'prediction': [],
+            }
+            for name in MOTION_LENGTH_BIN_NAMES
+        }
 
         nb_sample = 0
         mpjpe_sum = 0.0
@@ -455,6 +506,7 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
             bs, seq = motion.shape[:2]
 
             pred_pose_eval = torch.zeros((bs, seq, motion.shape[-1]), device=device)
+            batch_bin_names = []
 
             for i in range(bs):
                 pred_pose, _, _ = net(motion[i:i+1, :m_length[i]])
@@ -470,11 +522,17 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
                     pred_pose.detach().cpu().numpy())
                 pred_xyz = recover_from_local_position(pred_np.squeeze(0), num_joints)
 
-                mpjpe_sum += torch.sum(calculate_mpjpe(
+                sample_mpjpe_sum = torch.sum(calculate_mpjpe(
                     torch.from_numpy(pose_xyz).float().to(device),
                     torch.from_numpy(pred_xyz).float().to(device),
                 )).item()
+                mpjpe_sum += sample_mpjpe_sum
                 num_poses += pose_xyz.shape[0]
+
+                bin_name = motion_length_bin(m_length[i])
+                batch_bin_names.append(bin_name)
+                length_bins[bin_name]['mpjpe_sum'] += sample_mpjpe_sum
+                length_bins[bin_name]['num_poses'] += pose_xyz.shape[0]
 
                 if len(draw_org) < 4:
                     draw_org.append(torch.from_numpy(pose_xyz).float())
@@ -485,19 +543,30 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
             et = textencoder(text).loc                            # (B, 256)
             em = motionencoder(motion, m_length).loc              # (B, 256)
             em_pred = motionencoder(pred_pose_eval, m_length).loc
+            et_np = et.cpu().numpy()
+            em_np = em.cpu().numpy()
+            em_pred_np = em_pred.cpu().numpy()
 
-            motion_annotation_list.append(em.cpu().numpy())
-            motion_pred_list.append(em_pred.cpu().numpy())
+            motion_annotation_list.append(em_np)
+            motion_pred_list.append(em_pred_np)
+            for sample_index, bin_name in enumerate(batch_bin_names):
+                length_bins[bin_name]['text'].append(et_np[sample_index])
+                length_bins[bin_name]['annotation'].append(
+                    em_np[sample_index]
+                )
+                length_bins[bin_name]['prediction'].append(
+                    em_pred_np[sample_index]
+                )
 
             # R_precision & matching score - GT pairs
             temp_R, temp_match = calculate_R_precision(
-                et.cpu().numpy(), em.cpu().numpy(), top_k=3, sum_all=True)
+                et_np, em_np, top_k=3, sum_all=True)
             R_precision_real += temp_R
             matching_score_real += temp_match
 
             # R_precision & matching score - reconstructed pairs
             temp_R, temp_match = calculate_R_precision(
-                et.cpu().numpy(), em_pred.cpu().numpy(), top_k=3, sum_all=True)
+                et_np, em_pred_np, top_k=3, sum_all=True)
             R_precision_pred += temp_R
             matching_score_pred += temp_match
 
@@ -523,6 +592,60 @@ def evaluation_msa_vae_multi(out_dir, val_loader_t2m, net, logger, writer,
                f"R@2 {R_precision_pred[1]:.4f}, R@3 {R_precision_pred[2]:.4f}, "
                f"MM-dist {matching_score_pred:.4f} (real {matching_score_real:.4f})")
         logger.info(msg)
+
+        for bin_name, bin_values in length_bins.items():
+            count = len(bin_values['prediction'])
+            if count == 0:
+                logger.info(
+                    f"--> \t Eva. Iter {nb_iter} [{bin_name}]: "
+                    f"count 0"
+                )
+                continue
+            bin_metrics = calculate_msa_length_bin_metrics(
+                bin_values['text'],
+                bin_values['annotation'],
+                bin_values['prediction'],
+            )
+            bin_mpjpe = (
+                bin_values['mpjpe_sum']
+                / bin_values['num_poses']
+                * 1000
+            )
+            logger.info(
+                f"--> \t Eva. Iter {nb_iter} [{bin_name}]: "
+                f"count {count}, FID {bin_metrics['fid']:.4f}, "
+                f"MPJPE {bin_mpjpe:.3f}mm, "
+                f"R@1 {bin_metrics['r_pred'][0]:.4f}, "
+                f"R@2 {bin_metrics['r_pred'][1]:.4f}, "
+                f"R@3 {bin_metrics['r_pred'][2]:.4f}, "
+                f"MM-dist {bin_metrics['matching_pred']:.4f}"
+            )
+            writer.add_scalar(
+                f'./TestByLength/{bin_name}/count', count, nb_iter,
+            )
+            writer.add_scalar(
+                f'./TestByLength/{bin_name}/mpjpe', bin_mpjpe, nb_iter,
+            )
+            if np.isfinite(bin_metrics['fid']):
+                writer.add_scalar(
+                    f'./TestByLength/{bin_name}/FID',
+                    bin_metrics['fid'],
+                    nb_iter,
+                )
+            for top_index, value in enumerate(
+                    bin_metrics['r_pred'], start=1):
+                if np.isfinite(value):
+                    writer.add_scalar(
+                        f'./TestByLength/{bin_name}/R_precision_top'
+                        f'{top_index}',
+                        value,
+                        nb_iter,
+                    )
+            writer.add_scalar(
+                f'./TestByLength/{bin_name}/matching_score',
+                bin_metrics['matching_pred'],
+                nb_iter,
+            )
 
         writer.add_scalar('./Test/mpjpe', mpjpe, nb_iter)
         writer.add_scalar('./Test/FID', fid, nb_iter)

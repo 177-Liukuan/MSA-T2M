@@ -6,7 +6,7 @@ embeddings (BABEL frame-level, 20fps->30fps upsampled) for the HumanML3D∩BABEL
 intersection (train_ft.txt).
 
 Each __getitem__ returns:
-  motion:              (window_size, 272) - normalized motion window
+  motion:              (T, 272) - normalized window or complete motion
   global_text:         str - randomly chosen HumanML3D caption for this sample
   global_text_embed:   (D,) - precomputed global text embedding (offline)
   has_global_embed:    bool - whether offline global embedding is available
@@ -92,7 +92,13 @@ class MSAVAEDataset(data.Dataset):
         for name in tqdm(id_list, desc='Loading MSA-VAE data'):
             try:
                 motion = np.load(pjoin(self.motion_dir, name + '.npy'))
-                if motion.shape[0] < self.window_size:
+                if motion.shape[0] < self.unit_length:
+                    raise MotionSequenceTooShortError(
+                        f'Motion {name} has {motion.shape[0]} frames, fewer '
+                        f'than one {self.unit_length}-frame latent unit'
+                    )
+                if (self.sequence_mode == 'window'
+                        and motion.shape[0] < self.window_size):
                     continue
 
                 text_path = pjoin(self.text_dir, name + '.txt')
@@ -160,7 +166,14 @@ class MSAVAEDataset(data.Dataset):
                     'has_global': has_global,
                 }
                 self.data.append(entry)
-                self.lengths.append(motion.shape[0] - self.window_size)
+                if self.sequence_mode == 'window':
+                    self.lengths.append(
+                        motion.shape[0] - self.window_size + 1
+                    )
+                else:
+                    self.lengths.append(1)
+            except MotionSequenceTooShortError:
+                raise
             except Exception:
                 pass
 
@@ -255,6 +268,10 @@ class MSAVAEDataset(data.Dataset):
             local_text_pooled.astype(np.float32),
             motion_length,
         )
+
+
+class MotionSequenceTooShortError(ValueError):
+    """A motion cannot produce even one complete temporal latent token."""
 
 
 class MSAVAESequenceView(data.Dataset):

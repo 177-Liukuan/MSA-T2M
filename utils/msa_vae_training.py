@@ -10,6 +10,33 @@ import torch
 import torch.nn.functional as F
 
 
+MOTION_LENGTH_BIN_NAMES = (
+    'up_to_64',
+    '65_to_128',
+    'over_128',
+)
+
+
+def motion_length_bin(length):
+    """Return the reporting bin for a motion length in frames."""
+    length = int(length)
+    if length < 0:
+        raise ValueError('motion length must be nonnegative')
+    if length <= 64:
+        return MOTION_LENGTH_BIN_NAMES[0]
+    if length <= 128:
+        return MOTION_LENGTH_BIN_NAMES[1]
+    return MOTION_LENGTH_BIN_NAMES[2]
+
+
+def summarize_motion_length_bins(lengths):
+    """Count motions in the standard short/medium/long reporting bins."""
+    counts = {name: 0 for name in MOTION_LENGTH_BIN_NAMES}
+    for length in lengths:
+        counts[motion_length_bin(length)] += 1
+    return counts
+
+
 class MSAVAELossWeights(NamedTuple):
     root: float
     latent: float
@@ -296,6 +323,7 @@ def build_msa_checkpoint_metadata(args):
         'window_replay_interval': int(args.window_replay_interval),
         'down_t': int(args.down_t),
         'stride_t': int(args.stride_t),
+        'unit_length': int(args.stride_t) ** int(args.down_t),
         'latent_dim': int(args.latent_dim),
         'normalized_loss_version': 1,
     }
@@ -318,6 +346,18 @@ def validate_msa_checkpoint_metadata(metadata, args):
                 f'checkpoint {field}={actual} does not match requested '
                 f'{field}={expected}'
             )
+    expected_unit_length = int(args.stride_t) ** int(args.down_t)
+    actual_unit_length = int(
+        metadata.get(
+            'unit_length',
+            int(metadata['stride_t']) ** int(metadata['down_t']),
+        )
+    )
+    if actual_unit_length != expected_unit_length:
+        raise ValueError(
+            f'checkpoint unit_length={actual_unit_length} does not match '
+            f'requested unit_length={expected_unit_length}'
+        )
 
 
 def save_msa_checkpoint(path, model, metadata=None):

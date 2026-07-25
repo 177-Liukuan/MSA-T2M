@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,79 @@ class FullSequenceDatasetTest(unittest.TestCase):
     def test_invalid_sequence_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "sequence_mode"):
             self.dataset.get_item(0, "prefix")
+
+    def test_full_dataset_keeps_motion_shorter_than_window(self):
+        root = Path(self.temp_dir.name)
+        data_root = root / "humanml3d_272"
+        for directory in ("motion_data", "texts", "mean_std", "split"):
+            (data_root / directory).mkdir(parents=True, exist_ok=True)
+        np.save(
+            data_root / "motion_data" / "short.npy",
+            np.zeros((20, 272), dtype=np.float32),
+        )
+        np.save(
+            data_root / "mean_std" / "Mean.npy",
+            np.zeros(272, dtype=np.float32),
+        )
+        np.save(
+            data_root / "mean_std" / "Std.npy",
+            np.ones(272, dtype=np.float32),
+        )
+        (data_root / "texts" / "short.txt").write_text(
+            "take two steps#tokens#0#0\n",
+            encoding="utf-8",
+        )
+        (data_root / "split" / "train.txt").write_text(
+            "short\n",
+            encoding="utf-8",
+        )
+
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(root)
+            dataset = MSAVAEDataset(
+                "t2m_272",
+                window_size=64,
+                unit_length=4,
+                use_ft_split=False,
+                text_encoder_type="clip",
+                text_embed_dim=2,
+                sequence_mode="full",
+            )
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertEqual(len(dataset), 1)
+        self.assertEqual(dataset[0][0].shape, (20, 272))
+
+        np.save(
+            data_root / "motion_data" / "too_short.npy",
+            np.zeros((3, 272), dtype=np.float32),
+        )
+        (data_root / "texts" / "too_short.txt").write_text(
+            "move#tokens#0#0\n",
+            encoding="utf-8",
+        )
+        (data_root / "split" / "train.txt").write_text(
+            "too_short\n",
+            encoding="utf-8",
+        )
+        try:
+            os.chdir(root)
+            with self.assertRaisesRegex(
+                    dataset_msa_vae.MotionSequenceTooShortError,
+                    "one 4-frame latent unit"):
+                MSAVAEDataset(
+                    "t2m_272",
+                    window_size=64,
+                    unit_length=4,
+                    use_ft_split=False,
+                    text_encoder_type="clip",
+                    text_embed_dim=2,
+                    sequence_mode="full",
+                )
+        finally:
+            os.chdir(previous_cwd)
 
 
 class FullSequenceCollateTest(unittest.TestCase):

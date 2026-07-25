@@ -123,6 +123,20 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             self._value_after(arguments, "--exp-name"),
         )
 
+    def test_phase2_default_phase1_path_matches_text_encoder(self):
+        arguments = self._run_launcher(
+            "TRAIN_msa_vae_phase2.sh",
+            {
+                "TEXT_ENCODER_TYPE": "clip",
+            },
+        )
+
+        self.assertEqual(
+            self._value_after(arguments, "--resume-pth"),
+            "Experiments/MSA_VAEv7_phase1_fullseq_t2m_272_clip_fulldb/"
+            "net_last.pth",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

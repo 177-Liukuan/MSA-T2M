@@ -130,6 +130,8 @@ class CheckpointMetadataTest(unittest.TestCase):
         model = nn.Linear(3, 2)
         metadata = build_msa_checkpoint_metadata(self._args())
 
+        self.assertEqual(metadata["unit_length"], 4)
+
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "checkpoint.pth"
             save_msa_checkpoint(path, model, metadata)
@@ -163,6 +165,14 @@ class CheckpointMetadataTest(unittest.TestCase):
                         metadata,
                         self._args(**{field: value}),
                     )
+
+        incompatible_unit = dict(metadata)
+        incompatible_unit["unit_length"] = 8
+        with self.assertRaisesRegex(ValueError, "unit_length"):
+            validate_msa_checkpoint_metadata(
+                incompatible_unit,
+                self._args(),
+            )
 
     def test_legacy_checkpoint_without_metadata_is_accepted(self):
         validate_msa_checkpoint_metadata(None, self._args())
