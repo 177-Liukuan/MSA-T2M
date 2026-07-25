@@ -1,10 +1,31 @@
 import ast
 from pathlib import Path
+import subprocess
 import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPLORATIONS = REPO_ROOT / "explorations"
+
+
+def tracked_exploration_shell_files():
+    """Return launchers owned by this repository, excluding local archives."""
+    completed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "explorations"],
+        cwd=REPO_ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return [
+        REPO_ROOT / relative_path.decode("utf-8")
+        for relative_path in completed.stdout.split(b"\0")
+        if relative_path
+        and (
+            relative_path.endswith(b".sh")
+            or relative_path.endswith(b".sh.bak")
+        )
+    ]
+
 
 MOVED_PYTHON_TARGETS = {
     "ablations/no_rag/DEMO_msa_t2m_no_rag_t5.sh":
@@ -109,8 +130,7 @@ MOVED_CHECKPOINT_REFERENCES = {
 
 class ExplorationLauncherTest(unittest.TestCase):
     def test_shell_launchers_enter_repository_root(self):
-        shell_files = list(EXPLORATIONS.rglob("*.sh"))
-        shell_files.extend(EXPLORATIONS.rglob("*.sh.bak"))
+        shell_files = tracked_exploration_shell_files()
         self.assertTrue(shell_files)
         for path in shell_files:
             content = path.read_text()
