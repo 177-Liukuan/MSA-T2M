@@ -6,7 +6,7 @@ embeddings (BABEL frame-level, 20fps->30fps upsampled) for the HumanML3D∩BABEL
 intersection (train_ft.txt).
 
 Each __getitem__ returns:
-  motion:              (window_size, 272) - normalized motion window
+  motion:              (T, 272) - normalized window or complete motion
   global_text:         str - randomly chosen HumanML3D caption for this sample
   global_text_embed:   (D,) - precomputed global text embedding (offline)
   has_global_embed:    bool - whether offline global embedding is available
@@ -20,6 +20,7 @@ import numpy as np
 from os.path import join as pjoin
 import os
 import random
+import math
 import codecs as cs
 from tqdm import tqdm
 
@@ -29,9 +30,15 @@ class MSAVAEDataset(data.Dataset):
                  use_ft_split=True, text_encoder_type='clip',
                  clip_embed_dir=None, t5_embed_dir=None, text_embed_dim=None,
                  use_offline_global_text=True,
-                 clip_global_embed_dir=None, t5_global_embed_dir=None):
+                 clip_global_embed_dir=None, t5_global_embed_dir=None,
+                 sequence_mode='window'):
+        if sequence_mode not in ('window', 'full'):
+            raise ValueError(
+                f'sequence_mode must be window/full, got {sequence_mode}'
+            )
         self.window_size = window_size
         self.unit_length = unit_length
+        self.sequence_mode = sequence_mode
         self.dataset_name = dataset_name
         self.text_encoder_type = text_encoder_type.lower()
         self.use_offline_global_text = use_offline_global_text
@@ -85,7 +92,13 @@ class MSAVAEDataset(data.Dataset):
         for name in tqdm(id_list, desc='Loading MSA-VAE data'):
             try:
                 motion = np.load(pjoin(self.motion_dir, name + '.npy'))
-                if motion.shape[0] < self.window_size:
+                if motion.shape[0] < self.unit_length:
+                    raise MotionSequenceTooShortError(
+                        f'Motion {name} has {motion.shape[0]} frames, fewer '
+                        f'than one {self.unit_length}-frame latent unit'
+                    )
+                if (self.sequence_mode == 'window'
+                        and motion.shape[0] < self.window_size):
                     continue
 
                 text_path = pjoin(self.text_dir, name + '.txt')
@@ -153,7 +166,14 @@ class MSAVAEDataset(data.Dataset):
                     'has_global': has_global,
                 }
                 self.data.append(entry)
-                self.lengths.append(motion.shape[0] - self.window_size)
+                if self.sequence_mode == 'window':
+                    self.lengths.append(
+                        motion.shape[0] - self.window_size + 1
+                    )
+                else:
+                    self.lengths.append(1)
+            except MotionSequenceTooShortError:
+                raise
             except Exception:
                 pass
 
@@ -175,12 +195,30 @@ class MSAVAEDataset(data.Dataset):
         return len(self.data)
 
     def __getitem__(self, item):
+        return self.get_item(item, self.sequence_mode)
+
+    def get_item(self, item, sequence_mode):
+        if sequence_mode not in ('window', 'full'):
+            raise ValueError(
+                f'sequence_mode must be window/full, got {sequence_mode}'
+            )
+
         entry = self.data[item]
         motion = entry['motion']
 
-        idx = random.randint(0, len(motion) - self.window_size)
-        motion_window = motion[idx:idx + self.window_size]
-        motion_window = (motion_window - self.mean) / self.std
+        if sequence_mode == 'window':
+            motion_length = self.window_size
+            idx = random.randint(0, len(motion) - motion_length)
+        else:
+            motion_length = (len(motion) // self.unit_length) * self.unit_length
+            if motion_length < self.unit_length:
+                raise ValueError(
+                    f'Motion {entry["name"]} is too short for one latent token'
+                )
+            idx = 0
+
+        motion_view = motion[idx:idx + motion_length]
+        motion_view = (motion_view - self.mean) / self.std
 
         # sample one global caption and its line index
         cidx = random.randint(0, len(entry['captions']) - 1)
@@ -189,16 +227,16 @@ class MSAVAEDataset(data.Dataset):
 
         # local frame-level text embeddings
         has_local = entry['has_local']
-        latent_len = self.window_size // self.unit_length
+        latent_len = motion_length // self.unit_length
         if has_local:
             local_text_20 = np.load(entry['local_text_path'])  # (T_20fps, D)
             T_20 = local_text_20.shape[0]
             T_30 = len(motion)
             indices_30 = np.round(np.linspace(0, T_20 - 1, T_30)).astype(int)
             local_text_30 = local_text_20[indices_30]
-            local_text_window = local_text_30[idx:idx + self.window_size]  # (window, D)
-            local_text_pooled = local_text_window.mean(axis=0)  # (D,)
-            local_text_latent = _pool_to_latent(local_text_window, latent_len)
+            local_text_view = local_text_30[idx:idx + motion_length]
+            local_text_pooled = local_text_view.mean(axis=0)  # (D,)
+            local_text_latent = _pool_to_latent(local_text_view, latent_len)
         else:
             local_text_latent = np.zeros((latent_len, self.text_embed_dim), dtype=np.float32)
             local_text_pooled = np.zeros((self.text_embed_dim,), dtype=np.float32)
@@ -220,7 +258,7 @@ class MSAVAEDataset(data.Dataset):
             global_text_embed = np.zeros((self.text_embed_dim,), dtype=np.float32)
 
         return (
-            motion_window.astype(np.float32),
+            motion_view.astype(np.float32),
             caption,
             global_text_embed.astype(np.float32),
             has_global,
@@ -228,7 +266,89 @@ class MSAVAEDataset(data.Dataset):
             has_local,
             len(motion),
             local_text_pooled.astype(np.float32),
+            motion_length,
         )
+
+
+class MotionSequenceTooShortError(ValueError):
+    """A motion cannot produce even one complete temporal latent token."""
+
+
+class MSAVAESequenceView(data.Dataset):
+    """Select a sequence view without duplicating the loaded source records."""
+
+    def __init__(self, dataset, sequence_mode):
+        if sequence_mode not in ('window', 'full'):
+            raise ValueError(
+                f'sequence_mode must be window/full, got {sequence_mode}'
+            )
+        self.dataset = dataset
+        self.sequence_mode = sequence_mode
+
+    @property
+    def source_lengths(self):
+        if self.sequence_mode == 'window':
+            return [self.dataset.window_size] * len(self.dataset)
+        return [
+            (len(entry['motion']) // self.dataset.unit_length)
+            * self.dataset.unit_length
+            for entry in self.dataset.data
+        ]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, item):
+        return self.dataset.get_item(item, self.sequence_mode)
+
+
+class LengthBucketBatchSampler(torch.utils.data.Sampler):
+    """Shuffle similarly sized sequences together to limit padding."""
+
+    def __init__(self, lengths, batch_size, bucket_size, drop_last=True,
+                 seed=123):
+        if batch_size < 1:
+            raise ValueError('batch_size must be positive')
+        if bucket_size < 1:
+            raise ValueError('bucket_size must be positive')
+        self.lengths = [int(length) for length in lengths]
+        self.batch_size = int(batch_size)
+        self.bucket_size = max(int(bucket_size), self.batch_size)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _bucket_sizes(self):
+        return [
+            min(self.bucket_size, len(self.lengths) - start)
+            for start in range(0, len(self.lengths), self.bucket_size)
+        ]
+
+    def __len__(self):
+        if self.drop_last:
+            return sum(size // self.batch_size for size in self._bucket_sizes())
+        return sum(
+            math.ceil(size / self.batch_size) for size in self._bucket_sizes()
+        )
+
+    def __iter__(self):
+        generator = random.Random(self.seed + self.epoch)
+        sorted_indices = sorted(
+            range(len(self.lengths)), key=self.lengths.__getitem__
+        )
+        batches = []
+        for start in range(0, len(sorted_indices), self.bucket_size):
+            bucket = sorted_indices[start:start + self.bucket_size]
+            generator.shuffle(bucket)
+            for batch_start in range(0, len(bucket), self.batch_size):
+                batch = bucket[batch_start:batch_start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+        generator.shuffle(batches)
+        return iter(batches)
 
 
 def _pool_to_latent(text_window, latent_len):
@@ -244,15 +364,62 @@ def _pool_to_latent(text_window, latent_len):
 
 
 def collate_fn(batch):
-    motions, captions, global_texts, has_globals, local_texts, has_locals, total_frames, local_pooled = zip(*batch)
-    motions = torch.from_numpy(np.stack(motions))
+    (motions, captions, global_texts, has_globals, local_texts, has_locals,
+     total_frames, local_pooled, motion_lengths) = zip(*batch)
+
+    max_motion_len = max(motion.shape[0] for motion in motions)
+    motion_dim = motions[0].shape[1]
+    motion_batch = torch.zeros(
+        len(motions), max_motion_len, motion_dim, dtype=torch.float32
+    )
+    for index, motion in enumerate(motions):
+        motion_batch[index, :motion.shape[0]] = torch.from_numpy(motion)
+
+    max_local_len = max(local.shape[0] for local in local_texts)
+    text_dim = local_texts[0].shape[1]
+    local_batch = torch.zeros(
+        len(local_texts), max_local_len, text_dim, dtype=torch.float32
+    )
+    for index, local in enumerate(local_texts):
+        local_batch[index, :local.shape[0]] = torch.from_numpy(local)
+
     global_texts = torch.from_numpy(np.stack(global_texts))
     has_globals = torch.tensor(has_globals, dtype=torch.bool)
-    local_texts = torch.from_numpy(np.stack(local_texts))
     has_locals = torch.tensor(has_locals, dtype=torch.bool)
     total_frames = torch.tensor(total_frames, dtype=torch.long)
     local_pooled = torch.from_numpy(np.stack(local_pooled))
-    return motions, list(captions), global_texts, has_globals, local_texts, has_locals, total_frames, local_pooled
+    motion_lengths = torch.tensor(motion_lengths, dtype=torch.long)
+    return (
+        motion_batch, list(captions), global_texts, has_globals,
+        local_batch, has_locals, total_frames, local_pooled, motion_lengths,
+    )
+
+
+def make_loader(dataset, sequence_mode, batch_size, num_workers=8,
+                bucket_size=0, drop_last=True, seed=123):
+    view = MSAVAESequenceView(dataset, sequence_mode)
+    if sequence_mode == 'full' and bucket_size > 0:
+        batch_sampler = LengthBucketBatchSampler(
+            view.source_lengths,
+            batch_size=batch_size,
+            bucket_size=bucket_size,
+            drop_last=drop_last,
+            seed=seed,
+        )
+        return torch.utils.data.DataLoader(
+            view,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+        )
+    return torch.utils.data.DataLoader(
+        view,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        drop_last=drop_last,
+    )
 
 
 def DATALoader(dataset_name, batch_size, num_workers=8,
@@ -260,7 +427,9 @@ def DATALoader(dataset_name, batch_size, num_workers=8,
                text_encoder_type='clip', clip_embed_dir=None,
                t5_embed_dir=None, text_embed_dim=None,
                use_offline_global_text=True,
-               clip_global_embed_dir=None, t5_global_embed_dir=None):
+               clip_global_embed_dir=None, t5_global_embed_dir=None,
+               sequence_mode='window', bucket_size=0, drop_last=True,
+               seed=123):
     trainSet = MSAVAEDataset(
         dataset_name, window_size=window_size,
         unit_length=unit_length, use_ft_split=use_ft_split,
@@ -271,18 +440,27 @@ def DATALoader(dataset_name, batch_size, num_workers=8,
         use_offline_global_text=use_offline_global_text,
         clip_global_embed_dir=clip_global_embed_dir,
         t5_global_embed_dir=t5_global_embed_dir,
+        sequence_mode=sequence_mode,
     )
-    train_loader = torch.utils.data.DataLoader(
-        trainSet, batch_size,
-        shuffle=True,
+    return make_loader(
+        trainSet,
+        sequence_mode=sequence_mode,
+        batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=collate_fn,
-        drop_last=True,
+        bucket_size=bucket_size,
+        drop_last=drop_last,
+        seed=seed,
     )
-    return train_loader
 
 
 def cycle(iterable):
+    epoch = 0
     while True:
+        if hasattr(iterable, 'set_epoch'):
+            iterable.set_epoch(epoch)
+        elif hasattr(iterable, 'batch_sampler') and hasattr(
+                iterable.batch_sampler, 'set_epoch'):
+            iterable.batch_sampler.set_epoch(epoch)
         for x in iterable:
             yield x
+        epoch += 1

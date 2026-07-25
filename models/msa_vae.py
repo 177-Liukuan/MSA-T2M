@@ -273,6 +273,11 @@ class MSA_VAE(nn.Module):
         z_local, mu, logvar = self.cnn_encoder(x_in)
         return z_local, mu, logvar
 
+    def encode_cnn_stats(self, x):
+        """Raw motion -> deterministic posterior parameters."""
+        x_in = self.preprocess(x)
+        return self.cnn_encoder.encode_stats(x_in)
+
     def encode_transformer(self, z_local, key_padding_mask=None):
         """Local latents -> global [CLS] via Transformer Encoder.
         Args:
@@ -316,6 +321,44 @@ class MSA_VAE(nn.Module):
         """Decode from given latent tokens (for inference / generation)."""
         return self.decode_cnn(z)
 
+    def _latent_padding_mask(self, lengths, max_len):
+        if lengths is None:
+            return None
+        latent_lengths = lengths.long()
+        for _ in range(self.down_t):
+            latent_lengths = torch.div(
+                latent_lengths,
+                self.stride_t,
+                rounding_mode='floor',
+            )
+        return self.lengths_to_mask(latent_lengths, max_len)
+
+    def forward_semantic(self, x, lengths=None):
+        """Run deterministic CNN statistics and the semantic hierarchy only."""
+        mu, logvar = self.encode_cnn_stats(x)
+        key_padding_mask = self._latent_padding_mask(lengths, mu.size(1))
+        trans_latent_target = (
+            self.cnn_encoder.reparameterize(mu, logvar)
+            if self.disable_decoupling else mu
+        )
+        h_cls, _ = self.encode_transformer(
+            trans_latent_target, key_padding_mask=key_padding_mask
+        )
+        mu_recon = self.decode_transformer(
+            h_cls,
+            seq_len=trans_latent_target.size(1),
+            tgt_key_padding_mask=key_padding_mask,
+        )
+        return {
+            'mu': mu,
+            'logvar': logvar,
+            'h_cls': h_cls,
+            'mu_recon': mu_recon,
+            'trans_latent_target': trans_latent_target,
+            'clip_global_feat': self.global_proj(h_cls),
+            'clip_local_feat': self.local_proj(mu),
+        }
+
     # ------------------------------------------------------------------
     #  Forward
     # ------------------------------------------------------------------
@@ -342,14 +385,9 @@ class MSA_VAE(nn.Module):
         z_local, mu, logvar = self.encode_cnn(x)
 
         # --- Build padding mask for latent tokens ---
-        if lengths is not None:
-            # CNN downsamples time by stride_t for each down_t layer
-            latent_lengths = lengths
-            for _ in range(self.down_t):
-                latent_lengths = (latent_lengths + self.stride_t - 1) // self.stride_t
-            key_padding_mask = self.lengths_to_mask(latent_lengths, z_local.size(1))
-        else:
-            key_padding_mask = None
+        key_padding_mask = self._latent_padding_mask(
+            lengths, z_local.size(1)
+        )
 
         # --- Semantic track: Transformer AE input/target switch for decoupling ablation ---
         trans_latent_target = z_local if self.disable_decoupling else mu
@@ -434,8 +472,10 @@ class MSA_HumanVAE(nn.Module):
         """Returns (z_local, mu, logvar, h_cls)."""
         return self.msa_vae.encode(x, key_padding_mask=key_padding_mask)
 
-    def forward(self, x, lengths=None):
+    def forward(self, x, lengths=None, semantic_only=False):
         """Returns full output dict from MSA_VAE."""
+        if semantic_only:
+            return self.msa_vae.forward_semantic(x, lengths=lengths)
         return self.msa_vae(x, lengths=lengths)
 
     def forward_decoder(self, z):

@@ -15,12 +15,19 @@
 NUM_GPUS=${1:-1}
 dataset_name=${2:-t2m_272}
 BATCH_SIZE=$((128 / NUM_GPUS))
+DEFAULT_FULL_SEQ_BATCH_SIZE=$((16 / NUM_GPUS))
+if [ "$DEFAULT_FULL_SEQ_BATCH_SIZE" -lt 1 ]; then
+  DEFAULT_FULL_SEQ_BATCH_SIZE=1
+fi
+FULL_SEQ_BATCH_SIZE=${FULL_SEQ_BATCH_SIZE:-$DEFAULT_FULL_SEQ_BATCH_SIZE}
+WINDOW_REPLAY_INTERVAL=${WINDOW_REPLAY_INTERVAL:-4}
+LENGTH_BUCKET_SIZE=${LENGTH_BUCKET_SIZE:-256}
 
 TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-t5}
 T5_EMBED_DIR=${T5_EMBED_DIR:-./humanml3d_272/t5_enc_single}
 CLIP_EMBED_DIR=${CLIP_EMBED_DIR:-./humanml3d_272/clip_enc_single}
 T5_MODEL_PATH=${T5_MODEL_PATH:-sentencet5-xxl/}
-PHASE1_DIR=${PHASE1_DIR:-Experiments/MSA_VAEv6_phase1_t2m_272_t5_alpha0_662048_fulldb}
+PHASE1_DIR=${PHASE1_DIR:-Experiments/MSA_VAEv7_phase1_fullseq_${dataset_name}_${TEXT_ENCODER_TYPE}_fulldb}
 
 if [ "$TEXT_ENCODER_TYPE" = "t5" ]; then
   TEXT_EMBED_DIM=768
@@ -30,12 +37,15 @@ fi
 
 # Phase 1 output directory (must contain net_last.pth)
 PHASE1_DIR=${PHASE1_DIR:?"ERROR: set PHASE1_DIR to Phase 1 output directory"}
-RESUME_PTH="${PHASE1_DIR}/net_best_fid.pth"
+RESUME_PTH="${PHASE1_DIR}/net_last.pth"
 
 echo "========== MSA-VAE Phase 2: Full Fine-tune =========="
 echo "GPUs            : $NUM_GPUS"
 echo "Dataset         : $dataset_name"
 echo "Batch per GPU   : $BATCH_SIZE"
+echo "Full batch/GPU  : $FULL_SEQ_BATCH_SIZE"
+echo "Replay interval : $WINDOW_REPLAY_INTERVAL"
+echo "Length bucket   : $LENGTH_BUCKET_SIZE"
 echo "Text encoder    : $TEXT_ENCODER_TYPE"
 echo "Text dim        : $TEXT_EMBED_DIM"
 echo "Phase1 ckpt     : $RESUME_PTH"
@@ -48,6 +58,10 @@ accelerate launch --num_processes $NUM_GPUS --mixed_precision bf16 \
   --phase 2 \
   --cnn_lr_scale 0.1 \
   --batch-size $BATCH_SIZE \
+  --sequence_mode mixed \
+  --full-seq-batch-size $FULL_SEQ_BATCH_SIZE \
+  --window-replay-interval $WINDOW_REPLAY_INTERVAL \
+  --length-bucket-size $LENGTH_BUCKET_SIZE \
   --lr 5e-5 \
   --total-iter 50000 \
   --warm-up-iter 1000 \
@@ -57,7 +71,7 @@ accelerate launch --num_processes $NUM_GPUS --mixed_precision bf16 \
   --dilation-growth-rate 3 \
   --out-dir Experiments \
   --dataname $dataset_name \
-  --exp-name MSA_VAEv6_phase2_${dataset_name}_phase1_alpha0_${TEXT_ENCODER_TYPE}_trans662048_fulldb_right \
+  --exp-name MSA_VAEv7_phase2_fullseq_replay${WINDOW_REPLAY_INTERVAL}_${dataset_name}_${TEXT_ENCODER_TYPE}_fulldb \
   --root_loss 7.0 \
   --latent_dim 16 \
   --hidden_size 1024 \

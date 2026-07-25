@@ -61,14 +61,17 @@ class CausalEncoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def forward(self, x):
+    def encode_stats(self, x):
         x = self.model(x)
-        x = x.transpose(1, 2)  
-        x = self.proj(x)        
-        mu, logvar = x.chunk(2, dim=2)             
+        x = x.transpose(1, 2)
+        x = self.proj(x)
+        mu, logvar = x.chunk(2, dim=2)
         logvar = torch.clamp(logvar, self.clip_range[0], self.clip_range[1])
-        z = self.reparameterize(mu, logvar) 
+        return mu, logvar
 
+    def forward(self, x):
+        mu, logvar = self.encode_stats(x)
+        z = self.reparameterize(mu, logvar)
         return z, mu, logvar
 
 class CausalDecoder(nn.Module):

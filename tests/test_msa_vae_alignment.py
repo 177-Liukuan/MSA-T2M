@@ -221,6 +221,18 @@ class MaskedCosineAlignmentTest(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "train_msa_vae.py"
         ).read_text()
         self.assertEqual(source.count("compute_losses(batch, net)"), 2)
+        self.assertEqual(
+            source.count(
+                "total_loss, loss_dict = compute_humanml_losses("
+                "batch, batch_kind)"
+            ),
+            2,
+        )
+        self.assertIn(
+            "if args.msa_data_mode == 'humanml_full':\n"
+            "    validate_sequence_training_config(",
+            source,
+        )
         self.assertNotIn("net.module if args.num_gpus > 1 else net", source)
 
 

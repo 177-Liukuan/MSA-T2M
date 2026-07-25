@@ -15,6 +15,12 @@
 NUM_GPUS=${1:-1}
 dataset_name=${2:-t2m_272}
 BATCH_SIZE=$((128 / NUM_GPUS))
+DEFAULT_FULL_SEQ_BATCH_SIZE=$((32 / NUM_GPUS))
+if [ "$DEFAULT_FULL_SEQ_BATCH_SIZE" -lt 1 ]; then
+  DEFAULT_FULL_SEQ_BATCH_SIZE=1
+fi
+FULL_SEQ_BATCH_SIZE=${FULL_SEQ_BATCH_SIZE:-$DEFAULT_FULL_SEQ_BATCH_SIZE}
+LENGTH_BUCKET_SIZE=${LENGTH_BUCKET_SIZE:-256}
 
 TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-t5}
 T5_EMBED_DIR=${T5_EMBED_DIR:-./humanml3d_272/t5_enc_single}
@@ -35,6 +41,8 @@ echo "========== MSA-VAE Phase 1: Freeze CNN =========="
 echo "GPUs            : $NUM_GPUS"
 echo "Dataset         : $dataset_name"
 echo "Batch per GPU   : $BATCH_SIZE"
+echo "Full batch/GPU  : $FULL_SEQ_BATCH_SIZE"
+echo "Length bucket   : $LENGTH_BUCKET_SIZE"
 echo "Text encoder    : $TEXT_ENCODER_TYPE"
 echo "Text dim        : $TEXT_EMBED_DIM"
 echo "CNN checkpoint  : $CNN_CKPT"
@@ -45,6 +53,9 @@ accelerate launch --num_processes $NUM_GPUS --mixed_precision bf16 \
   train_msa_vae.py \
   --phase 1 \
   --batch-size $BATCH_SIZE \
+  --sequence_mode full \
+  --full-seq-batch-size $FULL_SEQ_BATCH_SIZE \
+  --length-bucket-size $LENGTH_BUCKET_SIZE \
   --lr 1e-4 \
   --total-iter 50000 \
   --warm-up-iter 500 \
@@ -54,7 +65,7 @@ accelerate launch --num_processes $NUM_GPUS --mixed_precision bf16 \
   --dilation-growth-rate 3 \
   --out-dir Experiments \
   --dataname $dataset_name \
-  --exp-name MSA_VAEv6_phase1_${dataset_name}_${TEXT_ENCODER_TYPE}_alpha-1_662048_fulldb \
+  --exp-name MSA_VAEv7_phase1_fullseq_${dataset_name}_${TEXT_ENCODER_TYPE}_fulldb \
   --root_loss 7.0 \
   --latent_dim 16 \
   --hidden_size 1024 \

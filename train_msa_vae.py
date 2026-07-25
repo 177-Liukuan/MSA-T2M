@@ -43,8 +43,18 @@ from utils.eval_msa_vae_babel import (
     prepare_babel_validation_loader,
     validate_msa_assets_after_loader,
 )
-from humanml3d_272 import dataset_msa_vae
+from humanml3d_272 import dataset_eval_t2m, dataset_msa_vae
 import utils.eval_trans as eval_trans
+from utils.msa_vae_training import (
+    MSAVAELossWeights,
+    build_global_alignment_target,
+    build_msa_checkpoint_metadata,
+    compute_msa_vae_objective,
+    save_msa_checkpoint,
+    select_training_batch,
+    validate_msa_checkpoint_metadata,
+    validate_sequence_training_config,
+)
 import sys
 import warnings
 warnings.filterwarnings('ignore')
@@ -167,6 +177,13 @@ else:
     accelerator = Accelerator()
 comp_device = accelerator.device
 torch.manual_seed(args.seed)
+if args.msa_data_mode == 'humanml_full':
+    validate_sequence_training_config(
+        phase=args.phase,
+        mode=args.sequence_mode,
+        full_batch_size=args.full_seq_batch_size,
+        replay_interval=args.window_replay_interval,
+    )
 
 args.out_dir = os.path.join(args.out_dir, f'{args.exp_name}')
 os.makedirs(args.out_dir, exist_ok=True)
@@ -204,19 +221,71 @@ logger.info(f'Resolved MSA mean path: {os.path.realpath(args.msa_mean_path)}')
 logger.info(f'Resolved MSA std path: {os.path.realpath(args.msa_std_path)}')
 
 ##### ---- Dataloader ---- #####
-(
-    checkpoint_metadata,
-    resume_checkpoint,
-    validated_cnn_state,
-) = preflight_msa_training_assets(args, accelerator)
-train_loader, validation_loader, validation_backend = build_msa_training_loaders(args)
 if args.msa_data_mode == 'babel_sparse_global':
+    (
+        checkpoint_metadata,
+        resume_checkpoint,
+        validated_cnn_state,
+    ) = preflight_msa_training_assets(args, accelerator)
+    train_loader, validation_loader, validation_backend = (
+        build_msa_training_loaders(args)
+    )
     validate_msa_assets_after_loader(args, checkpoint_metadata, accelerator)
-babel_validation_dataset = (
-    validation_loader.dataset
-    if args.msa_data_mode == 'babel_sparse_global'
-    else None
-)
+    babel_validation_dataset = validation_loader.dataset
+    full_loader = None
+    window_loader = None
+else:
+    checkpoint_metadata = build_msa_checkpoint_metadata(args)
+    resume_checkpoint = None
+    validated_cnn_state = None
+    babel_validation_dataset = None
+    unit_length = args.stride_t ** args.down_t
+    train_dataset = dataset_msa_vae.MSAVAEDataset(
+        args.dataname,
+        window_size=args.window_size,
+        unit_length=unit_length,
+        use_ft_split=args.use_ft_split,
+        text_encoder_type=args.text_encoder_type,
+        clip_embed_dir=args.clip_embed_dir,
+        t5_embed_dir=args.t5_embed_dir,
+        text_embed_dim=args.text_embed_dim,
+        use_offline_global_text=args.use_offline_global_text,
+        clip_global_embed_dir=args.clip_global_embed_dir,
+        t5_global_embed_dir=args.t5_global_embed_dir,
+        sequence_mode=(
+            'window'
+            if args.sequence_mode == 'mixed'
+            else args.sequence_mode
+        ),
+    )
+    full_loader = None
+    window_loader = None
+    if args.sequence_mode in ('full', 'mixed'):
+        full_loader = dataset_msa_vae.make_loader(
+            train_dataset,
+            sequence_mode='full',
+            batch_size=args.full_seq_batch_size,
+            num_workers=8,
+            bucket_size=args.length_bucket_size,
+            drop_last=True,
+            seed=args.seed,
+        )
+    if args.sequence_mode in ('window', 'mixed'):
+        window_loader = dataset_msa_vae.make_loader(
+            train_dataset,
+            sequence_mode='window',
+            batch_size=args.batch_size,
+            num_workers=8,
+            drop_last=True,
+            seed=args.seed,
+        )
+    validation_loader = dataset_eval_t2m.DATALoader(
+        args.dataname,
+        False,
+        32,
+        unit_length=unit_length,
+    )
+    validation_backend = 'humanml_tmr'
 logger.info(f'MSA validation backend: {validation_backend}')
 
 ##### ---- Network ---- #####
@@ -258,6 +327,32 @@ if args.global_align_weight > 0 and not args.use_offline_global_text:
 # Optionally load pretrained CNN VAE weights
 if args.resume_cnn_pth:
     logger.info(f'Loading pretrained CNN VAE from {args.resume_cnn_pth}')
+    if args.msa_data_mode == 'humanml_full':
+        cnn_checkpoint = torch.load(
+            args.resume_cnn_pth, map_location='cpu'
+        )
+        cnn_state = (
+            cnn_checkpoint
+            if not isinstance(cnn_checkpoint, dict)
+            or 'net' not in cnn_checkpoint
+            else cnn_checkpoint['net']
+        )
+        validated_cnn_state = {}
+        for key, value in cnn_state.items():
+            mapped_key = key
+            if key.startswith('tae.encoder.'):
+                mapped_key = key.replace(
+                    'tae.encoder.', 'msa_vae.cnn_encoder.'
+                )
+            elif key.startswith('tae.decoder.'):
+                mapped_key = key.replace(
+                    'tae.decoder.', 'msa_vae.cnn_decoder.'
+                )
+            elif key.startswith('tae.decode_proj.'):
+                mapped_key = key.replace(
+                    'tae.decode_proj.', 'msa_vae.decode_proj.'
+                )
+            validated_cnn_state[mapped_key] = value
     missing, unexpected = net.load_state_dict(
         validated_cnn_state, strict=False
     )
@@ -266,7 +361,14 @@ if args.resume_cnn_pth:
 
 if args.resume_pth:
     logger.info(f'Resuming full MSA-VAE from {args.resume_pth}')
-    ckpt = resume_checkpoint
+    if args.msa_data_mode == 'babel_sparse_global':
+        ckpt = resume_checkpoint
+    else:
+        ckpt = torch.load(args.resume_pth, map_location='cpu')
+        metadata = (
+            ckpt.get('metadata') if isinstance(ckpt, dict) else None
+        )
+        validate_msa_checkpoint_metadata(metadata, args)
     state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
     net.load_state_dict(state, strict=True)
 
@@ -305,7 +407,6 @@ phase_desc = 'Phase 1, CNN frozen' if args.phase == 1 else ('Phase 2, all unfroz
 log_model_params(net, name=f'MSA-HumanVAE ({phase_desc})', accelerator=accelerator)
 
 net.train()
-net_eval = EvalCompat(net)
 
 ##### ---- Evaluator for R_precision / FID ---- #####
 evaluator = None
@@ -368,20 +469,55 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer, milestones=args.lr_scheduler, gamma=args.gamma,
 )
 
-net, optimizer, train_loader = accelerator.prepare(net, optimizer, train_loader)
 if args.msa_data_mode == 'babel_sparse_global':
+    net, optimizer, train_loader = accelerator.prepare(
+        net, optimizer, train_loader
+    )
     validation_loader = prepare_babel_validation_loader(
         accelerator, validation_loader
     )
-train_loader_iter = dataset_msa_vae.cycle(train_loader)
+    train_loader_iter = dataset_msa_vae.cycle(train_loader)
+    full_loader_iter = None
+    window_loader_iter = None
+else:
+    if args.sequence_mode == 'mixed':
+        net, optimizer, full_loader, window_loader = accelerator.prepare(
+            net, optimizer, full_loader, window_loader,
+        )
+    elif args.sequence_mode == 'full':
+        net, optimizer, full_loader = accelerator.prepare(
+            net, optimizer, full_loader,
+        )
+    else:
+        net, optimizer, window_loader = accelerator.prepare(
+            net, optimizer, window_loader,
+        )
+    full_loader_iter = (
+        dataset_msa_vae.cycle(full_loader)
+        if full_loader is not None
+        else None
+    )
+    window_loader_iter = (
+        dataset_msa_vae.cycle(window_loader)
+        if window_loader is not None
+        else None
+    )
+    train_loader_iter = None
 
 ##### ---- Losses ---- #####
 Loss = losses.ReConsLoss(motion_dim=272)
 latent_recon_loss_fn = nn.MSELoss()
+loss_weights = MSAVAELossWeights(
+    root=args.root_loss,
+    latent=args.latent_recon_weight,
+    global_align=args.global_align_weight,
+    local_align=args.local_align_weight,
+)
+net_eval = EvalCompat(accelerator.unwrap_model(net))
 
 ##### ---- Training function (shared by warmup & main) ---- #####
 def compute_losses(batch, net_module):
-    """Compute all MSA-VAE losses from one batch.
+    """Compute fixed-window sparse-supervision BABEL losses.
 
     Returns: (total_loss, loss_dict)
     """
@@ -501,26 +637,113 @@ def compute_losses(batch, net_module):
     return total_loss, loss_dict
 
 
+def compute_humanml_losses(batch, batch_kind):
+    """Compute masked HumanML losses for full or replay batches."""
+    (
+        gt_motion,
+        captions,
+        global_text_gt,
+        has_global,
+        local_text_gt,
+        has_local,
+        total_frames,
+        local_text_pooled,
+        motion_lengths,
+    ) = batch
+    gt_motion = gt_motion.to(comp_device).float()
+    global_text_gt = global_text_gt.to(comp_device).float()
+    has_global = has_global.to(comp_device)
+    local_text_gt = local_text_gt.to(comp_device).float()
+    has_local = has_local.to(comp_device)
+    total_frames = total_frames.to(comp_device)
+    local_text_pooled = local_text_pooled.to(comp_device).float()
+    motion_lengths = motion_lengths.to(comp_device)
+
+    out = net(
+        gt_motion,
+        lengths=motion_lengths,
+        semantic_only=args.phase == 1,
+    )
+
+    with torch.no_grad():
+        if args.use_offline_global_text:
+            text_feat = global_text_gt
+            valid_global = has_global
+        else:
+            text_feat = text_encoder.encode_text(captions, comp_device)
+            valid_global = torch.ones_like(has_local, dtype=torch.bool)
+        global_target = build_global_alignment_target(
+            global_text=text_feat,
+            local_pooled=local_text_pooled,
+            has_local=has_local,
+            total_frames=total_frames,
+            window_size=args.window_size,
+            sequence_mode=args.sequence_mode,
+            spotlight_alpha=args.spotlight_alpha,
+        )
+
+    targets = {
+        'motion': gt_motion,
+        'motion_lengths': motion_lengths,
+        'global_text': global_target,
+        'has_global': valid_global,
+        'local_text': local_text_gt,
+        'has_local': has_local,
+    }
+    return compute_msa_vae_objective(
+        out,
+        targets,
+        phase=args.phase,
+        batch_kind=batch_kind,
+        weights=loss_weights,
+        stride_t=args.stride_t,
+        down_t=args.down_t,
+    )
+
+
+def select_current_training_batch(step):
+    """Route BABEL fixed windows or HumanML full/replay batches."""
+    if args.msa_data_mode == 'babel_sparse_global':
+        return next(train_loader_iter), 'window'
+    return select_training_batch(
+        step,
+        args.sequence_mode,
+        full_loader_iter,
+        window_loader_iter,
+        args.window_replay_interval,
+    )
+
+
 ##### ---- Warm-up ---- #####
-avg = {k: 0. for k in [
+loss_log_names = [
     'recon', 'kl', 'root', 'latent', 'global_align', 'local_align',
-    'global_valid_count', 'local_valid_count',
-    'global_valid_ratio', 'local_valid_ratio',
-]}
+]
+if args.msa_data_mode == 'babel_sparse_global':
+    loss_log_names.extend([
+        'global_valid_count',
+        'local_valid_count',
+        'global_valid_ratio',
+        'local_valid_ratio',
+    ])
+avg = {key: 0.0 for key in loss_log_names}
 
 logger.info(f'=== Warm-up: {args.warm_up_iter} iterations ===')
 for nb_iter in range(1, args.warm_up_iter):
     optimizer, current_lr = update_lr_warm_up(optimizer, nb_iter, args.warm_up_iter, args.lr)
 
-    batch = next(train_loader_iter)
-    total_loss, loss_dict = compute_losses(batch, net)
+    batch, batch_kind = select_current_training_batch(nb_iter)
+    if args.msa_data_mode == 'babel_sparse_global':
+        total_loss, loss_dict = compute_losses(batch, net)
+    else:
+        total_loss, loss_dict = compute_humanml_losses(batch, batch_kind)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
     optimizer.step()
 
     for k in avg:
-        avg[k] += loss_dict[k].item()
+        if k in loss_dict:
+            avg[k] += loss_dict[k].item()
 
     if nb_iter % args.print_iter == 0:
         if accelerator.is_main_process:
@@ -533,11 +756,7 @@ for nb_iter in range(1, args.warm_up_iter):
 
 
 ##### ---- Training ---- #####
-avg = {k: 0. for k in [
-    'recon', 'kl', 'root', 'latent', 'global_align', 'local_align',
-    'global_valid_count', 'local_valid_count',
-    'global_valid_ratio', 'local_valid_ratio',
-]}
+avg = {key: 0.0 for key in loss_log_names}
 
 # Initial eval
 eval_net = accelerator.unwrap_model(net)
@@ -559,6 +778,7 @@ else:
         args.out_dir, validation_loader, net_eval, logger, writer, 0,
         best_iter=best_iter, best_fid=best_fid, best_mpjpe=best_mpjpe,
         evaluator=evaluator, device=comp_device, accelerator=accelerator,
+        checkpoint_metadata=checkpoint_metadata,
     )
 
 logger.info(f'=== Main training: {args.total_iter} iterations ===')
@@ -568,8 +788,11 @@ logger.info(f'  Spotlight alpha: {args.spotlight_alpha} '
             f'({"dynamic: window/total" if args.spotlight_alpha < 0 else "fixed"})')
 
 for nb_iter in range(1, args.total_iter + 1):
-    batch = next(train_loader_iter)
-    total_loss, loss_dict = compute_losses(batch, net)
+    batch, batch_kind = select_current_training_batch(nb_iter)
+    if args.msa_data_mode == 'babel_sparse_global':
+        total_loss, loss_dict = compute_losses(batch, net)
+    else:
+        total_loss, loss_dict = compute_humanml_losses(batch, batch_kind)
 
     optimizer.zero_grad()
     accelerator.backward(total_loss)
@@ -613,4 +836,18 @@ for nb_iter in range(1, args.total_iter + 1):
                 args.out_dir, validation_loader, net_eval, logger, writer, nb_iter,
                 best_iter, best_fid, best_mpjpe,
                 evaluator=evaluator, device=comp_device, accelerator=accelerator,
+                checkpoint_metadata=checkpoint_metadata,
             )
+
+accelerator.wait_for_everyone()
+if (
+    args.msa_data_mode == 'humanml_full'
+    and accelerator.is_main_process
+):
+    final_model = accelerator.unwrap_model(net)
+    save_msa_checkpoint(
+        os.path.join(args.out_dir, 'net_last.pth'),
+        final_model,
+        checkpoint_metadata,
+    )
+    logger.info('Saved final Phase checkpoint to net_last.pth')
