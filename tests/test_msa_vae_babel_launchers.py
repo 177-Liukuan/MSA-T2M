@@ -91,7 +91,7 @@ class BabelMSAVAELauncherTest(unittest.TestCase):
         self.assertIn("不用于 BABEL 文本到运动生成", readme)
 
     def test_path_overrides_are_one_argv_value_without_shell_expansion(self):
-        """The harmless launcher substitutes prove paths reach argparse intact."""
+        """Harmless launcher substitutes prove spaces and matching globs stay literal."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             capture_path = root / "captured.json"
@@ -104,11 +104,16 @@ class BabelMSAVAELauncherTest(unittest.TestCase):
             )
             executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
 
-            def unsafe_value(name):
-                return str(root / "{} value [*]".format(name))
+            def space_value(name):
+                return str(root / "{} value with spaces".format(name))
+
+            def matching_glob(name):
+                pattern = root / "{}_glob_*".format(name)
+                (root / "{}_glob_expanded".format(name)).touch()
+                return str(pattern)
 
             common = {
-                name: unsafe_value(name)
+                name: space_value(name)
                 for name in (
                     "MSA_MEAN_PATH",
                     "MSA_STD_PATH",
@@ -152,9 +157,31 @@ class BabelMSAVAELauncherTest(unittest.TestCase):
             }
 
             cases = (
-                (PHASE1, "ACCELERATE_BIN", {"CNN_CKPT": unsafe_value("CNN_CKPT")}),
-                (PHASE2, "ACCELERATE_BIN", {"PHASE1_DIR": unsafe_value("PHASE1_DIR")}),
-                (EVALUATION, "PYTHON_BIN", {"BABEL_CKPT": unsafe_value("BABEL_CKPT")}),
+                (
+                    PHASE1,
+                    "ACCELERATE_BIN",
+                    {"CNN_CKPT": matching_glob("CNN_CKPT")},
+                ),
+                (
+                    PHASE2,
+                    "ACCELERATE_BIN",
+                    {
+                        "PHASE1_DIR": space_value("PHASE1_DIR"),
+                        "BABEL_TRAIN_MANIFEST": matching_glob(
+                            "BABEL_TRAIN_MANIFEST"
+                        ),
+                    },
+                ),
+                (
+                    EVALUATION,
+                    "PYTHON_BIN",
+                    {
+                        "BABEL_CKPT": space_value("BABEL_CKPT"),
+                        "BABEL_VAL_MOTION_DIR": matching_glob(
+                            "BABEL_VAL_MOTION_DIR"
+                        ),
+                    },
+                ),
             )
             for launcher, executable_variable, extra in cases:
                 with self.subTest(launcher=launcher.name):
@@ -177,10 +204,14 @@ class BabelMSAVAELauncherTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout)
                     arguments = json.loads(capture_path.read_text())
+                    expected_variables = dict(common)
+                    expected_variables.update(extra)
                     for option, variable in option_variables.items():
                         with self.subTest(option=option):
                             index = arguments.index(option)
-                            self.assertEqual(arguments[index + 1], common[variable])
+                            self.assertEqual(
+                                arguments[index + 1], expected_variables[variable]
+                            )
 
                     if launcher == PHASE1:
                         option, expected = "--resume-cnn-pth", extra["CNN_CKPT"]
