@@ -26,14 +26,20 @@ except ImportError:
     clip = None
 
 from torch.utils.tensorboard import SummaryWriter
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 
 import models.msa_vae as msa_vae
 import utils.losses as losses
 import options.option_msa_vae as option_msa_vae
 import utils.utils_model as utils_model
 from utils.msa_vae_alignment import distributed_masked_cosine_alignment
-from humanml3d_272 import dataset_msa_vae, dataset_eval_tae, dataset_eval_t2m
+from utils.eval_msa_vae_babel import (
+    build_msa_checkpoint_metadata,
+    build_msa_training_loaders,
+    evaluate_msa_vae_babel,
+    prepare_babel_validation_loader,
+)
+from humanml3d_272 import dataset_msa_vae
 import utils.eval_trans as eval_trans
 import sys
 import warnings
@@ -148,10 +154,14 @@ def log_model_params(model, name="Model", accelerator=None):
 # ---------------------------------------------------------------------------
 #   Main
 # ---------------------------------------------------------------------------
-accelerator = Accelerator()
-comp_device = accelerator.device
-
 args = option_msa_vae.get_args_parser()
+if args.msa_data_mode == 'babel_sparse_global':
+    accelerator = Accelerator(
+        dataloader_config=DataLoaderConfiguration(even_batches=False)
+    )
+else:
+    accelerator = Accelerator()
+comp_device = accelerator.device
 torch.manual_seed(args.seed)
 
 args.out_dir = os.path.join(args.out_dir, f'{args.exp_name}')
@@ -183,23 +193,27 @@ if args.use_offline_global_text:
 logger.info(f'Training MSA-VAE on {args.dataname}, motions are with {args.nb_joints} joints')
 if args.disable_decoupling:
     logger.info('Using z as Transformer AE input/target (decoupling disabled)')
+if args.msa_data_mode == 'babel_sparse_global' and not args.use_offline_global_text:
+    raise ValueError('babel_sparse_global requires offline bridge global targets')
+logger.info(f'MSA data mode: {args.msa_data_mode}')
+logger.info(f'Resolved MSA mean path: {os.path.realpath(args.msa_mean_path)}')
+logger.info(f'Resolved MSA std path: {os.path.realpath(args.msa_std_path)}')
 
 ##### ---- Dataloader ---- #####
-train_loader = dataset_msa_vae.DATALoader(
-    args.dataname, args.batch_size,
-    window_size=args.window_size, unit_length=2 ** args.down_t,
-    use_ft_split=args.use_ft_split,
-    text_encoder_type=args.text_encoder_type,
-    clip_embed_dir=args.clip_embed_dir,
-    t5_embed_dir=args.t5_embed_dir,
-    text_embed_dim=args.text_embed_dim,
-    use_offline_global_text=args.use_offline_global_text,
-    clip_global_embed_dir=args.clip_global_embed_dir,
-    t5_global_embed_dir=args.t5_global_embed_dir,
+train_loader, validation_loader, validation_backend = build_msa_training_loaders(args)
+babel_validation_dataset = (
+    validation_loader.dataset
+    if args.msa_data_mode == 'babel_sparse_global'
+    else None
 )
-val_loader = dataset_eval_tae.DATALoader(
-    args.dataname, False, 32, unit_length=2 ** args.down_t,
-)
+checkpoint_metadata = build_msa_checkpoint_metadata(args)
+logger.info(f'MSA validation backend: {validation_backend}')
+for checkpoint_label, checkpoint_path in (
+    ('resume CNN checkpoint', args.resume_cnn_pth),
+    ('resume MSA-VAE checkpoint', args.resume_pth),
+):
+    if checkpoint_path and not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f'{checkpoint_label} not found: {os.path.realpath(checkpoint_path)}')
 
 ##### ---- Network ---- #####
 clip_range = [-30, 20]
@@ -300,30 +314,37 @@ net.train()
 net_eval = EvalCompat(net)
 
 ##### ---- Evaluator for R_precision / FID ---- #####
-# Text-aware val loader (NOT prepared by accelerator, runs on main only)
-val_loader_t2m = dataset_eval_t2m.DATALoader(
-    args.dataname, False, 32, unit_length=2 ** args.down_t,
-)
-# Load TMR/TEMOS evaluator encoders
-sys.path.insert(0, 'Evaluator_272')
-from mld.models.architectures.temos.textencoder.distillbert_actor import DistilbertActorAgnosticEncoder
-from mld.models.architectures.temos.motionencoder.actor import ActorAgnosticEncoder
+evaluator = None
+if args.msa_data_mode == 'humanml_full':
+    # TMR is deliberately imported and initialized only for HumanML validation.
+    sys.path.insert(0, 'Evaluator_272')
+    from mld.models.architectures.temos.textencoder.distillbert_actor import DistilbertActorAgnosticEncoder
+    from mld.models.architectures.temos.motionencoder.actor import ActorAgnosticEncoder
 
-evaluator_modelpath = 'Evaluator_272/deps/distilbert-base-uncased'
-eval_textencoder = DistilbertActorAgnosticEncoder(evaluator_modelpath, num_layers=4, latent_dim=256)
-eval_motionencoder = ActorAgnosticEncoder(nfeats=272, vae=True, num_layers=4, latent_dim=256, max_len=300)
-
-evaluator_ckpt_path = 'Evaluator_272/experiments/temos/EXP1/checkpoints/epoch=99.ckpt'
-evaluator_ckpt = torch.load(evaluator_ckpt_path, map_location='cpu')
-for prefix, encoder in [('textencoder', eval_textencoder), ('motionencoder', eval_motionencoder)]:
-    state = {k.replace(f'{prefix}.', ''): v for k, v in evaluator_ckpt['state_dict'].items() if k.startswith(f'{prefix}.')}
-    encoder.load_state_dict(state, strict=True)
-    encoder.eval()
-    encoder.to(comp_device)
-    for p in encoder.parameters():
-        p.requires_grad = False
-evaluator = [eval_textencoder, eval_motionencoder]
-logger.info(f'Loaded TMR evaluator from {evaluator_ckpt_path}')
+    evaluator_modelpath = 'Evaluator_272/deps/distilbert-base-uncased'
+    eval_textencoder = DistilbertActorAgnosticEncoder(
+        evaluator_modelpath, num_layers=4, latent_dim=256
+    )
+    eval_motionencoder = ActorAgnosticEncoder(
+        nfeats=272, vae=True, num_layers=4, latent_dim=256, max_len=300
+    )
+    evaluator_ckpt_path = 'Evaluator_272/experiments/temos/EXP1/checkpoints/epoch=99.ckpt'
+    evaluator_ckpt = torch.load(evaluator_ckpt_path, map_location='cpu')
+    for prefix, encoder in [('textencoder', eval_textencoder), ('motionencoder', eval_motionencoder)]:
+        state = {
+            k.replace(f'{prefix}.', ''): v
+            for k, v in evaluator_ckpt['state_dict'].items()
+            if k.startswith(f'{prefix}.')
+        }
+        encoder.load_state_dict(state, strict=True)
+        encoder.eval()
+        encoder.to(comp_device)
+        for p in encoder.parameters():
+            p.requires_grad = False
+    evaluator = [eval_textencoder, eval_motionencoder]
+    logger.info(f'Loaded TMR evaluator from {evaluator_ckpt_path}')
+else:
+    logger.info('BABEL validation selected: HumanML TMR evaluator is not loaded')
 
 ##### ---- Optimizer & Scheduler ---- #####
 if args.phase == 2:
@@ -353,9 +374,11 @@ scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer, milestones=args.lr_scheduler, gamma=args.gamma,
 )
 
-net, optimizer, train_loader, val_loader = accelerator.prepare(
-    net, optimizer, train_loader, val_loader,
-)
+net, optimizer, train_loader = accelerator.prepare(net, optimizer, train_loader)
+if args.msa_data_mode == 'babel_sparse_global':
+    validation_loader = prepare_babel_validation_loader(
+        accelerator, validation_loader
+    )
 train_loader_iter = dataset_msa_vae.cycle(train_loader)
 
 ##### ---- Losses ---- #####
@@ -532,13 +555,26 @@ avg = {k: 0. for k in [
 ]}
 
 # Initial eval
-eval_net = net.module if args.num_gpus > 1 else net
-net_eval.model = eval_net
-best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
-    args.out_dir, val_loader_t2m, net_eval, logger, writer, 0,
-    best_iter=0, best_fid=1e6, best_mpjpe=1000,
-    evaluator=evaluator, device=comp_device, accelerator=accelerator,
-)
+eval_net = accelerator.unwrap_model(net)
+best_iter, best_fid = 0, 1e6
+best_semantic, best_mpjpe = float('inf'), float('inf')
+if args.msa_data_mode == 'babel_sparse_global':
+    babel_result = evaluate_msa_vae_babel(
+        args.out_dir, validation_loader, eval_net, babel_validation_dataset,
+        logger, writer, iteration=0, phase=args.phase,
+        best_semantic=best_semantic, best_mpjpe=best_mpjpe,
+        device=comp_device, accelerator=accelerator,
+        metadata=checkpoint_metadata,
+    )
+    best_semantic = babel_result.best_semantic
+    best_mpjpe = babel_result.best_mpjpe
+else:
+    net_eval.model = eval_net
+    best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
+        args.out_dir, validation_loader, net_eval, logger, writer, 0,
+        best_iter=best_iter, best_fid=best_fid, best_mpjpe=best_mpjpe,
+        evaluator=evaluator, device=comp_device, accelerator=accelerator,
+    )
 
 logger.info(f'=== Main training: {args.total_iter} iterations ===')
 logger.info(f'  Loss weights: root={args.root_loss}, latent={args.latent_recon_weight}, '
@@ -575,10 +611,22 @@ for nb_iter in range(1, args.total_iter + 1):
         avg = {k: 0. for k in avg}
 
     if nb_iter % args.eval_iter == 0:
-        eval_net = net.module if args.num_gpus > 1 else net
-        net_eval.model = eval_net
-        best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
-            args.out_dir, val_loader_t2m, net_eval, logger, writer, nb_iter,
-            best_iter, best_fid, best_mpjpe,
-            evaluator=evaluator, device=comp_device, accelerator=accelerator,
-        )
+        eval_net = accelerator.unwrap_model(net)
+        if args.msa_data_mode == 'babel_sparse_global':
+            babel_result = evaluate_msa_vae_babel(
+                args.out_dir, validation_loader, eval_net,
+                babel_validation_dataset, logger, writer,
+                iteration=nb_iter, phase=args.phase,
+                best_semantic=best_semantic, best_mpjpe=best_mpjpe,
+                device=comp_device, accelerator=accelerator,
+                metadata=checkpoint_metadata,
+            )
+            best_semantic = babel_result.best_semantic
+            best_mpjpe = babel_result.best_mpjpe
+        else:
+            net_eval.model = eval_net
+            best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
+                args.out_dir, validation_loader, net_eval, logger, writer, nb_iter,
+                best_iter, best_fid, best_mpjpe,
+                evaluator=evaluator, device=comp_device, accelerator=accelerator,
+            )
