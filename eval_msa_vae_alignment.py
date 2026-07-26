@@ -813,6 +813,7 @@ def build_alignment_result_manifest(
             in_sample_local_value = raw_local_value
         local_manifest = {
             "scope": scope,
+            "split": Path(local_dataset.split_file).name,
             "sample_count": local_sample_count,
             "sample_ids": list(local_dataset.sample_ids),
             "sample_hash": local_dataset.sample_hash,
@@ -834,8 +835,9 @@ def build_alignment_result_manifest(
             "retrieval_similarity": "L2-normalized cosine",
             "retrieval_ties": "average rank",
             "caption_policy": (
-                "all complete-motion captions; exact source-line cache rows"
+                "all complete-motion captions; multi-positive M2T"
             ),
+            "target_row_policy": "exact source-line cache rows",
             "global_aggregation": "motion-macro over captions",
             "local_aggregation": "motion-macro over valid latent tokens",
             "reconstruction_decode": "posterior_mean",

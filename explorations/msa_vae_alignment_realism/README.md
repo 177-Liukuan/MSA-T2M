@@ -44,23 +44,52 @@ screen -r msa_pilot_global_s123
 
 Detach without stopping it using `Ctrl-A`, then `D`.
 
-## Evaluate and collect
+## Evaluate internal alignment and realism
 
 After all four training status files report `state=complete`:
 
 ```bash
-bash explorations/msa_vae_alignment_realism/EVAL_PILOT.sh
+PILOT_DRY_RUN=1 \
+bash explorations/msa_vae_alignment_realism/EVAL_INTERNAL_PILOT.sh
+
+bash explorations/msa_vae_alignment_realism/EVAL_INTERNAL_PILOT.sh
 
 bash explorations/msa_vae_alignment_realism/STATUS_PILOT.sh
 
 conda run -n mgpt python \
-  explorations/msa_vae_alignment_realism/pilot.py collect
+  explorations/msa_vae_alignment_realism/pilot.py collect-internal
 ```
 
-The table is written under:
+The internal table, No-Alignment deltas, and four Pareto plots are written
+under:
 
 ```text
 Experiments/msa_vae_alignment_realism_pilot_s123_20260726/summary/
 ```
 
-This pilot has one seed and must not be reported with a standard deviation.
+The main internal protocol measures `global_proj(h_cls)` and `local_proj(mu)`
+directly against the SentenceT5 targets used for training. Reconstruction uses
+the posterior mean (`mu`) and reports FID, MPJPE, P-MPJPE, ACCEL, and skating.
+
+The current local cache covers `train_ft.txt`, so
+`in_sample_local_cosine` is a training-set diagnostic and is not held-out. It
+must not be placed in the final paper's held-out `Local Cosine` column. The
+pilot has one seed and must not be reported with a standard deviation or a
+claim of statistical significance.
+
+## Supplementary external-TMR preservation
+
+The older frozen-TMR retrieval table remains a supplementary test of whether
+the reconstructed motion is recognized by an external model. It is not the
+internal MSA-VAE alignment metric. Its historical artifacts under
+`evaluation/` are preserved and can still be collected with:
+
+```bash
+bash explorations/msa_vae_alignment_realism/EVAL_PILOT.sh
+
+conda run -n mgpt python \
+  explorations/msa_vae_alignment_realism/pilot.py collect
+```
+
+New internal artifacts are isolated under `evaluation_internal/`; neither
+workflow overwrites the other.

@@ -11,6 +11,8 @@ import torch
 
 from explorations.msa_vae_alignment_realism.pilot import (
     EVAL_INTERVAL,
+    INTERNAL_PROTOCOL_VERSION,
+    INTERNAL_TARGET_METRICS,
     PHASE_ITERATIONS,
     PILOT_SEED,
     PILOT_VARIANTS,
@@ -21,8 +23,10 @@ from explorations.msa_vae_alignment_realism.pilot import (
     VALIDATION_SEED,
     emit_contract,
     phase_checkpoint_path,
+    validate_internal_pilot_manifests,
     validate_pilot_checkpoints,
     validate_pilot_manifests,
+    write_internal_pilot_table,
     write_pilot_table,
 )
 
@@ -891,3 +895,499 @@ class PilotEvaluationTest(unittest.TestCase):
         )
         self.assertEqual(arguments[arguments.index("--seed") + 1], "123")
         self.assertIn("state=evaluation_complete", status)
+
+
+class InternalPilotCollectorTest(unittest.TestCase):
+    @classmethod
+    def _manifest(cls, variant, index, checkpoint):
+        metrics = {
+            name: float(index + metric_index / 10.0)
+            for metric_index, name in enumerate(INTERNAL_TARGET_METRICS)
+        }
+        metrics["fid"] = float(index)
+        metrics["local_cosine"] = None
+        shuffled = {
+            name: float(metric_index)
+            for metric_index, name in enumerate(
+                (
+                    "msa_t5_t2m_r1_percent",
+                    "msa_t5_t2m_r2_percent",
+                    "msa_t5_t2m_r3_percent",
+                    "msa_t5_t2m_r5_percent",
+                    "msa_t5_t2m_medr",
+                    "msa_t5_m2t_r1_percent",
+                    "msa_t5_m2t_r2_percent",
+                    "msa_t5_m2t_r3_percent",
+                    "msa_t5_m2t_r5_percent",
+                    "msa_t5_m2t_medr",
+                )
+            )
+        }
+        return {
+            "seed": 123,
+            "batch_size": 32,
+            "protocol": {
+                "version": INTERNAL_PROTOCOL_VERSION,
+                "retrieval": (
+                    "MSA-global-projection-to-SentenceT5-multi-positive"
+                ),
+                "caption_policy": (
+                    "all complete-motion captions; multi-positive M2T"
+                ),
+                "reconstruction_decode": "posterior_mean",
+            },
+            "metrics": metrics,
+            "checkpoint": json.loads(json.dumps(checkpoint)),
+            "evaluator": {
+                "path": "/evaluator/epoch.ckpt",
+                "sha256": "e" * 64,
+            },
+            "model_config": {
+                "values": {
+                    "latent_dim": 16,
+                    "trans_d_model": 768,
+                    "clip_dim": 768,
+                },
+                "sources": {
+                    "latent_dim": "metadata",
+                    "trans_d_model": "metadata",
+                    "clip_dim": "metadata",
+                },
+            },
+            "global_realism_dataset": {
+                "sample_count": 2480,
+                "sample_ids": ["sample-0001", "sample-0002"],
+                "sample_hash": "global-sample-hash",
+                "target_directory": (
+                    "/data/humanml3d_272/text_latents_t5"
+                ),
+                "target_hash": "g" * 64,
+                "caption_count": 7000,
+                "caption_hash": "c" * 64,
+            },
+            "local_alignment": {
+                "scope": "in_sample",
+                "split": "train_ft.txt",
+                "sample_count": 6000,
+                "sample_ids": ["local-0001", "local-0002"],
+                "sample_hash": "local-sample-hash",
+                "target_directory": (
+                    "/data/humanml3d_272/t5_enc_single"
+                ),
+                "target_hash": "l" * 64,
+                "token_count": 100000,
+            },
+            "diagnostics": {
+                "shuffled_global_retrieval": shuffled,
+            },
+            "skating": {
+                "foot_indices": [10, 11],
+                "fps": 30.0,
+                "height_threshold_m": 0.05,
+                "velocity_threshold_mps": 0.5,
+                "smoothing_window_frames": 8,
+            },
+        }
+
+    @classmethod
+    def _write_internal_manifests(cls, output_root):
+        external = PilotCollectorTest._write_manifests(output_root)
+        manifests = []
+        for index, (variant, external_manifest) in enumerate(
+            zip(PILOT_VARIANTS, external),
+            start=1,
+        ):
+            manifest = cls._manifest(
+                variant,
+                index,
+                external_manifest["checkpoint"],
+            )
+            path = (
+                output_root
+                / "evaluation_internal"
+                / variant.slug
+                / "metrics.json"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(manifest, indent=2),
+                encoding="utf-8",
+            )
+            manifests.append(manifest)
+        return manifests
+
+    @staticmethod
+    def _rewrite(output_root, manifests):
+        for variant, manifest in zip(PILOT_VARIANTS, manifests):
+            path = (
+                output_root
+                / "evaluation_internal"
+                / variant.slug
+                / "metrics.json"
+            )
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_validates_and_writes_internal_table_deltas_and_plots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_root = Path(temp)
+            manifests = self._write_internal_manifests(output_root)
+            manifests[0]["metrics"]["fid"] = 1.0
+            manifests[1]["metrics"]["fid"] = 2.0
+            self._rewrite(output_root, manifests)
+
+            validated = validate_internal_pilot_manifests(output_root)
+            paths = write_internal_pilot_table(output_root)
+            payload = json.loads(
+                paths["json"].read_text(encoding="utf-8")
+            )
+            deltas = json.loads(
+                paths["deltas"].read_text(encoding="utf-8")
+            )
+            markdown = paths["markdown"].read_text(encoding="utf-8")
+            for name in (
+                "json",
+                "csv",
+                "markdown",
+                "deltas",
+                "global_fid_plot",
+                "global_mpjpe_plot",
+                "local_fid_plot",
+                "local_mpjpe_plot",
+            ):
+                self.assertTrue(paths[name].is_file(), name)
+
+        self.assertEqual(len(validated), 4)
+        self.assertEqual(
+            payload["qualification"],
+            "single-seed pilot; local cosine is an in-sample train_ft "
+            "diagnostic; no uncertainty estimate",
+        )
+        self.assertEqual(deltas["baseline"], "No Alignment")
+        self.assertEqual(
+            deltas["variants"]["Global Only"]["fid"][
+                "absolute_delta"
+            ],
+            1.0,
+        )
+        self.assertIn("Global Cos↑", markdown)
+        self.assertIn("Local Cos↑ (train diagnostic)", markdown)
+        self.assertIn("MSA-T5 T2M R@1↑", markdown)
+
+    def test_rejects_protocol_scope_identity_and_metric_failures(self):
+        cases = (
+            (
+                "protocol",
+                lambda manifests: manifests[0]["protocol"].update(
+                    {"version": "msa-vae-standard-v2"}
+                ),
+            ),
+            (
+                "posterior",
+                lambda manifests: manifests[0]["protocol"].update(
+                    {"reconstruction_decode": "stochastic"}
+                ),
+            ),
+            (
+                "target hash",
+                lambda manifests: manifests[0][
+                    "global_realism_dataset"
+                ].pop("target_hash"),
+            ),
+            (
+                "local scope",
+                lambda manifests: manifests[0][
+                    "local_alignment"
+                ].update({"scope": "held_out"}),
+            ),
+            (
+                "global dataset",
+                lambda manifests: manifests[0][
+                    "global_realism_dataset"
+                ].update({"sample_hash": "different"}),
+            ),
+            (
+                "local dataset",
+                lambda manifests: manifests[0][
+                    "local_alignment"
+                ].update({"sample_hash": "different"}),
+            ),
+            (
+                "best checkpoint",
+                lambda manifests: manifests[0]["checkpoint"].update(
+                    {"path": "/pilot/net_best_fid.pth"}
+                ),
+            ),
+            (
+                "shuffled",
+                lambda manifests: manifests[0].pop("diagnostics"),
+            ),
+            (
+                "metric",
+                lambda manifests: manifests[0]["metrics"].update(
+                    {"fid": math.nan}
+                ),
+            ),
+        )
+        for message, mutate in cases:
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as temp:
+                    output_root = Path(temp)
+                    manifests = self._write_internal_manifests(
+                        output_root
+                    )
+                    mutate(manifests)
+                    self._rewrite(output_root, manifests)
+
+                    with self.assertRaisesRegex(ValueError, message):
+                        validate_internal_pilot_manifests(output_root)
+
+
+class InternalPilotEvaluationEntrypointTest(unittest.TestCase):
+    @staticmethod
+    def _write_executable(path, source):
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
+
+    def test_internal_runner_forwards_exact_global_and_local_protocol(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            output_root = temp_root / "pilot"
+            checkpoint = temp_root / "net_last.pth"
+            checkpoint.write_bytes(b"checkpoint")
+            capture = temp_root / "internal-eval.txt"
+            evaluator = temp_root / "fake-eval.sh"
+            self._write_executable(
+                evaluator,
+                "#!/usr/bin/env bash\n"
+                'printf "cuda=%s\\n" "$CUDA_VISIBLE_DEVICES" '
+                '> "$EVAL_CAPTURE"\n'
+                'printf "%s\\n" "$@" >> "$EVAL_CAPTURE"\n'
+                "output=''\n"
+                "while [[ $# -gt 0 ]]; do\n"
+                "  if [[ $1 == --output-dir ]]; then output=$2; fi\n"
+                "  shift\n"
+                "done\n"
+                'mkdir -p "$output"\n'
+                'printf "{}\\n" > "$output/metrics.json"\n',
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PILOT_ROOT": str(output_root),
+                    "EVAL_COMMAND": str(evaluator),
+                    "EVAL_CAPTURE": str(capture),
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    "bash",
+                    str(
+                        EXPLORATION_ROOT
+                        / "eval_internal_variant.sh"
+                    ),
+                    "global_only",
+                    "2",
+                    str(checkpoint),
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            arguments = capture.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            status = (
+                output_root
+                / "status"
+                / "global_only.internal_evaluation.status"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        self.assertEqual(arguments[0], "cuda=2")
+        self.assertEqual(arguments[1], str(checkpoint))
+        expected = {
+            "--split-file": "humanml3d_272/split/test.txt",
+            "--global-text-embed-dir": (
+                "humanml3d_272/text_latents_t5"
+            ),
+            "--local-split-file": (
+                "humanml3d_272/split/train_ft.txt"
+            ),
+            "--local-text-embed-dir": (
+                "humanml3d_272/t5_enc_single"
+            ),
+            "--local-target-scope": "in-sample",
+            "--batch-size": "32",
+            "--num-workers": "8",
+            "--seed": "123",
+        }
+        for option, value in expected.items():
+            index = arguments.index(option)
+            self.assertEqual(arguments[index + 1], value)
+        self.assertIn("state=internal_evaluation_complete", status)
+
+    def test_internal_runner_refuses_missing_checkpoint_and_existing_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            output_root = temp_root / "pilot"
+            environment = os.environ.copy()
+            environment["PILOT_ROOT"] = str(output_root)
+            runner = EXPLORATION_ROOT / "eval_internal_variant.sh"
+            missing = subprocess.run(
+                ["bash", str(runner), "no_align", "0", "missing.pth"],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            checkpoint = temp_root / "net_last.pth"
+            checkpoint.write_bytes(b"checkpoint")
+            (
+                output_root / "evaluation_internal" / "no_align"
+            ).mkdir(parents=True)
+            existing = subprocess.run(
+                [
+                    "bash",
+                    str(runner),
+                    "no_align",
+                    "0",
+                    str(checkpoint),
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(missing.returncode, 10)
+        self.assertIn("missing", missing.stderr)
+        self.assertEqual(existing.returncode, 11)
+        self.assertIn("already exists", existing.stderr)
+
+    def _fake_screen_tools(self, temp_root):
+        capture = temp_root / "screen.txt"
+        screen = temp_root / "screen"
+        nvidia_smi = temp_root / "nvidia-smi"
+        self._write_executable(
+            screen,
+            "#!/usr/bin/env bash\n"
+            "if [[ ${1:-} == -ls ]]; then\n"
+            '  printf "No Sockets found.\\n"\n'
+            "  exit 1\n"
+            "fi\n"
+            'printf "%s" "$1" >> "$SCREEN_CAPTURE"\n'
+            "shift\n"
+            'printf " %s" "$@" >> "$SCREEN_CAPTURE"\n'
+            'printf "\\n" >> "$SCREEN_CAPTURE"\n',
+        )
+        self._write_executable(
+            nvidia_smi,
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"--query-compute-apps="* ]]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            "for index in 0 1 2 3 4 5 6 7; do\n"
+            '  printf "%s, 1, 24564, 0\\n" "$index"\n'
+            "done\n",
+        )
+        return screen, nvidia_smi, capture
+
+    def _run_orchestrator(self, temp_root, dry_run):
+        output_root = temp_root / "pilot"
+        PilotEvaluationTest._write_checkpoints(output_root)
+        screen, nvidia_smi, capture = self._fake_screen_tools(
+            temp_root
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PILOT_ROOT": str(output_root),
+                "SCREEN_BIN": str(screen),
+                "NVIDIA_SMI_BIN": str(nvidia_smi),
+                "SCREEN_CAPTURE": str(capture),
+                "PILOT_DRY_RUN": "1" if dry_run else "0",
+            }
+        )
+        completed = subprocess.run(
+            [
+                "bash",
+                str(EXPLORATION_ROOT / "EVAL_INTERNAL_PILOT.sh"),
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return completed, output_root, capture
+
+    def test_internal_orchestrator_dry_run_and_screen_mapping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            dry, _, dry_capture = self._run_orchestrator(
+                temp_root,
+                dry_run=True,
+            )
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertFalse(dry_capture.exists())
+        expected_sessions = (
+            "msa_internal_eval_no_align_s123",
+            "msa_internal_eval_global_only_s123",
+            "msa_internal_eval_local_only_s123",
+            "msa_internal_eval_global_local_s123",
+        )
+        for session, gpu in zip(expected_sessions, ("0", "2", "4", "6")):
+            self.assertIn(session, dry.stdout)
+            self.assertIn("GPU={}".format(gpu), dry.stdout)
+
+        with tempfile.TemporaryDirectory() as temp:
+            completed, _, capture = self._run_orchestrator(
+                Path(temp),
+                dry_run=False,
+            )
+            lines = capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+        self.assertEqual(len(lines), 4)
+        for session, slug, gpu, line in zip(
+            expected_sessions,
+            ("no_align", "global_only", "local_only", "global_local"),
+            ("0", "2", "4", "6"),
+            lines,
+        ):
+            self.assertIn(session, line)
+            self.assertIn(
+                "eval_internal_variant.sh {} {}".format(
+                    slug,
+                    gpu,
+                ),
+                line,
+            )
+
+    def test_status_and_readme_distinguish_internal_from_supplementary(self):
+        status = (
+            EXPLORATION_ROOT / "STATUS_PILOT.sh"
+        ).read_text(encoding="utf-8")
+        readme = (
+            EXPLORATION_ROOT / "README.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(".internal_evaluation.status", status)
+        self.assertIn("EVAL_INTERNAL_PILOT.sh", readme)
+        self.assertIn("collect-internal", readme)
+        self.assertIn("supplementary", readme.lower())
+        self.assertIn("not held-out", readme.lower())

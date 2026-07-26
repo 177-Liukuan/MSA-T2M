@@ -416,8 +416,20 @@ class AlignmentResultArtifactTest(unittest.TestCase):
             "MSA-global-projection-to-SentenceT5-multi-positive",
         )
         self.assertEqual(
+            manifest["protocol"]["caption_policy"],
+            "all complete-motion captions; multi-positive M2T",
+        )
+        self.assertEqual(
+            manifest["protocol"]["target_row_policy"],
+            "exact source-line cache rows",
+        )
+        self.assertEqual(
             manifest["local_alignment"]["scope"],
             "in_sample",
+        )
+        self.assertEqual(
+            manifest["local_alignment"]["split"],
+            "local.txt",
         )
         self.assertIsNone(manifest["metrics"]["local_cosine"])
         self.assertEqual(

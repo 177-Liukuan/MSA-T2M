@@ -31,6 +31,7 @@ DEFAULT_OUTPUT_ROOT = (
     "Experiments/msa_vae_alignment_realism_pilot_s123_20260726"
 )
 PROTOCOL_VERSION = "msa-vae-standard-v2"
+INTERNAL_PROTOCOL_VERSION = "msa-vae-internal-alignment-v1"
 TARGET_METRICS = (
     "fid",
     "mpjpe_mm",
@@ -43,6 +44,33 @@ TARGET_METRICS = (
     "m2t_r1_percent",
     "m2t_r5_percent",
     "m2t_medr",
+)
+INTERNAL_TARGET_METRICS = (
+    "global_cosine",
+    "in_sample_local_cosine",
+    "fid",
+    "mpjpe_mm",
+    "p_mpjpe_mm",
+    "accel_mm_per_frame2",
+    "skating_percent",
+    "msa_t5_t2m_r1_percent",
+    "msa_t5_t2m_r5_percent",
+    "msa_t5_t2m_medr",
+    "msa_t5_m2t_r1_percent",
+    "msa_t5_m2t_r5_percent",
+    "msa_t5_m2t_medr",
+)
+INTERNAL_RETRIEVAL_METRICS = (
+    "msa_t5_t2m_r1_percent",
+    "msa_t5_t2m_r2_percent",
+    "msa_t5_t2m_r3_percent",
+    "msa_t5_t2m_r5_percent",
+    "msa_t5_t2m_medr",
+    "msa_t5_m2t_r1_percent",
+    "msa_t5_m2t_r2_percent",
+    "msa_t5_m2t_r3_percent",
+    "msa_t5_m2t_r5_percent",
+    "msa_t5_m2t_medr",
 )
 TABLE_HEADERS = (
     "Variant",
@@ -57,6 +85,22 @@ TABLE_HEADERS = (
     "M2T R@1↑",
     "M2T R@5↑",
     "M2T MedR↓",
+)
+INTERNAL_TABLE_HEADERS = (
+    "Variant",
+    "Global Cos↑",
+    "Local Cos↑ (train diagnostic)",
+    "FID↓",
+    "MPJPE↓",
+    "P-MPJPE↓",
+    "ACCEL↓",
+    "Skating%↓",
+    "MSA-T5 T2M R@1↑",
+    "MSA-T5 T2M R@5↑",
+    "MSA-T5 T2M MedR↓",
+    "MSA-T5 M2T R@1↑",
+    "MSA-T5 M2T R@5↑",
+    "MSA-T5 M2T MedR↓",
 )
 
 
@@ -835,6 +879,504 @@ def write_pilot_table(output_root: Path) -> Dict[str, Path]:
     }
 
 
+def _validate_internal_checkpoint(
+    manifest: Mapping[str, Any],
+    variant: PilotVariant,
+) -> None:
+    if manifest.get("seed") != PILOT_SEED:
+        raise ValueError("evaluation seed must be 123")
+    if manifest.get("batch_size") != VALIDATION_BATCH_SIZE:
+        raise ValueError("evaluation batch size must be 32")
+    checkpoint_path = _nested(
+        manifest,
+        ("checkpoint", "path"),
+        "checkpoint",
+    )
+    if (
+        not isinstance(checkpoint_path, str)
+        or Path(checkpoint_path).name != "net_last.pth"
+    ):
+        raise ValueError("best checkpoint is forbidden; use net_last.pth")
+    metadata = _nested(
+        manifest,
+        ("checkpoint", "metadata"),
+        "checkpoint metadata",
+    )
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("phase") != 2
+        or metadata.get("normalized_loss_version") != 1
+    ):
+        raise ValueError("Phase 2 checkpoint metadata is invalid")
+    _validate_metadata_schedule(metadata, phase=2)
+    _validate_training_args(
+        metadata.get("training_args"),
+        variant,
+        phase=2,
+    )
+    lineage = metadata.get("lineage")
+    parent = (
+        lineage.get("parent_checkpoint_metadata")
+        if isinstance(lineage, Mapping)
+        else None
+    )
+    parent_path = (
+        lineage.get("parent_checkpoint_path")
+        if isinstance(lineage, Mapping)
+        else None
+    )
+    if (
+        not isinstance(parent, Mapping)
+        or parent.get("phase") != 1
+        or not isinstance(parent_path, str)
+        or Path(parent_path).name != "net_last.pth"
+    ):
+        raise ValueError("Phase 1 lineage is invalid")
+    _validate_metadata_schedule(parent, phase=1)
+    _validate_training_args(
+        parent.get("training_args"),
+        variant,
+        phase=1,
+    )
+
+
+def _require_target_hash(
+    dataset: Mapping[str, Any],
+    label: str,
+) -> str:
+    target_hash = dataset.get("target_hash")
+    if (
+        not isinstance(target_hash, str)
+        or len(target_hash) != 64
+    ):
+        raise ValueError(f"{label} target hash is missing")
+    return target_hash
+
+
+def _validate_internal_variant_manifest(
+    manifest: Mapping[str, Any],
+    variant: PilotVariant,
+) -> Dict[str, float]:
+    protocol = _nested(manifest, ("protocol",), "protocol")
+    if not isinstance(protocol, Mapping):
+        raise ValueError("protocol must be a dictionary")
+    if protocol.get("version") != INTERNAL_PROTOCOL_VERSION:
+        raise ValueError(
+            f"protocol must be {INTERNAL_PROTOCOL_VERSION}"
+        )
+    if protocol.get("retrieval") != (
+        "MSA-global-projection-to-SentenceT5-multi-positive"
+    ):
+        raise ValueError("internal retrieval protocol is invalid")
+    if protocol.get("caption_policy") != (
+        "all complete-motion captions; multi-positive M2T"
+    ):
+        raise ValueError("internal caption policy is invalid")
+    if protocol.get("reconstruction_decode") != "posterior_mean":
+        raise ValueError(
+            "posterior_mean reconstruction decode is required"
+        )
+    _validate_internal_checkpoint(manifest, variant)
+
+    metrics = _nested(manifest, ("metrics",), "metric")
+    if not isinstance(metrics, Mapping):
+        raise ValueError("metric dictionary is missing")
+    values = {
+        name: _finite(metrics.get(name), f"metric {name}")
+        for name in INTERNAL_TARGET_METRICS
+    }
+    if metrics.get("local_cosine") is not None:
+        raise ValueError(
+            "in-sample pilot must leave local_cosine empty"
+        )
+
+    global_dataset = _nested(
+        manifest,
+        ("global_realism_dataset",),
+        "global dataset",
+    )
+    if not isinstance(global_dataset, Mapping):
+        raise ValueError("global dataset is missing")
+    _require_target_hash(global_dataset, "global")
+    local_dataset = _nested(
+        manifest,
+        ("local_alignment",),
+        "local dataset",
+    )
+    if not isinstance(local_dataset, Mapping):
+        raise ValueError("local dataset is missing")
+    if local_dataset.get("scope") != "in_sample":
+        raise ValueError(
+            "local scope must be in_sample for this pilot"
+        )
+    split_value = local_dataset.get(
+        "split",
+        local_dataset.get("split_file"),
+    )
+    if (
+        not isinstance(split_value, str)
+        or Path(split_value).name != "train_ft.txt"
+    ):
+        raise ValueError(
+            "local dataset must use the train_ft.txt diagnostic"
+        )
+    _require_target_hash(local_dataset, "local")
+
+    shuffled = _nested(
+        manifest,
+        ("diagnostics", "shuffled_global_retrieval"),
+        "shuffled control",
+    )
+    if not isinstance(shuffled, Mapping):
+        raise ValueError("shuffled control is missing")
+    for name in INTERNAL_RETRIEVAL_METRICS:
+        _finite(
+            shuffled.get(name),
+            f"shuffled control {name}",
+        )
+    return values
+
+
+def _load_internal_pilot_manifests(
+    output_root: Path,
+) -> List[Dict[str, Any]]:
+    output_root = _resolve_output_root(output_root)
+    manifests = []
+    for variant in PILOT_VARIANTS:
+        path = (
+            output_root
+            / "evaluation_internal"
+            / variant.slug
+            / "metrics.json"
+        )
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            raise ValueError(
+                f"missing internal metrics manifest for "
+                f"{variant.slug}: {path}"
+            ) from error
+        if not isinstance(value, dict):
+            raise ValueError(f"{path} must contain a JSON object")
+        manifests.append(value)
+    return manifests
+
+
+def validate_internal_pilot_manifests(
+    output_root: Path,
+) -> List[Dict[str, Any]]:
+    """Validate four internal-alignment manifests and their lineages."""
+
+    output_root = _resolve_output_root(output_root)
+    checkpoint_records = validate_pilot_checkpoints(output_root)
+    manifests = _load_internal_pilot_manifests(output_root)
+    for manifest, variant, checkpoint in zip(
+        manifests,
+        PILOT_VARIANTS,
+        checkpoint_records,
+    ):
+        _validate_internal_variant_manifest(manifest, variant)
+        manifest_path = _nested(
+            manifest,
+            ("checkpoint", "path"),
+            "checkpoint path",
+        )
+        if Path(manifest_path).resolve() != Path(
+            checkpoint["phase2_path"]
+        ).resolve():
+            raise ValueError(
+                f"checkpoint path mismatch for {variant.slug}"
+            )
+        manifest_sha = _nested(
+            manifest,
+            ("checkpoint", "sha256"),
+            "checkpoint SHA-256",
+        )
+        if manifest_sha != checkpoint["phase2_sha256"]:
+            raise ValueError(
+                f"checkpoint SHA-256 mismatch for {variant.slug}"
+            )
+
+    common_identities = (
+        (("protocol",), "protocol"),
+        (("evaluator", "sha256"), "evaluator"),
+        (
+            ("global_realism_dataset", "sample_hash"),
+            "global dataset",
+        ),
+        (
+            ("global_realism_dataset", "sample_count"),
+            "global dataset",
+        ),
+        (
+            ("global_realism_dataset", "sample_ids"),
+            "global dataset",
+        ),
+        (
+            ("global_realism_dataset", "target_directory"),
+            "global dataset",
+        ),
+        (
+            ("global_realism_dataset", "target_hash"),
+            "global dataset",
+        ),
+        (
+            ("global_realism_dataset", "caption_count"),
+            "global dataset",
+        ),
+        (
+            ("global_realism_dataset", "caption_hash"),
+            "global dataset",
+        ),
+        (("local_alignment", "scope"), "local dataset"),
+        (("local_alignment", "sample_hash"), "local dataset"),
+        (("local_alignment", "sample_count"), "local dataset"),
+        (("local_alignment", "sample_ids"), "local dataset"),
+        (
+            ("local_alignment", "target_directory"),
+            "local dataset",
+        ),
+        (("local_alignment", "target_hash"), "local dataset"),
+        (("local_alignment", "token_count"), "local dataset"),
+        (("skating",), "skating"),
+        (("model_config", "values"), "model"),
+        (("seed",), "evaluation seed"),
+        (("batch_size",), "evaluation batch size"),
+    )
+    for keys, label in common_identities:
+        _require_equal(
+            [
+                _nested(manifest, keys, label)
+                for manifest in manifests
+            ],
+            label,
+        )
+    sample_count = _nested(
+        manifests[0],
+        ("global_realism_dataset", "sample_count"),
+        "global dataset",
+    )
+    if sample_count != 2480:
+        raise ValueError(
+            f"global dataset sample count must be 2480, got "
+            f"{sample_count}"
+        )
+    return manifests
+
+
+def _write_tradeoff_plot(
+    rows: Sequence[Mapping[str, Any]],
+    x_metric: str,
+    y_metric: str,
+    x_label: str,
+    y_label: str,
+    path: Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(6.4, 4.8))
+    for row in rows:
+        x_value = row["metrics"][x_metric]
+        y_value = row["metrics"][y_metric]
+        axis.scatter([x_value], [y_value], s=48)
+        axis.annotate(
+            row["variant"],
+            (x_value, y_value),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+        )
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.grid(True, alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(str(path), format="svg")
+    plt.close(figure)
+
+
+def write_internal_pilot_table(
+    output_root: Path,
+) -> Dict[str, Path]:
+    output_root = _resolve_output_root(output_root)
+    manifests = validate_internal_pilot_manifests(output_root)
+    summary_dir = output_root / "summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    json_rows = []
+    for variant, manifest in zip(PILOT_VARIANTS, manifests):
+        metrics = _validate_internal_variant_manifest(
+            manifest,
+            variant,
+        )
+        row = {
+            "Variant": variant.label,
+            "seed": str(PILOT_SEED),
+        }
+        row.update(
+            {
+                header: metrics[name]
+                for header, name in zip(
+                    INTERNAL_TABLE_HEADERS[1:],
+                    INTERNAL_TARGET_METRICS,
+                )
+            }
+        )
+        rows.append(row)
+        json_rows.append(
+            {
+                "variant": variant.label,
+                "slug": variant.slug,
+                "seed": PILOT_SEED,
+                "checkpoint": manifest["checkpoint"],
+                "metrics": metrics,
+            }
+        )
+
+    json_path = summary_dir / "internal_alignment_pilot_table.json"
+    csv_path = summary_dir / "internal_alignment_pilot_table.csv"
+    markdown_path = summary_dir / "internal_alignment_pilot_table.md"
+    deltas_path = summary_dir / "internal_alignment_deltas.json"
+    qualification = (
+        "single-seed pilot; local cosine is an in-sample train_ft "
+        "diagnostic; no uncertainty estimate"
+    )
+    payload = {
+        "qualification": qualification,
+        "seed_count": 1,
+        "seed": PILOT_SEED,
+        "protocol": manifests[0]["protocol"],
+        "global_realism_dataset": manifests[0][
+            "global_realism_dataset"
+        ],
+        "local_alignment": manifests[0]["local_alignment"],
+        "rows": json_rows,
+    }
+    json_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    fieldnames = (
+        ("Variant", "seed") + INTERNAL_TABLE_HEADERS[1:]
+    )
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    markdown_rows = []
+    for row in rows:
+        values = [row["Variant"]]
+        values.extend(
+            f"{float(row[header]):.3f}"
+            for header in INTERNAL_TABLE_HEADERS[1:]
+        )
+        markdown_rows.append("| " + " | ".join(values) + " |")
+    markdown = (
+        "| " + " | ".join(INTERNAL_TABLE_HEADERS) + " |\n"
+        "| "
+        + " | ".join(["---"] * len(INTERNAL_TABLE_HEADERS))
+        + " |\n"
+        + "\n".join(markdown_rows)
+        + "\n"
+    )
+    markdown_path.write_text(markdown, encoding="utf-8")
+
+    baseline = json_rows[0]["metrics"]
+    delta_variants = {}
+    for row in json_rows:
+        metric_deltas = {}
+        for name in INTERNAL_TARGET_METRICS:
+            absolute_delta = row["metrics"][name] - baseline[name]
+            relative_delta = (
+                absolute_delta / abs(baseline[name])
+                if baseline[name] != 0.0
+                else None
+            )
+            metric_deltas[name] = {
+                "absolute_delta": absolute_delta,
+                "relative_delta": relative_delta,
+            }
+        delta_variants[row["variant"]] = metric_deltas
+    deltas_path.write_text(
+        json.dumps(
+            {
+                "qualification": qualification,
+                "baseline": PILOT_VARIANTS[0].label,
+                "variants": delta_variants,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    plot_specs = (
+        (
+            "global_cosine",
+            "fid",
+            "Global cosine",
+            "FID (lower is better)",
+            "global_cosine_vs_fid.svg",
+            "global_fid_plot",
+        ),
+        (
+            "global_cosine",
+            "mpjpe_mm",
+            "Global cosine",
+            "MPJPE (mm; lower is better)",
+            "global_cosine_vs_mpjpe.svg",
+            "global_mpjpe_plot",
+        ),
+        (
+            "in_sample_local_cosine",
+            "fid",
+            "In-sample local cosine",
+            "FID (lower is better)",
+            "in_sample_local_cosine_vs_fid.svg",
+            "local_fid_plot",
+        ),
+        (
+            "in_sample_local_cosine",
+            "mpjpe_mm",
+            "In-sample local cosine",
+            "MPJPE (mm; lower is better)",
+            "in_sample_local_cosine_vs_mpjpe.svg",
+            "local_mpjpe_plot",
+        ),
+    )
+    plot_paths = {}
+    for (
+        x_metric,
+        y_metric,
+        x_label,
+        y_label,
+        filename,
+        result_name,
+    ) in plot_specs:
+        path = summary_dir / filename
+        _write_tradeoff_plot(
+            json_rows,
+            x_metric,
+            y_metric,
+            x_label,
+            y_label,
+            path,
+        )
+        plot_paths[result_name] = path
+    return {
+        "json": json_path,
+        "csv": csv_path,
+        "markdown": markdown_path,
+        "deltas": deltas_path,
+        **plot_paths,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -846,6 +1388,7 @@ def _build_parser() -> argparse.ArgumentParser:
     contract.add_argument("--format", choices=("json", "tsv"), default="json")
     subparsers.add_parser("verify")
     subparsers.add_parser("collect")
+    subparsers.add_parser("collect-internal")
     subparsers.add_parser("check-ports")
     record = subparsers.add_parser("record-run")
     record.add_argument("--slug", required=True)
@@ -891,7 +1434,10 @@ def main(argv=None) -> None:
     if args.command == "check-ports":
         check_pilot_ports()
         return
-    paths = write_pilot_table(output_root)
+    if args.command == "collect-internal":
+        paths = write_internal_pilot_table(output_root)
+    else:
+        paths = write_pilot_table(output_root)
     for name, path in paths.items():
         print(f"{name}: {path}")
 
