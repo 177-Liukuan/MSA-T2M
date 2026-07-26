@@ -134,25 +134,26 @@ class FullSequenceDatasetTest(unittest.TestCase):
             encoding="utf-8",
         )
         (data_root / "split" / "train.txt").write_text(
-            "too_short\n",
+            "short\ntoo_short\n",
             encoding="utf-8",
         )
         try:
             os.chdir(root)
-            with self.assertRaisesRegex(
-                    dataset_msa_vae.MotionSequenceTooShortError,
-                    "one 4-frame latent unit"):
-                MSAVAEDataset(
-                    "t2m_272",
-                    window_size=64,
-                    unit_length=4,
-                    use_ft_split=False,
-                    text_encoder_type="clip",
-                    text_embed_dim=2,
-                    sequence_mode="full",
-                )
+            filtered = MSAVAEDataset(
+                "t2m_272",
+                window_size=64,
+                unit_length=4,
+                use_ft_split=False,
+                text_encoder_type="clip",
+                text_embed_dim=2,
+                sequence_mode="full",
+            )
         finally:
             os.chdir(previous_cwd)
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered.data[0]["name"], "short")
+        self.assertEqual(filtered.skipped_subunit_count, 1)
 
 
 class FullSequenceCollateTest(unittest.TestCase):

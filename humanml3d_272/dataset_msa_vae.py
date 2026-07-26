@@ -86,6 +86,7 @@ class MSAVAEDataset(data.Dataset):
 
         self.data = []
         self.lengths = []
+        self.skipped_subunit_count = 0
         n_with_local = 0
         n_with_global = 0
 
@@ -93,10 +94,8 @@ class MSAVAEDataset(data.Dataset):
             try:
                 motion = np.load(pjoin(self.motion_dir, name + '.npy'))
                 if motion.shape[0] < self.unit_length:
-                    raise MotionSequenceTooShortError(
-                        f'Motion {name} has {motion.shape[0]} frames, fewer '
-                        f'than one {self.unit_length}-frame latent unit'
-                    )
+                    self.skipped_subunit_count += 1
+                    continue
                 if (self.sequence_mode == 'window'
                         and motion.shape[0] < self.window_size):
                     continue
@@ -181,7 +180,9 @@ class MSAVAEDataset(data.Dataset):
         self.std = std
         print(f'MSA-VAE training: {len(self.data)} samples '
               f'({n_with_local} with local {self.text_encoder_type.upper()} embeddings, '
-              f'{n_with_global} with offline global embeddings, dim={self.text_embed_dim})')
+              f'{n_with_global} with offline global embeddings, '
+              f'{self.skipped_subunit_count} shorter than one latent unit skipped, '
+              f'dim={self.text_embed_dim})')
 
     def inv_transform(self, data):
         return data * self.std + self.mean
