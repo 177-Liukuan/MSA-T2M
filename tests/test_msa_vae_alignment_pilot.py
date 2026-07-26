@@ -1,6 +1,8 @@
 import csv
 import json
 import math
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +19,11 @@ from explorations.msa_vae_alignment_realism.pilot import (
     VALIDATION_SEED,
     validate_pilot_manifests,
     write_pilot_table,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+EXPLORATION_ROOT = (
+    ROOT / "explorations" / "msa_vae_alignment_realism"
 )
 
 
@@ -298,3 +305,162 @@ class PilotCollectorTest(unittest.TestCase):
                         path.write_text(json.dumps(manifest), encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, message):
                         validate_pilot_manifests(output_root)
+
+
+class PilotRunnerTest(unittest.TestCase):
+    @staticmethod
+    def _fake_launcher(path, capture_variable, exit_code=0, checkpoint=True):
+        checkpoint_command = (
+            'mkdir -p "$OUT_DIR/$EXP_NAME"\n'
+            'printf "checkpoint\\n" > "$OUT_DIR/$EXP_NAME/net_last.pth"\n'
+            if checkpoint
+            else ""
+        )
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f'capture="${{{capture_variable}}}"\n'
+            "{\n"
+            '  printf "arg1=%s\\n" "$1"\n'
+            '  printf "arg2=%s\\n" "$2"\n'
+            '  printf "cuda=%s\\n" "$CUDA_VISIBLE_DEVICES"\n'
+            '  printf "out_dir=%s\\n" "$OUT_DIR"\n'
+            '  printf "exp_name=%s\\n" "$EXP_NAME"\n'
+            '  printf "seed=%s\\n" "$SEED"\n'
+            '  printf "total_iter=%s\\n" "$TOTAL_ITER"\n'
+            '  printf "eval_iter=%s\\n" "$EVAL_ITER"\n'
+            '  printf "validation_seed=%s\\n" "$VALIDATION_SEED"\n'
+            '  printf "validation_batch=%s\\n" "$VALIDATION_BATCH_SIZE"\n'
+            '  printf "global=%s\\n" "$GLOBAL_ALIGN_WEIGHT"\n'
+            '  printf "local=%s\\n" "$LOCAL_ALIGN_WEIGHT"\n'
+            '  printf "cnn=%s\\n" "${CNN_CKPT:-}"\n'
+            '  printf "cnn_sha=%s\\n" "${CNN_CKPT_SHA256:-}"\n'
+            '  printf "phase1_dir=%s\\n" "${PHASE1_DIR:-}"\n'
+            '} > "$capture"\n'
+            f"{checkpoint_command}"
+            f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    @staticmethod
+    def _read_capture(path):
+        return dict(
+            line.split("=", 1)
+            for line in path.read_text(encoding="utf-8").splitlines()
+        )
+
+    def _run_variant(
+        self,
+        temp_root,
+        phase1_exit=0,
+        phase1_checkpoint=True,
+    ):
+        phase1 = temp_root / "phase1.sh"
+        phase2 = temp_root / "phase2.sh"
+        phase1_capture = temp_root / "phase1.txt"
+        phase2_capture = temp_root / "phase2.txt"
+        self._fake_launcher(
+            phase1,
+            "CAPTURE_PHASE1",
+            exit_code=phase1_exit,
+            checkpoint=phase1_checkpoint,
+        )
+        self._fake_launcher(phase2, "CAPTURE_PHASE2")
+        env = os.environ.copy()
+        env.update(
+            {
+                "PILOT_ROOT": str(temp_root / "pilot"),
+                "TAE_CHECKPOINT": "/fixed/tae.pth",
+                "TAE_SHA256": TAE_SHA256,
+                "PHASE1_LAUNCHER": str(phase1),
+                "PHASE2_LAUNCHER": str(phase2),
+                "CAPTURE_PHASE1": str(phase1_capture),
+                "CAPTURE_PHASE2": str(phase2_capture),
+            }
+        )
+        completed = subprocess.run(
+            [
+                "bash",
+                str(EXPLORATION_ROOT / "run_variant.sh"),
+                "global_only",
+                "2,3",
+                "0.2",
+                "0",
+                "0.05",
+                "0",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return completed, phase1_capture, phase2_capture
+
+    def test_runs_fresh_phase1_then_its_own_phase2_with_fixed_contract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            completed, phase1_path, phase2_path = self._run_variant(
+                temp_root
+            )
+            phase1 = self._read_capture(phase1_path)
+            phase2 = self._read_capture(phase2_path)
+            status = (
+                temp_root
+                / "pilot"
+                / "status"
+                / "global_only.status"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        for capture in (phase1, phase2):
+            self.assertEqual(capture["arg1"], "2")
+            self.assertEqual(capture["arg2"], "t2m_272")
+            self.assertEqual(capture["cuda"], "2,3")
+            self.assertEqual(capture["seed"], "123")
+            self.assertEqual(capture["total_iter"], "25000")
+            self.assertEqual(capture["eval_iter"], "5000")
+            self.assertEqual(capture["validation_seed"], "123")
+            self.assertEqual(capture["validation_batch"], "32")
+        self.assertEqual(phase1["global"], "0.2")
+        self.assertEqual(phase1["local"], "0")
+        self.assertEqual(phase1["cnn"], "/fixed/tae.pth")
+        self.assertEqual(phase1["cnn_sha"], TAE_SHA256)
+        self.assertEqual(phase2["global"], "0.05")
+        self.assertEqual(phase2["local"], "0")
+        self.assertEqual(
+            phase2["phase1_dir"],
+            phase1["out_dir"] + "/" + phase1["exp_name"],
+        )
+        self.assertIn("state=complete", status)
+
+    def test_phase1_failure_or_missing_checkpoint_never_starts_phase2(self):
+        cases = (
+            (7, True, "Phase 1 launcher failed"),
+            (0, False, "Phase 1 net_last.pth is missing"),
+        )
+        for exit_code, checkpoint, message in cases:
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as temp:
+                    temp_root = Path(temp)
+                    completed, _, phase2_path = self._run_variant(
+                        temp_root,
+                        phase1_exit=exit_code,
+                        phase1_checkpoint=checkpoint,
+                    )
+                    status = (
+                        temp_root
+                        / "pilot"
+                        / "status"
+                        / "global_only.status"
+                    ).read_text(encoding="utf-8")
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(phase2_path.exists())
+                self.assertIn("state=failed", status)
+                self.assertIn(message, completed.stdout + completed.stderr)
