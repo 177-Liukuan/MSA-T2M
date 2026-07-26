@@ -133,6 +133,21 @@ def _canonical_training_configuration(metadata: Any) -> Dict[str, Any]:
     return configuration
 
 
+def _valid_internal_validation_identity(training_args: Any) -> bool:
+    """Return whether deterministic complete-validation settings are usable."""
+    if not isinstance(training_args, Mapping):
+        return False
+    validation_seed = training_args.get("validation_seed")
+    validation_batch_size = training_args.get("validation_batch_size")
+    return (
+        isinstance(validation_seed, int)
+        and not isinstance(validation_seed, bool)
+        and isinstance(validation_batch_size, int)
+        and not isinstance(validation_batch_size, bool)
+        and validation_batch_size > 0
+    )
+
+
 def _validate_official_two_stage_protocol(metadata: Any) -> None:
     """Require the final HumanML result protocol approved for the paper."""
     if not isinstance(metadata, Mapping):
@@ -150,6 +165,7 @@ def _validate_official_two_stage_protocol(metadata: Any) -> None:
         or training_args.get("msa_data_mode") != "humanml_full"
         or training_args.get("use_ft_split") is not False
         or training_args.get("num_gpus") != 2
+        or not _valid_internal_validation_identity(training_args)
         or isinstance(eval_iter, bool)
         or not isinstance(eval_iter, int)
         or eval_iter < 1
@@ -171,6 +187,7 @@ def _validate_official_two_stage_protocol(metadata: Any) -> None:
         or parent_args.get("msa_data_mode") != "humanml_full"
         or parent_args.get("use_ft_split") is not False
         or parent_args.get("num_gpus") != 2
+        or not _valid_internal_validation_identity(parent_args)
         or isinstance(parent_eval_iter, bool)
         or not isinstance(parent_eval_iter, int)
         or parent_eval_iter < 1
@@ -252,6 +269,21 @@ def aggregate_variant(
         raise ValueError("checkpoint SHA-256 values must be non-empty strings")
     if len(set(checkpoint_shas)) != 3:
         raise ValueError("checkpoint SHA-256 values must be distinct")
+
+    checkpoint_paths = [
+        _nested(item, ("checkpoint", "path"), "checkpoint")
+        for item in manifests
+    ]
+    if any(
+        not isinstance(path, str)
+        or not path
+        or Path(path).name != "net_last.pth"
+        for path in checkpoint_paths
+    ):
+        raise ValueError(
+            "formal aggregation requires each Phase 2 checkpoint "
+            "to be net_last.pth"
+        )
 
     seeds = [
         _nested(
@@ -349,15 +381,14 @@ def aggregate_variant(
         }
 
     sources = []
-    for seed, manifest in sorted(zip(seeds, manifests), key=lambda pair: pair[0]):
+    for seed, manifest, checkpoint_path in sorted(
+        zip(seeds, manifests, checkpoint_paths),
+        key=lambda item: item[0],
+    ):
         sources.append(
             {
                 "seed": seed,
-                "checkpoint_path": _nested(
-                    manifest,
-                    ("checkpoint", "path"),
-                    "checkpoint",
-                ),
+                "checkpoint_path": checkpoint_path,
                 "checkpoint_sha256": _nested(
                     manifest,
                     ("checkpoint", "sha256"),

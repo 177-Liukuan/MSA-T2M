@@ -46,6 +46,8 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                 "root_loss": 7.0,
                 "latent_recon_weight": 1.0,
                 "eval_iter": 2500,
+                "validation_seed": 123,
+                "validation_batch_size": 32,
                 "msa_data_mode": "humanml_full",
                 "use_ft_split": False,
                 "num_gpus": 2,
@@ -63,7 +65,7 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
             "metrics": metrics,
             "checkpoint": {
                 "sha256": checkpoint_suffix * 64,
-                "path": f"/models/seed-{seed}.pth",
+                "path": f"/models/seed-{seed}/net_last.pth",
                 "metadata": {
                     "format_version": 1,
                     "phase": 2,
@@ -90,6 +92,8 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                         "root_loss": 7.0,
                         "latent_recon_weight": 1.0,
                         "eval_iter": 2500,
+                        "validation_seed": 123,
+                        "validation_batch_size": 32,
                         "msa_data_mode": "humanml_full",
                         "use_ft_split": False,
                         "num_gpus": 2,
@@ -284,6 +288,68 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                         "official two-stage protocol",
                     ):
                         aggregate_variant("variant", manifests)
+
+    def test_rejects_missing_or_invalid_internal_validation_identity(self):
+        phase_paths = (
+            ("training_args",),
+            ("lineage", "parent_checkpoint_metadata", "training_args"),
+        )
+        invalid_fields = (
+            ("validation_seed", None),
+            ("validation_seed", True),
+            ("validation_seed", 1.5),
+            ("validation_batch_size", None),
+            ("validation_batch_size", 0),
+            ("validation_batch_size", True),
+            ("validation_batch_size", 1.5),
+        )
+        for phase_path in phase_paths:
+            for field, invalid_value in invalid_fields:
+                manifests = self._manifests()
+                for manifest in manifests:
+                    target = manifest["checkpoint"]["metadata"]
+                    for key in phase_path:
+                        target = target[key]
+                    if invalid_value is None:
+                        del target[field]
+                    else:
+                        target[field] = invalid_value
+                with self.subTest(
+                    phase_path=phase_path,
+                    field=field,
+                    invalid_value=invalid_value,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "official two-stage protocol",
+                    ):
+                        aggregate_variant("variant", manifests)
+
+    def test_rejects_cross_seed_internal_validation_mismatch(self):
+        for field, value in (
+            ("validation_seed", 456),
+            ("validation_batch_size", 16),
+        ):
+            manifests = self._manifests()
+            manifests[1]["checkpoint"]["metadata"]["training_args"][
+                field
+            ] = value
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "training configuration",
+                ):
+                    aggregate_variant("variant", manifests)
+
+    def test_formal_aggregation_requires_phase2_net_last(self):
+        for filename in ("net_best_fid.pth", "net_best_mpjpe.pth"):
+            manifests = self._manifests()
+            manifests[1]["checkpoint"]["path"] = (
+                f"/models/seed-456/{filename}"
+            )
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(ValueError, "net_last.pth"):
+                    aggregate_variant("variant", manifests)
 
     def test_writes_json_numeric_csv_and_requested_markdown_row(self):
         result = aggregate_variant("Global + Local", self._manifests())
