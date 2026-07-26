@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import subprocess
@@ -211,10 +212,10 @@ def emit_contract(output_root: Path, format_name: str) -> str:
             variant.training_gpus,
             variant.evaluation_gpu,
             variant.screen_session,
-            variant.phase1_global,
-            variant.phase1_local,
-            variant.phase2_global,
-            variant.phase2_local,
+            format(variant.phase1_global, "g"),
+            format(variant.phase1_local, "g"),
+            format(variant.phase2_global, "g"),
+            format(variant.phase2_local, "g"),
         )
         lines.append("\t".join(str(value) for value in fields))
     return "\n".join(lines) + "\n"
@@ -289,8 +290,15 @@ def _validate_training_args(
         or training_args.get("msa_data_mode") != "humanml_full"
     ):
         raise ValueError("training configuration does not match the pilot")
+    tae_path = training_args.get("resume_cnn_pth")
+    if not isinstance(tae_path, str):
+        raise ValueError("TAE identity does not match the fixed checkpoint")
+    resolved_tae = Path(tae_path)
+    if not resolved_tae.is_absolute():
+        resolved_tae = _repo_root() / resolved_tae
+    expected_tae = (_repo_root() / TAE_CHECKPOINT).resolve()
     if (
-        training_args.get("resume_cnn_pth") != TAE_CHECKPOINT
+        resolved_tae.resolve() != expected_tae
         or training_args.get("resume_cnn_sha256") != TAE_SHA256
     ):
         raise ValueError("TAE identity does not match the fixed checkpoint")
@@ -361,6 +369,113 @@ def _validate_variant_manifest(
         name: _finite(metrics.get(name), f"metric {name}")
         for name in TARGET_METRICS
     }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_pilot_checkpoints(output_root: Path) -> List[Dict[str, Any]]:
+    """Validate four real Phase-1/Phase-2 checkpoint lineages."""
+    import torch
+
+    output_root = _resolve_output_root(output_root)
+    results = []
+    for variant in PILOT_VARIANTS:
+        parent_path = phase_checkpoint_path(output_root, variant, 1)
+        phase2_path = phase_checkpoint_path(output_root, variant, 2)
+        if not parent_path.is_file() or parent_path.stat().st_size < 1:
+            raise ValueError(
+                f"missing Phase 1 net_last.pth for {variant.slug}: "
+                f"{parent_path}"
+            )
+        if not phase2_path.is_file() or phase2_path.stat().st_size < 1:
+            raise ValueError(
+                f"missing Phase 2 net_last.pth for {variant.slug}: "
+                f"{phase2_path}"
+            )
+        parent_payload = torch.load(
+            parent_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        phase2_payload = torch.load(
+            phase2_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        parent_metadata = (
+            parent_payload.get("metadata")
+            if isinstance(parent_payload, Mapping)
+            else None
+        )
+        metadata = (
+            phase2_payload.get("metadata")
+            if isinstance(phase2_payload, Mapping)
+            else None
+        )
+        if (
+            not isinstance(parent_metadata, Mapping)
+            or parent_metadata.get("phase") != 1
+            or parent_metadata.get("sequence_mode") != "full"
+        ):
+            raise ValueError(
+                f"Phase 1 checkpoint metadata is invalid for {variant.slug}"
+            )
+        _validate_training_args(
+            parent_metadata.get("training_args"),
+            variant,
+            phase=1,
+        )
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("phase") != 2
+            or metadata.get("sequence_mode") != "mixed"
+        ):
+            raise ValueError(
+                f"Phase 2 checkpoint metadata is invalid for {variant.slug}"
+            )
+        _validate_training_args(
+            metadata.get("training_args"),
+            variant,
+            phase=2,
+        )
+        lineage = metadata.get("lineage")
+        embedded_parent = (
+            lineage.get("parent_checkpoint_metadata")
+            if isinstance(lineage, Mapping)
+            else None
+        )
+        embedded_path = (
+            lineage.get("parent_checkpoint_path")
+            if isinstance(lineage, Mapping)
+            else None
+        )
+        if embedded_parent != parent_metadata:
+            raise ValueError(
+                f"Phase 1 lineage metadata mismatch for {variant.slug}"
+            )
+        if (
+            not isinstance(embedded_path, str)
+            or Path(embedded_path).resolve() != parent_path.resolve()
+        ):
+            raise ValueError(
+                f"Phase 1 lineage path mismatch for {variant.slug}"
+            )
+        results.append(
+            {
+                "slug": variant.slug,
+                "phase1_path": str(parent_path),
+                "phase2_path": str(phase2_path),
+                "phase1_sha256": _file_sha256(parent_path),
+                "phase2_sha256": _file_sha256(phase2_path),
+            }
+        )
+    return results
 
 
 def _load_pilot_manifests(output_root: Path) -> List[Dict[str, Any]]:
@@ -492,6 +607,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     contract = subparsers.add_parser("contract")
     contract.add_argument("--format", choices=("json", "tsv"), default="json")
+    subparsers.add_parser("verify")
     subparsers.add_parser("collect")
     return parser
 
@@ -501,6 +617,15 @@ def main(argv=None) -> None:
     output_root = _resolve_output_root(args.output_root)
     if args.command == "contract":
         print(emit_contract(output_root, args.format), end="")
+        return
+    if args.command == "verify":
+        print(
+            json.dumps(
+                validate_pilot_checkpoints(output_root),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
     paths = write_pilot_table(output_root)
     for name, path in paths.items():

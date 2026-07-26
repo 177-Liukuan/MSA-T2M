@@ -37,7 +37,12 @@ OFFICIAL_ROOT_ENTRYPOINTS = {
 
 ARCHIVED_ENTRYPOINTS = {
     "msa_vae_alignment_realism": {
+        "EVAL_PILOT.sh",
+        "RUN_PILOT.sh",
+        "STATUS_PILOT.sh",
+        "eval_variant.sh",
         "pilot.py",
+        "run_variant.sh",
     },
     "ablations/no_rag": {
         "demo_msa_t2m_no_rag_t5.py",

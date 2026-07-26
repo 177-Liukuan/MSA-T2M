@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import torch
+
 from explorations.msa_vae_alignment_realism.pilot import (
     EVAL_INTERVAL,
     PHASE_ITERATIONS,
@@ -17,6 +19,9 @@ from explorations.msa_vae_alignment_realism.pilot import (
     TARGET_METRICS,
     VALIDATION_BATCH_SIZE,
     VALIDATION_SEED,
+    emit_contract,
+    phase_checkpoint_path,
+    validate_pilot_checkpoints,
     validate_pilot_manifests,
     write_pilot_table,
 )
@@ -59,6 +64,18 @@ class PilotContractTest(unittest.TestCase):
         self.assertEqual(
             TAE_SHA256,
             "7c92115aeb36c71f93baa381869ae35f391e7d4dc2b51fe2b8c6761bf352bdd8",
+        )
+
+    def test_tsv_uses_canonical_weight_strings_for_shell_directory_names(self):
+        lines = emit_contract(Path("."), "tsv").splitlines()
+        fields = [line.split("\t") for line in lines]
+
+        self.assertEqual(fields[0][5:], ["0", "0", "0", "0"])
+        self.assertEqual(fields[1][5:], ["0.2", "0", "0.05", "0"])
+        self.assertEqual(fields[2][5:], ["0", "0.2", "0", "0.05"])
+        self.assertEqual(
+            fields[3][5:],
+            ["0.2", "0.2", "0.05", "0.05"],
         )
 
 
@@ -306,6 +323,30 @@ class PilotCollectorTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         validate_pilot_manifests(output_root)
 
+    def test_accepts_canonical_absolute_fixed_tae_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_root = Path(temp)
+            manifests = self._write_manifests(output_root)
+            absolute_tae = str((ROOT / TAE_CHECKPOINT).resolve())
+            for manifest in manifests:
+                metadata = manifest["checkpoint"]["metadata"]
+                metadata["training_args"]["resume_cnn_pth"] = absolute_tae
+                metadata["lineage"]["parent_checkpoint_metadata"][
+                    "training_args"
+                ]["resume_cnn_pth"] = absolute_tae
+            for variant, manifest in zip(PILOT_VARIANTS, manifests):
+                path = (
+                    output_root
+                    / "evaluation"
+                    / variant.slug
+                    / "metrics.json"
+                )
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            validated = validate_pilot_manifests(output_root)
+
+        self.assertEqual(len(validated), 4)
+
 
 class PilotRunnerTest(unittest.TestCase):
     @staticmethod
@@ -464,3 +505,229 @@ class PilotRunnerTest(unittest.TestCase):
                 self.assertFalse(phase2_path.exists())
                 self.assertIn("state=failed", status)
                 self.assertIn(message, completed.stdout + completed.stderr)
+
+
+class PilotScreenEntrypointTest(unittest.TestCase):
+    @staticmethod
+    def _write_executable(path, source):
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
+
+    def _fake_tools(self, temp_root, busy=False):
+        screen_capture = temp_root / "screen.txt"
+        screen = temp_root / "screen"
+        nvidia_smi = temp_root / "nvidia-smi"
+        sha256sum = temp_root / "sha256sum"
+        self._write_executable(
+            screen,
+            "#!/usr/bin/env bash\n"
+            "if [[ ${1:-} == -ls ]]; then\n"
+            '  printf "No Sockets found.\\n"\n'
+            "  exit 1\n"
+            "fi\n"
+            'printf "%s" "$1" >> "$SCREEN_CAPTURE"\n'
+            'shift\n'
+            'printf " %s" "$@" >> "$SCREEN_CAPTURE"\n'
+            'printf "\\n" >> "$SCREEN_CAPTURE"\n',
+        )
+        compute_output = (
+            'printf "GPU-deadbeef, 999, 100 MiB\\n"\n'
+            if busy
+            else ":"
+        )
+        self._write_executable(
+            nvidia_smi,
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"--query-compute-apps="* ]]; then\n'
+            f"  {compute_output}\n"
+            "  exit 0\n"
+            "fi\n"
+            "for index in 0 1 2 3 4 5 6 7; do\n"
+            '  printf "%s, 1, 24564, 0\\n" "$index"\n'
+            "done\n",
+        )
+        self._write_executable(
+            sha256sum,
+            "#!/usr/bin/env bash\n"
+            f'printf "{TAE_SHA256}  %s\\n" "${{!#}}"\n',
+        )
+        return screen, nvidia_smi, sha256sum, screen_capture
+
+    def _launch(self, temp_root, dry_run=False, busy=False):
+        screen, nvidia, sha256sum, capture = self._fake_tools(
+            temp_root,
+            busy=busy,
+        )
+        tae = temp_root / "tae.pth"
+        tae.write_bytes(b"fixed TAE fixture")
+        output_root = temp_root / "pilot"
+        env = os.environ.copy()
+        env.update(
+            {
+                "PILOT_ROOT": str(output_root),
+                "TAE_CHECKPOINT": str(tae),
+                "SCREEN_BIN": str(screen),
+                "NVIDIA_SMI_BIN": str(nvidia),
+                "SHA256SUM_BIN": str(sha256sum),
+                "SCREEN_CAPTURE": str(capture),
+                "PILOT_DRY_RUN": "1" if dry_run else "0",
+            }
+        )
+        completed = subprocess.run(
+            ["bash", str(EXPLORATION_ROOT / "RUN_PILOT.sh")],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return completed, output_root, capture
+
+    def test_dry_run_prints_four_sessions_without_writing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            completed, output_root, capture = self._launch(
+                Path(temp),
+                dry_run=True,
+            )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        self.assertFalse(output_root.exists())
+        self.assertFalse(capture.exists())
+        for variant in PILOT_VARIANTS:
+            self.assertIn(variant.screen_session, completed.stdout)
+            self.assertIn(variant.training_gpus, completed.stdout)
+
+    def test_launches_exactly_four_logged_detached_screens(self):
+        with tempfile.TemporaryDirectory() as temp:
+            completed, output_root, capture = self._launch(Path(temp))
+            screen_lines = capture.read_text(encoding="utf-8").splitlines()
+            contract = json.loads(
+                (output_root / "contract.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        self.assertEqual(len(screen_lines), 4)
+        self.assertEqual(contract["seed"], 123)
+        for variant, line in zip(PILOT_VARIANTS, screen_lines):
+            self.assertIn("-dmS", line)
+            self.assertIn(variant.screen_session, line)
+            self.assertIn(variant.training_gpus, line)
+            self.assertIn("run_variant.sh", line)
+
+    def test_rejects_busy_gpu_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            completed, output_root, capture = self._launch(
+                Path(temp),
+                busy=True,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("GPU compute process", completed.stderr)
+        self.assertFalse(output_root.exists())
+        self.assertFalse(capture.exists())
+
+
+class PilotEvaluationTest(unittest.TestCase):
+    @classmethod
+    def _write_checkpoints(cls, output_root):
+        for variant in PILOT_VARIANTS:
+            parent_path = phase_checkpoint_path(output_root, variant, 1)
+            phase2_path = phase_checkpoint_path(output_root, variant, 2)
+            parent_path.parent.mkdir(parents=True)
+            phase2_path.parent.mkdir(parents=True)
+            metadata = PilotCollectorTest._metadata(variant)
+            metadata["lineage"]["parent_checkpoint_path"] = str(parent_path)
+            parent_metadata = metadata["lineage"][
+                "parent_checkpoint_metadata"
+            ]
+            torch.save(
+                {"net": {}, "metadata": parent_metadata},
+                parent_path,
+            )
+            torch.save({"net": {}, "metadata": metadata}, phase2_path)
+
+    def test_checkpoint_preflight_validates_all_phase_lineage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_root = Path(temp)
+            self._write_checkpoints(output_root)
+            result = validate_pilot_checkpoints(output_root)
+        self.assertEqual(
+            [item["slug"] for item in result],
+            [variant.slug for variant in PILOT_VARIANTS],
+        )
+        self.assertTrue(
+            all(item["phase2_sha256"] for item in result)
+        )
+
+    def test_eval_runner_uses_complete_test_protocol(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            output_root = temp_root / "pilot"
+            checkpoint = temp_root / "net_last.pth"
+            checkpoint.write_bytes(b"checkpoint")
+            capture = temp_root / "eval.txt"
+            evaluator = temp_root / "fake-eval.sh"
+            evaluator.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$@" > "$EVAL_CAPTURE"\n'
+                "output=''\n"
+                "while [[ $# -gt 0 ]]; do\n"
+                "  if [[ $1 == --output-dir ]]; then output=$2; fi\n"
+                "  shift\n"
+                "done\n"
+                'mkdir -p "$output"\n'
+                'printf "{}\\n" > "$output/metrics.json"\n',
+                encoding="utf-8",
+            )
+            evaluator.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PILOT_ROOT": str(output_root),
+                    "EVAL_COMMAND": str(evaluator),
+                    "EVAL_CAPTURE": str(capture),
+                }
+            )
+            completed = subprocess.run(
+                [
+                    "bash",
+                    str(EXPLORATION_ROOT / "eval_variant.sh"),
+                    "global_only",
+                    "2",
+                    str(checkpoint),
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            arguments = capture.read_text(encoding="utf-8").splitlines()
+            status = (
+                output_root
+                / "status"
+                / "global_only.evaluation.status"
+            ).read_text(encoding="utf-8")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        self.assertEqual(arguments[0], str(checkpoint))
+        self.assertEqual(
+            arguments[arguments.index("--split-file") + 1],
+            "humanml3d_272/split/test.txt",
+        )
+        self.assertEqual(
+            arguments[arguments.index("--batch-size") + 1],
+            "32",
+        )
+        self.assertEqual(arguments[arguments.index("--seed") + 1], "123")
+        self.assertIn("state=evaluation_complete", status)
