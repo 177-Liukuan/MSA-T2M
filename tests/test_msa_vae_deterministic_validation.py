@@ -616,6 +616,78 @@ class ValidationCheckpointPublicationTest(unittest.TestCase):
                         sorted(checkpoint_names),
                     )
 
+    def test_rollback_failure_preserves_recovery_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            model = torch.nn.Linear(3, 2)
+            metadata = {"format_version": 1, "phase": 2}
+            state = publish_msa_validation(
+                result=_validation_result(),
+                iteration=0,
+                out_dir=output,
+                model=model,
+                metadata=metadata,
+                state=MSAValidationState(),
+                logger=_Logger(),
+                writer=_Writer(),
+                validation_seed=123,
+                validation_batch_size=32,
+            )
+            original_fid_hash = _file_sha256(
+                output / "net_best_fid.pth"
+            )
+            with torch.no_grad():
+                model.weight.add_(1.0)
+
+            real_replace = os.replace
+            replace_count = 0
+
+            def fail_commit_and_rollback(source, destination):
+                nonlocal replace_count
+                replace_count += 1
+                if replace_count == 2:
+                    raise OSError("simulated checkpoint commit failure")
+                if replace_count == 3:
+                    raise OSError("simulated checkpoint rollback failure")
+                real_replace(source, destination)
+
+            with mock.patch(
+                "utils.msa_vae_validation.os.replace",
+                side_effect=fail_commit_and_rollback,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "recovery files preserved at",
+                ):
+                    publish_msa_validation(
+                        result=_validation_result(
+                            fid=0.9,
+                            mpjpe_mm=21.0,
+                        ),
+                        iteration=1,
+                        out_dir=output,
+                        model=model,
+                        metadata=metadata,
+                        state=state,
+                        logger=_Logger(),
+                        writer=_Writer(),
+                        validation_seed=123,
+                        validation_batch_size=32,
+                    )
+
+            recovery_dirs = list(
+                output.glob(".msa-validation-checkpoints-*")
+            )
+            self.assertEqual(len(recovery_dirs), 1)
+            recovery_checkpoint = (
+                recovery_dirs[0] / "backup" / "net_best_fid.pth"
+            )
+            self.assertTrue(recovery_checkpoint.is_file())
+            self.assertEqual(
+                _file_sha256(recovery_checkpoint),
+                original_fid_hash,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

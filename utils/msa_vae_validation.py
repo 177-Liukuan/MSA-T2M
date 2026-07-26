@@ -176,6 +176,7 @@ def _publish_checkpoint_generation(
     backup_dir = transaction_dir / "backup"
     staging_dir.mkdir()
     backup_dir.mkdir()
+    cleanup_transaction = True
     try:
         for name in checkpoint_names:
             save_msa_checkpoint(
@@ -195,17 +196,27 @@ def _publish_checkpoint_generation(
                     backed_up.add(name)
                 os.replace(str(staging_dir / name), str(target))
                 published.add(name)
-        except Exception:
-            _rollback_checkpoint_generation(
-                checkpoint_names,
-                out_dir,
-                backup_dir,
-                backed_up,
-                published,
-            )
+        except Exception as commit_error:
+            try:
+                _rollback_checkpoint_generation(
+                    checkpoint_names,
+                    out_dir,
+                    backup_dir,
+                    backed_up,
+                    published,
+                )
+            except Exception as rollback_error:
+                cleanup_transaction = False
+                raise RuntimeError(
+                    "checkpoint publication and rollback failed; "
+                    "recovery files preserved at "
+                    f"{transaction_dir}; commit error: {commit_error}; "
+                    f"rollback error: {rollback_error}"
+                ) from rollback_error
             raise
     finally:
-        shutil.rmtree(str(transaction_dir), ignore_errors=True)
+        if cleanup_transaction:
+            shutil.rmtree(str(transaction_dir), ignore_errors=True)
 
 
 def publish_msa_validation(
