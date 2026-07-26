@@ -118,7 +118,15 @@ class MotionStreamerAdapter(Adapter):
         ckpt = torch.load(_resolve(cfg.ms_ckpt), map_location="cpu")
         self.model = LLaMAHF(LLaMAHFConfig.from_name("Normal_size"), 9, 16,
                              self.device_obj).to(self.device_obj).eval()
-        self.model.load_state_dict({k.split("module.", 1)[-1]: v for k, v in ckpt["trans"].items()}, strict=True)
+        state = {}
+        for key, value in ckpt["trans"].items():
+            clean = key.split("module.", 1)[-1]
+            state[clean] = value
+            # Historical MotionStreamer checkpoints stored the DDPM network
+            # directly as diff_loss.net; current DiffLoss wraps it as head.net.
+            if clean.startswith("diff_loss.net."):
+                state["diff_loss.head." + clean[len("diff_loss."):]] = value
+        self.model.load_state_dict(state, strict=True)
 
     def generate(self, caption: str, frames: int) -> Dict[str, Any]:
         t = self.torch
