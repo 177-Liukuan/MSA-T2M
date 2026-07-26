@@ -16,6 +16,8 @@ OFFICIAL_ROOT_ENTRYPOINTS = {
     "EVAL_msa_vae.sh",
     "eval_msa_vae_metrics.py",
     "EVAL_msa_vae_metrics.sh",
+    "eval_msa_vae_alignment.py",
+    "EVAL_msa_vae_alignment.sh",
     "aggregate_msa_vae_metrics.py",
     "AGGREGATE_msa_vae_metrics.sh",
     "TRAIN_msa_vae_babel_phase1.sh",
