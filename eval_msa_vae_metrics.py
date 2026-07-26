@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import pickle
 import random
 import sys
 import warnings
@@ -59,6 +60,24 @@ class EvaluationPaths:
     output_dir: Path
 
 
+class EvaluationReporter:
+    """Mirror evaluation lifecycle messages to the terminal and a durable log."""
+
+    def __init__(self, output_dir, stream=None):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.output_dir / "evaluation.log"
+        self.log_path.write_text("", encoding="utf-8")
+        self.stream = sys.stdout if stream is None else stream
+
+    def emit(self, message):
+        message = str(message)
+        print(message, file=self.stream, flush=True)
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(message)
+            handle.write("\n")
+
+
 def _repository_path(repo_root, value):
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -82,6 +101,14 @@ def parse_args(argv=None):
     parser.add_argument(
         "--evaluator-checkpoint",
         default=None,
+    )
+    parser.add_argument(
+        "--trust-evaluator-checkpoint",
+        action="store_true",
+        help=(
+            "Allow legacy pickle deserialization for an explicitly supplied "
+            "evaluator checkpoint; use only for a checkpoint you trust"
+        ),
     )
     parser.add_argument(
         "--distilbert-root",
@@ -166,6 +193,25 @@ def resolve_cli_paths(repo_root, args):
         evaluator_checkpoint=evaluator_checkpoint,
         distilbert_root=distilbert_root,
         output_dir=output_dir.resolve(),
+    )
+
+
+def resolve_evaluator_legacy_trust(repo_root, args, paths):
+    bundled_checkpoint = (
+        Path(repo_root).resolve()
+        / "Evaluator_272"
+        / "experiments"
+        / "temos"
+        / "EXP1"
+        / "checkpoints"
+        / "epoch=99.ckpt"
+    ).resolve()
+    return bool(
+        args.trust_evaluator_checkpoint
+        or (
+            args.evaluator_checkpoint is None
+            and paths.evaluator_checkpoint == bundled_checkpoint
+        )
     )
 
 
@@ -277,6 +323,7 @@ def evaluate_msa_vae_metrics(
     loader,
     device,
     skating_config,
+    progress_callback=None,
 ):
     model.eval()
     text_encoder, motion_encoder = evaluator
@@ -346,6 +393,8 @@ def evaluate_msa_vae_metrics(
             )
             reconstruction.update(prediction_joints, target_joints)
         sample_count += len(batch["sample_ids"])
+        if progress_callback is not None:
+            progress_callback(sample_count, len(loader.dataset))
 
     if sample_count == 0:
         raise ValueError("MSA-VAE evaluation loader yielded no samples")
@@ -377,18 +426,36 @@ def evaluate_msa_vae_metrics(
     return {"sample_count": sample_count, **metrics}
 
 
-def load_evaluator_checkpoint(path, evaluator_root=None):
-    """Load the trusted frozen Lightning evaluator, including NumPy scalars."""
+def load_evaluator_checkpoint(
+    path,
+    evaluator_root=None,
+    trusted_legacy=False,
+):
+    """Load tensor-only evaluators safely or explicitly trusted legacy payloads."""
     root = None if evaluator_root is None else str(Path(evaluator_root).resolve())
     inserted = root is not None and root not in sys.path
     if inserted:
         sys.path.insert(0, root)
     try:
-        payload = torch.load(
-            str(path),
-            map_location="cpu",
-            weights_only=False,
-        )
+        if trusted_legacy:
+            payload = torch.load(
+                str(path),
+                map_location="cpu",
+                weights_only=False,
+            )
+        else:
+            try:
+                payload = torch.load(
+                    str(path),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+            except pickle.UnpicklingError as error:
+                raise ValueError(
+                    "custom evaluator checkpoint is not tensor-only; refusing "
+                    "legacy pickle deserialization. Pass "
+                    "--trust-evaluator-checkpoint only if this file is trusted."
+                ) from error
     finally:
         if inserted:
             sys.path.remove(root)
@@ -405,6 +472,7 @@ def load_frozen_humanml_evaluator(
     device,
     evaluator_checkpoint,
     distilbert_root,
+    trusted_legacy=False,
 ):
     evaluator_root = Path(evaluator_root).resolve()
     inserted = str(evaluator_root) not in sys.path
@@ -442,6 +510,7 @@ def load_frozen_humanml_evaluator(
     evaluator_payload = load_evaluator_checkpoint(
         evaluator_checkpoint,
         evaluator_root=evaluator_root,
+        trusted_legacy=trusted_legacy,
     )
     state_dict = evaluator_payload["state_dict"]
     for prefix, encoder in (
@@ -563,7 +632,7 @@ def _format_final_report(manifest):
     )
 
 
-def write_result_artifacts(manifest, output_dir):
+def write_result_artifacts(manifest, output_dir, append_log=False):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
@@ -593,7 +662,9 @@ def write_result_artifacts(manifest, output_dir):
         writer.writerow(row)
 
     report = _format_final_report(manifest)
-    (output_dir / "evaluation.log").write_text(report, encoding="utf-8")
+    mode = "a" if append_log else "w"
+    with (output_dir / "evaluation.log").open(mode, encoding="utf-8") as handle:
+        handle.write(report)
     return report
 
 
@@ -614,8 +685,12 @@ def main(argv=None):
     preflight_evaluation_assets(paths)
     validate_runtime_args(args)
     device = _resolve_device(args.device)
+    reporter = EvaluationReporter(paths.output_dir)
+    reporter.emit("Preflight passed")
+    reporter.emit("Device: {}".format(device))
     set_evaluation_seed(args.seed)
 
+    reporter.emit("Loading MSA-VAE checkpoint: {}".format(paths.checkpoint))
     model, resolved_config, model_identity = build_and_load_msa_vae(
         paths.checkpoint,
         architecture_overrides(args),
@@ -630,39 +705,71 @@ def main(argv=None):
         split_file=paths.split_file,
         unit_length=unit_length,
     )
+    reporter.emit(
+        "Dataset ready: {} samples (hash {})".format(
+            len(dataset),
+            dataset.sample_hash,
+        )
+    )
     loader = make_msa_vae_metrics_loader(
         dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
+    trusted_legacy_evaluator = resolve_evaluator_legacy_trust(
+        repo_root,
+        args,
+        paths,
+    )
+    reporter.emit(
+        "Loading frozen evaluator: {} ({})".format(
+            paths.evaluator_checkpoint,
+            (
+                "trusted legacy compatibility"
+                if trusted_legacy_evaluator
+                else "tensor-only safe loading"
+            ),
+        )
+    )
     evaluator = load_frozen_humanml_evaluator(
         paths.evaluator_root,
         device,
         paths.evaluator_checkpoint,
         paths.distilbert_root,
+        trusted_legacy=trusted_legacy_evaluator,
     )
     skating_config = SkatingConfig()
+    reporter.emit("Evaluation started")
     metrics = evaluate_msa_vae_metrics(
         model,
         evaluator,
         loader,
         device,
         skating_config,
+        progress_callback=lambda completed, total: reporter.emit(
+            "Progress: {}/{} samples".format(completed, total)
+        ),
     )
+    evaluator_identity = checkpoint_manifest(paths.evaluator_checkpoint)
+    evaluator_identity["trusted_legacy_pickle"] = trusted_legacy_evaluator
     manifest = build_result_manifest(
         metrics=metrics,
         checkpoint=model_identity,
-        evaluator=checkpoint_manifest(paths.evaluator_checkpoint),
+        evaluator=evaluator_identity,
         resolved_config=resolved_config,
         dataset=dataset,
         seed=args.seed,
         batch_size=args.batch_size,
         skating_config=skating_config,
     )
-    report = write_result_artifacts(manifest, paths.output_dir)
+    report = write_result_artifacts(
+        manifest,
+        paths.output_dir,
+        append_log=True,
+    )
     print(report, end="")
-    print("Artifacts: {}".format(paths.output_dir))
+    reporter.emit("Artifacts: {}".format(paths.output_dir))
 
 
 if __name__ == "__main__":

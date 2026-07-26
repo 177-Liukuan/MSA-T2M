@@ -94,8 +94,10 @@ class MSAVAEMetricsDataset(Dataset):
             raise ValueError("HumanML3D-272 mean and std must each have shape (272,)")
         if not np.isfinite(self.mean).all() or not np.isfinite(self.std).all():
             raise ValueError("HumanML3D-272 normalization contains non-finite values")
-        if np.any(self.std == 0):
-            raise ValueError("HumanML3D-272 standard deviation contains zero")
+        if np.any(self.std <= 0):
+            raise ValueError(
+                "HumanML3D-272 standard deviation must be strictly positive"
+            )
 
         resolved_split = (
             Path(split_file)
@@ -152,6 +154,11 @@ class MSAVAEMetricsDataset(Dataset):
             if not captions:
                 continue
             length = raw_length // self.unit_length * self.unit_length
+            if length < 3:
+                raise ValueError(
+                    "{} has fewer than 3 frames after unit-length truncation "
+                    "({} -> {})".format(sample_id, raw_length, length)
+                )
             records.append(
                 EvaluationRecord(
                     sample_id=sample_id,
