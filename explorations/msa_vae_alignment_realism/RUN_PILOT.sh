@@ -48,7 +48,9 @@ if [[ "$actual_tae_sha" != "$TAE_SHA256" ]]; then
 fi
 
 screen_listing=$("$SCREEN_BIN" -ls 2>&1 || true)
-mapfile -t contract_lines < <(pilot_python contract --format tsv)
+mapfile -t contract_lines < <(
+    pilot_python contract --format tsv | sed '/^[[:space:]]*$/d'
+)
 if [[ ${#contract_lines[@]} -ne 4 ]]; then
     echo "Pilot contract must contain exactly four variants" >&2
     exit 2

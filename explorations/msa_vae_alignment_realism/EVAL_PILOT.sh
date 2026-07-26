@@ -26,7 +26,9 @@ weight_name() {
     printf '%s' "${value//./p}"
 }
 
-mapfile -t contract_lines < <(pilot_python contract --format tsv)
+mapfile -t contract_lines < <(
+    pilot_python contract --format tsv | sed '/^[[:space:]]*$/d'
+)
 pilot_python verify >/dev/null
 screen_listing=$("$SCREEN_BIN" -ls 2>&1 || true)
 

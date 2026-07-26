@@ -553,7 +553,13 @@ class PilotScreenEntrypointTest(unittest.TestCase):
         )
         return screen, nvidia_smi, sha256sum, screen_capture
 
-    def _launch(self, temp_root, dry_run=False, busy=False):
+    def _launch(
+        self,
+        temp_root,
+        dry_run=False,
+        busy=False,
+        contract_blank_line=False,
+    ):
         screen, nvidia, sha256sum, capture = self._fake_tools(
             temp_root,
             busy=busy,
@@ -573,6 +579,19 @@ class PilotScreenEntrypointTest(unittest.TestCase):
                 "PILOT_DRY_RUN": "1" if dry_run else "0",
             }
         )
+        if contract_blank_line:
+            conda = temp_root / "conda"
+            self._write_executable(
+                conda,
+                "#!/usr/bin/env bash\n"
+                "shift 4\n"
+                'python "$@"\n'
+                "code=$?\n"
+                'printf "\\n"\n'
+                "exit $code\n",
+            )
+            env["CONDA_DEFAULT_ENV"] = "base"
+            env["PATH"] = f"{temp_root}:{env['PATH']}"
         completed = subprocess.run(
             ["bash", str(EXPLORATION_ROOT / "RUN_PILOT.sh")],
             cwd=ROOT,
@@ -620,6 +639,20 @@ class PilotScreenEntrypointTest(unittest.TestCase):
             self.assertIn(variant.screen_session, line)
             self.assertIn(variant.training_gpus, line)
             self.assertIn("run_variant.sh", line)
+
+    def test_ignores_conda_run_trailing_blank_contract_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            completed, _, capture = self._launch(
+                Path(temp),
+                contract_blank_line=True,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=completed.stdout + completed.stderr,
+            )
+            screen_lines = capture.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(screen_lines), 4)
 
     def test_rejects_busy_gpu_before_creating_output(self):
         with tempfile.TemporaryDirectory() as temp:
