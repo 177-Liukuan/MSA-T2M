@@ -435,7 +435,7 @@ def load_frozen_humanml_evaluator(
             vae=True,
             num_layers=4,
             latent_dim=256,
-            max_len=300,
+            max_len=-1,
         )
     evaluator_payload = load_evaluator_checkpoint(
         evaluator_checkpoint,

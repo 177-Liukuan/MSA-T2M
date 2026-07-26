@@ -441,6 +441,7 @@ class EvaluationCLITest(unittest.TestCase):
                 "class ActorAgnosticEncoder(torch.nn.Module):\n"
                 "    def __init__(self, **kwargs):\n"
                 "        super().__init__()\n"
+                "        self.init_kwargs = kwargs\n"
                 "        warnings.warn('enable_nested_tensor is True, but fake', UserWarning)\n"
                 "        self.weight = torch.nn.Parameter(torch.zeros(1))\n"
             ),
@@ -481,6 +482,7 @@ class EvaluationCLITest(unittest.TestCase):
             )
 
         self.assertEqual(len(encoders), 2)
+        self.assertEqual(encoders[1].init_kwargs["max_len"], -1)
         self.assertFalse(
             [
                 item
