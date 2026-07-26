@@ -1,4 +1,5 @@
 import hashlib
+import os
 import random
 import tempfile
 import unittest
@@ -70,6 +71,23 @@ class _StochasticModel(torch.nn.Module):
     def forward(self, motions, lengths=None):
         noise = torch.randn_like(motions) * 1e-4
         return {"x_recon": motions + noise}
+
+
+class _AccelerateWrappedModel(_StochasticModel):
+    def __init__(self):
+        super().__init__()
+        self.original_forward_calls = 0
+        self.wrapper_forward_calls = 0
+        self._original_forward = self.forward
+        self.forward = self._amp_forward
+
+    def _amp_forward(self, motions, lengths=None):
+        self.wrapper_forward_calls += 1
+        raise AssertionError("AMP training wrapper must not run in validation")
+
+    def forward(self, motions, lengths=None):
+        self.original_forward_calls += 1
+        return super().forward(motions, lengths=lengths)
 
 
 class _TextEncoder(torch.nn.Module):
@@ -271,6 +289,33 @@ class DeterministicValidationWrapperTest(unittest.TestCase):
 
         self.assertFalse(model.training)
 
+    @mock.patch(
+        "eval_msa_vae_metrics.recover_from_local_position",
+        side_effect=_recover_fixture,
+    )
+    def test_bypasses_and_restores_accelerate_amp_forward_wrapper(
+        self,
+        _recover,
+    ):
+        model = _AccelerateWrappedModel()
+
+        run_deterministic_msa_validation(
+            model,
+            [_TextEncoder(), _MotionEncoder()],
+            self.loader,
+            torch.device("cpu"),
+            seed=123,
+        )
+
+        self.assertGreater(model.original_forward_calls, 0)
+        self.assertEqual(model.wrapper_forward_calls, 0)
+        with self.assertRaisesRegex(
+            AssertionError,
+            "AMP training wrapper",
+        ):
+            model(torch.zeros(1, 4, 272), lengths=torch.tensor([4]))
+        self.assertEqual(model.wrapper_forward_calls, 1)
+
 
 class ValidationCheckpointPublicationTest(unittest.TestCase):
     @mock.patch("utils.eval_trans.tensorborad_add_video_xyz")
@@ -404,6 +449,172 @@ class ValidationCheckpointPublicationTest(unittest.TestCase):
                         validation_batch_size=32,
                     )
                 self.assertEqual(list(Path(temp).iterdir()), [])
+
+    def test_staging_failure_preserves_entire_checkpoint_generation(self):
+        from utils.msa_vae_training import save_msa_checkpoint
+
+        for failing_call in (2, 3):
+            with self.subTest(failing_call=failing_call):
+                with tempfile.TemporaryDirectory() as temp:
+                    self._assert_staging_failure_preserves_generation(
+                        Path(temp),
+                        failing_call,
+                        save_msa_checkpoint,
+                    )
+
+    def _assert_staging_failure_preserves_generation(
+        self,
+        output,
+        failing_call,
+        save_msa_checkpoint,
+    ):
+        model = torch.nn.Linear(3, 2)
+        metadata = {"format_version": 1, "phase": 2}
+        state = publish_msa_validation(
+            result=_validation_result(),
+            iteration=0,
+            out_dir=output,
+            model=model,
+            metadata=metadata,
+            state=MSAValidationState(),
+            logger=_Logger(),
+            writer=_Writer(),
+            validation_seed=123,
+            validation_batch_size=32,
+        )
+        checkpoint_names = (
+            "net_best_fid.pth",
+            "net_best_mpjpe.pth",
+            "net_last.pth",
+        )
+        original_hashes = {
+            name: _file_sha256(output / name)
+            for name in checkpoint_names
+        }
+        with torch.no_grad():
+            model.weight.add_(1.0)
+
+        call_count = 0
+
+        def fail_during_staging(path, model, metadata):
+            nonlocal call_count
+            call_count += 1
+            if call_count == failing_call:
+                raise OSError("simulated checkpoint I/O failure")
+            save_msa_checkpoint(path, model, metadata)
+
+        with mock.patch(
+            "utils.msa_vae_validation.save_msa_checkpoint",
+            side_effect=fail_during_staging,
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "simulated checkpoint I/O failure",
+            ):
+                publish_msa_validation(
+                    result=_validation_result(
+                        fid=0.9,
+                        mpjpe_mm=21.0,
+                    ),
+                    iteration=1,
+                    out_dir=output,
+                    model=model,
+                    metadata=metadata,
+                    state=state,
+                    logger=_Logger(),
+                    writer=_Writer(),
+                    validation_seed=123,
+                    validation_batch_size=32,
+                )
+
+        self.assertEqual(
+            {
+                name: _file_sha256(output / name)
+                for name in checkpoint_names
+            },
+            original_hashes,
+        )
+        self.assertEqual(
+            sorted(path.name for path in output.iterdir()),
+            sorted(checkpoint_names),
+        )
+
+    def test_commit_failure_rolls_back_entire_checkpoint_generation(self):
+        for failing_replace in (4, 6):
+            with self.subTest(failing_replace=failing_replace):
+                with tempfile.TemporaryDirectory() as temp:
+                    output = Path(temp)
+                    model = torch.nn.Linear(3, 2)
+                    metadata = {"format_version": 1, "phase": 2}
+                    state = publish_msa_validation(
+                        result=_validation_result(),
+                        iteration=0,
+                        out_dir=output,
+                        model=model,
+                        metadata=metadata,
+                        state=MSAValidationState(),
+                        logger=_Logger(),
+                        writer=_Writer(),
+                        validation_seed=123,
+                        validation_batch_size=32,
+                    )
+                    checkpoint_names = (
+                        "net_best_fid.pth",
+                        "net_best_mpjpe.pth",
+                        "net_last.pth",
+                    )
+                    original_hashes = {
+                        name: _file_sha256(output / name)
+                        for name in checkpoint_names
+                    }
+                    with torch.no_grad():
+                        model.weight.add_(1.0)
+
+                    real_replace = os.replace
+                    replace_count = 0
+
+                    def fail_during_commit(source, destination):
+                        nonlocal replace_count
+                        replace_count += 1
+                        if replace_count == failing_replace:
+                            raise OSError("simulated atomic replace failure")
+                        real_replace(source, destination)
+
+                    with mock.patch(
+                        "utils.msa_vae_validation.os.replace",
+                        side_effect=fail_during_commit,
+                    ):
+                        with self.assertRaisesRegex(
+                            OSError,
+                            "simulated atomic replace failure",
+                        ):
+                            publish_msa_validation(
+                                result=_validation_result(
+                                    fid=0.9,
+                                    mpjpe_mm=21.0,
+                                ),
+                                iteration=1,
+                                out_dir=output,
+                                model=model,
+                                metadata=metadata,
+                                state=state,
+                                logger=_Logger(),
+                                writer=_Writer(),
+                                validation_seed=123,
+                                validation_batch_size=32,
+                            )
+
+                    self.assertEqual(
+                        {
+                            name: _file_sha256(output / name)
+                            for name in checkpoint_names
+                        },
+                        original_hashes,
+                    )
+                    self.assertEqual(
+                        sorted(path.name for path in output.iterdir()),
+                        sorted(checkpoint_names),
+                    )
 
 
 if __name__ == "__main__":

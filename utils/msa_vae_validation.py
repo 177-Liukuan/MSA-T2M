@@ -4,8 +4,11 @@ import contextlib
 import math
 import os
 import random
+import shutil
+import tempfile
 from dataclasses import dataclass
 from numbers import Real
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -36,6 +39,21 @@ VALIDATION_METRIC_KEYS = (
 class MSAValidationState:
     best_fid: float = float("inf")
     best_mpjpe: float = float("inf")
+
+
+@contextlib.contextmanager
+def _original_forward_for_validation(model):
+    """Temporarily bypass Accelerate's mixed-precision forward wrapper."""
+    original_forward = model.__dict__.get("_original_forward")
+    if original_forward is None:
+        yield
+        return
+    wrapped_forward = model.forward
+    model.forward = original_forward
+    try:
+        yield
+    finally:
+        model.forward = wrapped_forward
 
 
 @contextlib.contextmanager
@@ -86,13 +104,14 @@ def run_deterministic_msa_validation(
     was_training = model.training
     try:
         with isolated_validation_rng(seed):
-            return evaluate_msa_vae_metrics(
-                model,
-                evaluator,
-                loader,
-                device,
-                skating_config or SkatingConfig(),
-            )
+            with _original_forward_for_validation(model):
+                return evaluate_msa_vae_metrics(
+                    model,
+                    evaluator,
+                    loader,
+                    device,
+                    skating_config or SkatingConfig(),
+                )
     finally:
         model.train(was_training)
 
@@ -120,6 +139,73 @@ def _validated_result(result):
             )
         validated[name] = float(value)
     return validated
+
+
+def _rollback_checkpoint_generation(
+    checkpoint_names,
+    out_dir,
+    backup_dir,
+    backed_up,
+    published,
+):
+    """Restore the complete prior generation after a failed commit."""
+    for name in reversed(checkpoint_names):
+        target = out_dir / name
+        backup = backup_dir / name
+        if name in backed_up and backup.exists():
+            os.replace(str(backup), str(target))
+        elif name in published and target.exists():
+            target.unlink()
+
+
+def _publish_checkpoint_generation(
+    checkpoint_names,
+    out_dir,
+    model,
+    metadata,
+):
+    """Stage every checkpoint, then publish them as one rollback-safe set."""
+    out_dir = Path(out_dir)
+    transaction_dir = Path(
+        tempfile.mkdtemp(
+            dir=str(out_dir),
+            prefix=".msa-validation-checkpoints-",
+        )
+    )
+    staging_dir = transaction_dir / "staging"
+    backup_dir = transaction_dir / "backup"
+    staging_dir.mkdir()
+    backup_dir.mkdir()
+    try:
+        for name in checkpoint_names:
+            save_msa_checkpoint(
+                staging_dir / name,
+                model,
+                metadata,
+            )
+
+        backed_up = set()
+        published = set()
+        try:
+            for name in checkpoint_names:
+                target = out_dir / name
+                backup = backup_dir / name
+                if target.exists():
+                    os.replace(str(target), str(backup))
+                    backed_up.add(name)
+                os.replace(str(staging_dir / name), str(target))
+                published.add(name)
+        except Exception:
+            _rollback_checkpoint_generation(
+                checkpoint_names,
+                out_dir,
+                backup_dir,
+                backed_up,
+                published,
+            )
+            raise
+    finally:
+        shutil.rmtree(str(transaction_dir), ignore_errors=True)
 
 
 def publish_msa_validation(
@@ -160,17 +246,14 @@ def publish_msa_validation(
         )
 
     best_fid = state.best_fid
+    checkpoint_names = []
     if result["fid"] < best_fid:
         logger.info(
             f"Complete val FID improved from {best_fid:.6f} "
             f"to {result['fid']:.6f}"
         )
         best_fid = result["fid"]
-        save_msa_checkpoint(
-            os.path.join(out_dir, "net_best_fid.pth"),
-            model,
-            metadata,
-        )
+        checkpoint_names.append("net_best_fid.pth")
 
     best_mpjpe = state.best_mpjpe
     if result["mpjpe_mm"] < best_mpjpe:
@@ -179,14 +262,12 @@ def publish_msa_validation(
             f"to {result['mpjpe_mm']:.3f}"
         )
         best_mpjpe = result["mpjpe_mm"]
-        save_msa_checkpoint(
-            os.path.join(out_dir, "net_best_mpjpe.pth"),
-            model,
-            metadata,
-        )
+        checkpoint_names.append("net_best_mpjpe.pth")
 
-    save_msa_checkpoint(
-        os.path.join(out_dir, "net_last.pth"),
+    checkpoint_names.append("net_last.pth")
+    _publish_checkpoint_generation(
+        checkpoint_names,
+        out_dir,
         model,
         metadata,
     )
