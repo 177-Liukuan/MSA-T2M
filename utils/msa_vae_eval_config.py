@@ -297,4 +297,8 @@ def build_and_load_msa_vae(path, overrides, device):
     model.load_state_dict(payload["net"], strict=True)
     model.to(device)
     model.eval()
-    return model, resolved, checkpoint_manifest(path)
+    identity = checkpoint_manifest(path)
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        identity["metadata"] = dict(metadata)
+    return model, resolved, identity

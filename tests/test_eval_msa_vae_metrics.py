@@ -209,10 +209,12 @@ class ResultArtifactTest(unittest.TestCase):
             "t2m_r1_percent": 10.0,
             "t2m_r2_percent": 20.0,
             "t2m_r3_percent": 30.0,
+            "t2m_r5_percent": 40.0,
             "t2m_medr": 7.0,
             "m2t_r1_percent": 11.0,
             "m2t_r2_percent": 21.0,
             "m2t_r3_percent": 31.0,
+            "m2t_r5_percent": 41.0,
             "m2t_medr": 8.0,
         }
         self.dataset = SimpleNamespace(
@@ -245,6 +247,7 @@ class ResultArtifactTest(unittest.TestCase):
             resolved_config=self.resolved,
             dataset=self.dataset,
             seed=123,
+            batch_size=32,
             skating_config=SkatingConfig(),
         )
 
@@ -263,7 +266,7 @@ class ResultArtifactTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(loaded["protocol"]["retrieval"], "TMR-full-normal")
-        self.assertEqual(loaded["protocol"]["version"], "msa-vae-standard-v1")
+        self.assertEqual(loaded["protocol"]["version"], "msa-vae-standard-v2")
         self.assertEqual(
             loaded["protocol"]["caption_policy"],
             "first complete-motion caption",
@@ -275,11 +278,14 @@ class ResultArtifactTest(unittest.TestCase):
         )
         self.assertEqual(loaded["dataset"]["sample_hash"], "abc123")
         self.assertEqual(loaded["dataset"]["sample_ids"], ["a", "b", "c"])
+        self.assertEqual(loaded["batch_size"], 32)
         self.assertEqual(loaded["skating"]["smoothing_window_frames"], 8)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["checkpoint_sha256"], "f" * 64)
         self.assertEqual(float(rows[0]["t2m_r1_percent"]), 10.0)
+        self.assertEqual(float(rows[0]["t2m_r5_percent"]), 40.0)
         self.assertIn("TMR-full-normal", log_text)
+        self.assertEqual(log_text.count("R@5"), 2)
         self.assertEqual(log_text.count("P-MPJPE"), 1)
         self.assertEqual(log_text.count("ACCEL"), 1)
 
@@ -295,6 +301,7 @@ class ResultArtifactTest(unittest.TestCase):
                 resolved_config=self.resolved,
                 dataset=self.dataset,
                 seed=123,
+                batch_size=32,
                 skating_config=SkatingConfig(),
             )
 
@@ -441,6 +448,7 @@ class EvaluationCLITest(unittest.TestCase):
                 "class ActorAgnosticEncoder(torch.nn.Module):\n"
                 "    def __init__(self, **kwargs):\n"
                 "        super().__init__()\n"
+                "        self.init_kwargs = kwargs\n"
                 "        warnings.warn('enable_nested_tensor is True, but fake', UserWarning)\n"
                 "        self.weight = torch.nn.Parameter(torch.zeros(1))\n"
             ),
@@ -481,6 +489,7 @@ class EvaluationCLITest(unittest.TestCase):
             )
 
         self.assertEqual(len(encoders), 2)
+        self.assertEqual(encoders[1].init_kwargs["max_len"], -1)
         self.assertFalse(
             [
                 item

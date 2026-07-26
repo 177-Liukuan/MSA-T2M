@@ -250,6 +250,7 @@ def _rank_metrics(ranks, prefix):
         "{}_r1_percent".format(prefix): float(np.mean(ranks < 1) * 100.0),
         "{}_r2_percent".format(prefix): float(np.mean(ranks < 2) * 100.0),
         "{}_r3_percent".format(prefix): float(np.mean(ranks < 3) * 100.0),
+        "{}_r5_percent".format(prefix): float(np.mean(ranks < 5) * 100.0),
         "{}_medr".format(prefix): float(np.median(ranks) + 1.0),
     }
 

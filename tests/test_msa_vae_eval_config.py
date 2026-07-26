@@ -198,6 +198,10 @@ class MSAEvalConfigTest(unittest.TestCase):
         self.assertEqual(resolved.values, config)
         self.assertEqual(loaded.state_dict().keys(), source_model.state_dict().keys())
         self.assertEqual(manifest["path"], str(self.checkpoint.resolve()))
+        self.assertEqual(
+            manifest["metadata"]["training_args"],
+            config,
+        )
         self.assertFalse(loaded.training)
 
     def test_build_rejects_partial_checkpoint_instead_of_partial_loading(self):
