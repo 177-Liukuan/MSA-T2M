@@ -24,6 +24,8 @@ class MSAOptionTest(unittest.TestCase):
         self.assertEqual(args.full_seq_batch_size, 32)
         self.assertEqual(args.window_replay_interval, 4)
         self.assertEqual(args.length_bucket_size, 256)
+        self.assertEqual(args.validation_seed, 123)
+        self.assertEqual(args.validation_batch_size, 32)
 
 
 class MSAFullSequenceLauncherTest(unittest.TestCase):
@@ -114,6 +116,14 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             self._value_after(arguments, "--length-bucket-size"),
             "19",
         )
+        self.assertEqual(
+            self._value_after(arguments, "--validation-seed"),
+            "123",
+        )
+        self.assertEqual(
+            self._value_after(arguments, "--validation-batch-size"),
+            "32",
+        )
         expected = {
             "--exp-name": "phase1-global-local-seed123",
             "--global_align_weight": "0.25",
@@ -166,6 +176,14 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
         self.assertEqual(
             self._value_after(arguments, "--length-bucket-size"),
             "23",
+        )
+        self.assertEqual(
+            self._value_after(arguments, "--validation-seed"),
+            "123",
+        )
+        self.assertEqual(
+            self._value_after(arguments, "--validation-batch-size"),
+            "32",
         )
         self.assertEqual(
             self._value_after(arguments, "--resume-pth"),

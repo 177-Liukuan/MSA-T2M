@@ -40,6 +40,8 @@ TRAINING_IDENTITY_FIELDS = (
     'total_iter',
     'warm_up_iter',
     'eval_iter',
+    'validation_seed',
+    'validation_batch_size',
     'lr',
     'lr_scheduler',
     'gamma',

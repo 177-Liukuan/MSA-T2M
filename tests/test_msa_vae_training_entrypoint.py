@@ -123,6 +123,8 @@ class CheckpointMetadataTest(unittest.TestCase):
             "full_seq_batch_size": 16,
             "window_replay_interval": 4,
             "length_bucket_size": 256,
+            "validation_seed": 123,
+            "validation_batch_size": 32,
             "down_t": 2,
             "stride_t": 2,
             "latent_dim": 16,
@@ -187,6 +189,11 @@ class CheckpointMetadataTest(unittest.TestCase):
             "a" * 64,
         )
         self.assertEqual(metadata["training_args"]["eval_iter"], 2500)
+        self.assertEqual(metadata["training_args"]["validation_seed"], 123)
+        self.assertEqual(
+            metadata["training_args"]["validation_batch_size"],
+            32,
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "checkpoint.pth"

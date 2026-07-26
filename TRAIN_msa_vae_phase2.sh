@@ -28,6 +28,8 @@ LENGTH_BUCKET_SIZE=${LENGTH_BUCKET_SIZE:-256}
 TOTAL_ITER=${TOTAL_ITER:-50000}
 WARM_UP_ITER=${WARM_UP_ITER:-1000}
 EVAL_ITER=${EVAL_ITER:-500}
+VALIDATION_SEED=${VALIDATION_SEED:-123}
+VALIDATION_BATCH_SIZE=${VALIDATION_BATCH_SIZE:-32}
 OUT_DIR=${OUT_DIR:-Experiments}
 SEED=${SEED:-123}
 GLOBAL_ALIGN_WEIGHT=${GLOBAL_ALIGN_WEIGHT:-0.1}
@@ -87,6 +89,7 @@ echo "Output root     : $OUT_DIR"
 echo "Seed            : $SEED"
 echo "Iterations      : $TOTAL_ITER (warm-up $WARM_UP_ITER)"
 echo "Eval interval   : $EVAL_ITER"
+echo "Validation      : seed=$VALIDATION_SEED batch=$VALIDATION_BATCH_SIZE"
 echo "Align weights   : global=$GLOBAL_ALIGN_WEIGHT local=$LOCAL_ALIGN_WEIGHT"
 echo "====================================================="
 
@@ -133,6 +136,8 @@ accelerate launch --num_processes "$NUM_GPUS" --mixed_precision bf16 \
   --num_gpus "$NUM_GPUS" \
   --resume-pth "$RESUME_PTH" \
   --eval-iter "$EVAL_ITER" \
+  --validation-seed "$VALIDATION_SEED" \
+  --validation-batch-size "$VALIDATION_BATCH_SIZE" \
   --print-iter 200 \
   --spotlight_alpha 0.0 \
   --seed "$SEED"
