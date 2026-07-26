@@ -54,6 +54,7 @@ from utils.msa_vae_training import (
     save_msa_checkpoint,
     select_training_batch,
     validate_msa_checkpoint_metadata,
+    validate_phase2_parent_metadata,
     validate_sequence_training_config,
 )
 import sys
@@ -368,6 +369,7 @@ if args.resume_pth:
             ckpt.get('metadata') if isinstance(ckpt, dict) else None
         )
         validate_msa_checkpoint_metadata(metadata, args)
+        validate_phase2_parent_metadata(metadata, args)
         checkpoint_metadata = inherit_msa_checkpoint_lineage(
             checkpoint_metadata,
             metadata,

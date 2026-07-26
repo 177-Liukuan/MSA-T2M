@@ -27,6 +27,7 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
             for name in TARGET_METRICS
         }
         return {
+            "seed": 2026,
             "protocol": {
                 "version": "msa-vae-standard-v2",
                 "retrieval": "TMR-full-normal",
@@ -36,10 +37,26 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                 "sha256": checkpoint_suffix * 64,
                 "path": f"/models/seed-{seed}.pth",
                 "metadata": {
+                    "format_version": 1,
+                    "phase": 2,
+                    "sequence_mode": "mixed",
+                    "window_size": 64,
+                    "full_seq_batch_size": 16,
+                    "window_replay_interval": 4,
+                    "down_t": 2,
+                    "stride_t": 2,
+                    "unit_length": 4,
+                    "latent_dim": 16,
+                    "normalized_loss_version": 1,
                     "training_args": {
                         "seed": seed,
+                        "exp_name": f"variant-seed-{seed}",
                         "global_align_weight": 0.25,
                         "local_align_weight": 0.05,
+                        "root_loss": 7.0,
+                        "latent_recon_weight": 1.0,
+                        "msa_data_mode": "humanml_full",
+                        "use_ft_split": False,
                         "resume_cnn_pth": "/models/fixed-tae.pth",
                         "resume_cnn_sha256": "d" * 64,
                     }
@@ -127,6 +144,32 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
             "resume_cnn_sha256"
         ] = "c" * 64
         mutations["TAE"] = tae_mismatch
+
+        evaluation_seed_mismatch = self._manifests()
+        evaluation_seed_mismatch[1]["seed"] = 2027
+        mutations["evaluation seed"] = evaluation_seed_mismatch
+
+        training_config_mutations = (
+            (("phase",), 1),
+            (("sequence_mode",), "window"),
+            (("window_replay_interval",), 8),
+            (("training_args", "root_loss"), 8.0),
+            (("training_args", "latent_recon_weight"), 0.5),
+            (("training_args", "msa_data_mode"), "babel_sparse_global"),
+            (("training_args", "use_ft_split"), True),
+        )
+        for keys, value in training_config_mutations:
+            incompatible = self._manifests()
+            target = incompatible[1]["checkpoint"]["metadata"]
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            with self.subTest(training_configuration=keys):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "training configuration",
+                ):
+                    aggregate_variant("variant", incompatible)
 
         missing_metric = self._manifests()
         del missing_metric[1]["metrics"]["fid"]

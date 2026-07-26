@@ -39,6 +39,27 @@ TABLE_HEADERS = (
     "M2T R@5↑",
     "M2T MedR↓",
 )
+TRAINING_RUN_SPECIFIC_FIELDS = frozenset(
+    (
+        "seed",
+        "exp_name",
+        "resume_cnn_pth",
+        "resume_cnn_sha256",
+    )
+)
+CHECKPOINT_METADATA_FIELDS = (
+    "format_version",
+    "phase",
+    "sequence_mode",
+    "window_size",
+    "full_seq_batch_size",
+    "window_replay_interval",
+    "down_t",
+    "stride_t",
+    "unit_length",
+    "latent_dim",
+    "normalized_loss_version",
+)
 
 
 def load_manifest(path: Path) -> Dict[str, Any]:
@@ -78,6 +99,38 @@ def _finite_number(value: Any, label: str) -> float:
     if not math.isfinite(value):
         raise ValueError(f"{label} must be finite")
     return value
+
+
+def _canonical_training_configuration(metadata: Any) -> Dict[str, Any]:
+    """Remove only per-run identity while retaining scientific settings."""
+    if not isinstance(metadata, Mapping):
+        raise ValueError("checkpoint training configuration is missing")
+    configuration = {
+        field: _nested(metadata, (field,), "training configuration")
+        for field in CHECKPOINT_METADATA_FIELDS
+    }
+    training_args = _nested(
+        metadata,
+        ("training_args",),
+        "training configuration",
+    )
+    if not isinstance(training_args, Mapping):
+        raise ValueError("checkpoint training configuration is missing")
+    configuration["training_args"] = {
+        key: value
+        for key, value in training_args.items()
+        if key not in TRAINING_RUN_SPECIFIC_FIELDS
+    }
+
+    lineage = metadata.get("lineage")
+    if lineage is not None:
+        if not isinstance(lineage, Mapping):
+            raise ValueError("checkpoint training configuration is invalid")
+        parent = lineage.get("parent_checkpoint_metadata")
+        configuration["parent_checkpoint"] = (
+            _canonical_training_configuration(parent)
+        )
+    return configuration
 
 
 def aggregate_variant(
@@ -127,6 +180,13 @@ def aggregate_variant(
         ("model_config", "values"),
         "model",
     )
+    evaluation_seed = _same_identity(
+        manifests,
+        ("seed",),
+        "evaluation seed",
+    )
+    if isinstance(evaluation_seed, bool) or not isinstance(evaluation_seed, int):
+        raise ValueError("evaluation seed must be an integer")
 
     checkpoint_shas = [
         _nested(item, ("checkpoint", "sha256"), "checkpoint")
@@ -195,6 +255,22 @@ def aggregate_variant(
     ):
         raise ValueError("TAE checkpoint SHA-256 must be 64 hexadecimal characters")
 
+    training_configurations = [
+        _canonical_training_configuration(
+            _nested(
+                item,
+                ("checkpoint", "metadata"),
+                "training configuration",
+            )
+        )
+        for item in manifests
+    ]
+    if any(
+        configuration != training_configurations[0]
+        for configuration in training_configurations[1:]
+    ):
+        raise ValueError("training configuration mismatch across manifests")
+
     aggregated_metrics = {}
     for name in TARGET_METRICS:
         values = []
@@ -230,12 +306,14 @@ def aggregate_variant(
         "variant": variant,
         "seed_count": 3,
         "seeds": sorted(seeds),
+        "evaluation_seed": evaluation_seed,
         "protocol": protocols[0],
         "evaluator_sha256": evaluator_sha,
         "dataset": dataset_identity,
         "skating": skating,
         "model_config": model_values,
         "alignment_weights": alignment_weights,
+        "training_configuration": training_configurations[0],
         "tae_checkpoint": {
             "path": tae_path,
             "sha256": tae_sha256.lower(),

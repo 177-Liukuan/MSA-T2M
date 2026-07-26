@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 import sys
@@ -10,6 +11,8 @@ from options import option_msa_vae
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FAKE_CNN_CONTENT = b"fake CNN checkpoint for launcher tests\n"
+FAKE_CNN_SHA256 = hashlib.sha256(FAKE_CNN_CONTENT).hexdigest()
 
 
 class MSAOptionTest(unittest.TestCase):
@@ -35,9 +38,12 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
                 encoding="utf-8",
             )
             accelerate.chmod(0o755)
+            fake_cnn = temp_root / "fixed-tae.pth"
+            fake_cnn.write_bytes(FAKE_CNN_CONTENT)
 
             env = os.environ.copy()
             env.update(extra_env)
+            env.setdefault("CNN_CKPT", str(fake_cnn))
             env["CAPTURE_FILE"] = str(capture)
             env["PATH"] = f"{temp_root}:{env['PATH']}"
             completed = subprocess.run(
@@ -84,8 +90,7 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             {
                 "FULL_SEQ_BATCH_SIZE": "7",
                 "LENGTH_BUCKET_SIZE": "19",
-                "CNN_CKPT": "Experiments/test-cnn.pth",
-                "CNN_CKPT_SHA256": "d" * 64,
+                "CNN_CKPT_SHA256": FAKE_CNN_SHA256,
                 "EXP_NAME": "phase1-global-local-seed123",
                 "GLOBAL_ALIGN_WEIGHT": "0.25",
                 "LOCAL_ALIGN_WEIGHT": "0.05",
@@ -118,7 +123,7 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             "--warm-up-iter": "3",
             "--eval-iter": "4",
             "--out-dir": "Experiments/test-ablation",
-            "--resume-cnn-sha256": "d" * 64,
+            "--resume-cnn-sha256": FAKE_CNN_SHA256,
         }
         for flag, value in expected.items():
             self.assertEqual(
@@ -222,6 +227,11 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             "TRAIN_msa_vae_phase1.sh",
             {"CNN_CKPT_SHA256": "not-a-sha256"},
             "CNN_CKPT_SHA256",
+        )
+        self._assert_launcher_rejected(
+            "TRAIN_msa_vae_phase1.sh",
+            {"CNN_CKPT_SHA256": "0" * 64},
+            "does not match",
         )
 
 

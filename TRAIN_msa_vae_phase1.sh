@@ -61,17 +61,23 @@ validate_nonnegative_weight() {
 validate_nonnegative_weight "GLOBAL_ALIGN_WEIGHT" "$GLOBAL_ALIGN_WEIGHT"
 validate_nonnegative_weight "LOCAL_ALIGN_WEIGHT" "$LOCAL_ALIGN_WEIGHT"
 
-if [[ -z "$CNN_CKPT_SHA256" ]]; then
-  if [[ ! -f "$CNN_CKPT" ]]; then
-    echo "ERROR: CNN_CKPT is not a file: $CNN_CKPT" >&2
-    exit 2
-  fi
-  CNN_CKPT_SHA256=$(sha256sum -- "$CNN_CKPT" | awk '{print $1}')
-fi
-if [[ ! "$CNN_CKPT_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
-  echo "ERROR: CNN_CKPT_SHA256 must contain 64 hexadecimal characters" >&2
+if [[ ! -f "$CNN_CKPT" ]]; then
+  echo "ERROR: CNN_CKPT is not a file: $CNN_CKPT" >&2
   exit 2
 fi
+if [[ ! "$CNN_CKPT_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+  if [[ -n "$CNN_CKPT_SHA256" ]]; then
+    echo "ERROR: CNN_CKPT_SHA256 must contain 64 hexadecimal characters" >&2
+    exit 2
+  fi
+fi
+ACTUAL_CNN_CKPT_SHA256=$(sha256sum -- "$CNN_CKPT" | awk '{print $1}')
+if [[ -n "$CNN_CKPT_SHA256" \
+      && "${CNN_CKPT_SHA256,,}" != "$ACTUAL_CNN_CKPT_SHA256" ]]; then
+  echo "ERROR: CNN_CKPT_SHA256 does not match CNN_CKPT contents" >&2
+  exit 2
+fi
+CNN_CKPT_SHA256=$ACTUAL_CNN_CKPT_SHA256
 
 if [ "$TEXT_ENCODER_TYPE" = "t5" ]; then
   TEXT_EMBED_DIM=768

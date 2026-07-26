@@ -3,6 +3,7 @@
 import math
 import json
 import os
+import re
 import tempfile
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -18,6 +19,10 @@ MOTION_LENGTH_BIN_NAMES = (
 )
 
 TRAINING_IDENTITY_FIELDS = (
+    'dataname',
+    'batch_size',
+    'use_ft_split',
+    'length_bucket_size',
     'hidden_size',
     'down_t',
     'stride_t',
@@ -32,6 +37,15 @@ TRAINING_IDENTITY_FIELDS = (
     'trans_dropout',
     'clip_dim',
     'disable_decoupling',
+    'total_iter',
+    'warm_up_iter',
+    'lr',
+    'lr_scheduler',
+    'gamma',
+    'weight_decay',
+    'cnn_lr_scale',
+    'spotlight_alpha',
+    'num_gpus',
     'seed',
     'global_align_weight',
     'local_align_weight',
@@ -41,6 +55,7 @@ TRAINING_IDENTITY_FIELDS = (
     'msa_data_mode',
     'text_encoder_type',
     'text_embed_dim',
+    'use_offline_global_text',
     'resume_cnn_pth',
     'resume_cnn_sha256',
 )
@@ -391,6 +406,46 @@ def validate_msa_checkpoint_metadata(metadata, args):
         raise ValueError(
             f'checkpoint unit_length={actual_unit_length} does not match '
             f'requested unit_length={expected_unit_length}'
+        )
+
+
+def validate_phase2_parent_metadata(metadata, args):
+    """Require Phase 2 to resume a traceable full-sequence Phase 1 run."""
+    if int(args.phase) != 2:
+        return
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            'Phase 2 requires checkpoint metadata from a fresh Phase 1 run'
+        )
+    validate_msa_checkpoint_metadata(metadata, args)
+    if metadata.get('phase') != 1:
+        raise ValueError(
+            f'Phase 2 parent checkpoint phase must be 1, '
+            f'got {metadata.get("phase")}'
+        )
+    if metadata.get('sequence_mode') != 'full':
+        raise ValueError(
+            'Phase 2 parent checkpoint sequence_mode must be full, '
+            f'got {metadata.get("sequence_mode")}'
+        )
+    parent_args = metadata.get('training_args')
+    if not isinstance(parent_args, Mapping):
+        raise ValueError(
+            'Phase 2 parent checkpoint is missing training metadata'
+        )
+    tae_path = parent_args.get('resume_cnn_pth')
+    tae_sha256 = parent_args.get('resume_cnn_sha256')
+    if not isinstance(tae_path, str) or not tae_path:
+        raise ValueError(
+            'Phase 2 parent checkpoint is missing fixed TAE path metadata'
+        )
+    if (
+        not isinstance(tae_sha256, str)
+        or re.fullmatch(r'[0-9a-fA-F]{64}', tae_sha256) is None
+    ):
+        raise ValueError(
+            'Phase 2 parent checkpoint is missing valid fixed TAE SHA-256 '
+            'metadata'
         )
 
 
