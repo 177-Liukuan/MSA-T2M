@@ -24,6 +24,8 @@ import math
 import codecs as cs
 from tqdm import tqdm
 
+from humanml3d_272.msa_text_targets import build_local_text_target
+
 
 class MSAVAEDataset(data.Dataset):
     def __init__(self, dataset_name, window_size=64, unit_length=4,
@@ -86,6 +88,7 @@ class MSAVAEDataset(data.Dataset):
 
         self.data = []
         self.lengths = []
+        self.skipped_subunit_count = 0
         n_with_local = 0
         n_with_global = 0
 
@@ -93,10 +96,8 @@ class MSAVAEDataset(data.Dataset):
             try:
                 motion = np.load(pjoin(self.motion_dir, name + '.npy'))
                 if motion.shape[0] < self.unit_length:
-                    raise MotionSequenceTooShortError(
-                        f'Motion {name} has {motion.shape[0]} frames, fewer '
-                        f'than one {self.unit_length}-frame latent unit'
-                    )
+                    self.skipped_subunit_count += 1
+                    continue
                 if (self.sequence_mode == 'window'
                         and motion.shape[0] < self.window_size):
                     continue
@@ -181,7 +182,9 @@ class MSAVAEDataset(data.Dataset):
         self.std = std
         print(f'MSA-VAE training: {len(self.data)} samples '
               f'({n_with_local} with local {self.text_encoder_type.upper()} embeddings, '
-              f'{n_with_global} with offline global embeddings, dim={self.text_embed_dim})')
+              f'{n_with_global} with offline global embeddings, '
+              f'{self.skipped_subunit_count} shorter than one latent unit skipped, '
+              f'dim={self.text_embed_dim})')
 
     def inv_transform(self, data):
         return data * self.std + self.mean
@@ -229,14 +232,15 @@ class MSAVAEDataset(data.Dataset):
         has_local = entry['has_local']
         latent_len = motion_length // self.unit_length
         if has_local:
-            local_text_20 = np.load(entry['local_text_path'])  # (T_20fps, D)
-            T_20 = local_text_20.shape[0]
-            T_30 = len(motion)
-            indices_30 = np.round(np.linspace(0, T_20 - 1, T_30)).astype(int)
-            local_text_30 = local_text_20[indices_30]
-            local_text_view = local_text_30[idx:idx + motion_length]
-            local_text_pooled = local_text_view.mean(axis=0)  # (D,)
-            local_text_latent = _pool_to_latent(local_text_view, latent_len)
+            local_text_20 = np.load(entry['local_text_path'])
+            local_text_latent, local_text_pooled = build_local_text_target(
+                local_text_20,
+                raw_motion_length=len(motion),
+                view_start=idx,
+                view_length=motion_length,
+                latent_length=latent_len,
+                expected_dim=self.text_embed_dim,
+            )
         else:
             local_text_latent = np.zeros((latent_len, self.text_embed_dim), dtype=np.float32)
             local_text_pooled = np.zeros((self.text_embed_dim,), dtype=np.float32)
@@ -274,6 +278,15 @@ class MotionSequenceTooShortError(ValueError):
     """A motion cannot produce even one complete temporal latent token."""
 
 
+def source_dataset_sequence_mode(sequence_mode):
+    """Keep every full-sequence record when mixed replay is requested."""
+    if sequence_mode == 'mixed':
+        return 'full'
+    if sequence_mode in ('window', 'full'):
+        return sequence_mode
+    raise ValueError(f'unknown sequence_mode: {sequence_mode}')
+
+
 class MSAVAESequenceView(data.Dataset):
     """Select a sequence view without duplicating the loaded source records."""
 
@@ -284,22 +297,30 @@ class MSAVAESequenceView(data.Dataset):
             )
         self.dataset = dataset
         self.sequence_mode = sequence_mode
+        if sequence_mode == 'window':
+            self.indices = [
+                index
+                for index, entry in enumerate(dataset.data)
+                if len(entry['motion']) >= dataset.window_size
+            ]
+        else:
+            self.indices = list(range(len(dataset.data)))
 
     @property
     def source_lengths(self):
         if self.sequence_mode == 'window':
-            return [self.dataset.window_size] * len(self.dataset)
+            return [self.dataset.window_size] * len(self.indices)
         return [
-            (len(entry['motion']) // self.dataset.unit_length)
+            (len(self.dataset.data[index]['motion']) // self.dataset.unit_length)
             * self.dataset.unit_length
-            for entry in self.dataset.data
+            for index in self.indices
         ]
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.indices)
 
     def __getitem__(self, item):
-        return self.dataset.get_item(item, self.sequence_mode)
+        return self.dataset.get_item(self.indices[item], self.sequence_mode)
 
 
 class LengthBucketBatchSampler(torch.utils.data.Sampler):
@@ -349,19 +370,6 @@ class LengthBucketBatchSampler(torch.utils.data.Sampler):
                     batches.append(batch)
         generator.shuffle(batches)
         return iter(batches)
-
-
-def _pool_to_latent(text_window, latent_len):
-    """Average-pool frame-level text embedding (T, D) to (latent_len, D)."""
-    T = text_window.shape[0]
-    if T == latent_len:
-        return text_window
-    indices = np.linspace(0, T, latent_len + 1).astype(int)
-    pooled = np.zeros((latent_len, text_window.shape[1]), dtype=np.float32)
-    for i in range(latent_len):
-        pooled[i] = text_window[indices[i]:indices[i + 1]].mean(axis=0)
-    return pooled
-
 
 def collate_fn(batch):
     (motions, captions, global_texts, has_globals, local_texts, has_locals,

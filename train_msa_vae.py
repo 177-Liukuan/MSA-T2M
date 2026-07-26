@@ -27,6 +27,7 @@ except ImportError:
 
 from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate.utils import broadcast_object_list
 
 import models.msa_vae as msa_vae
 import utils.losses as losses
@@ -43,17 +44,30 @@ from utils.eval_msa_vae_babel import (
     prepare_babel_validation_loader,
     validate_msa_assets_after_loader,
 )
-from humanml3d_272 import dataset_eval_t2m, dataset_msa_vae
-import utils.eval_trans as eval_trans
+from humanml3d_272 import dataset_msa_vae
+from humanml3d_272.dataset_eval_msa_vae_metrics import (
+    MSAVAEMetricsDataset,
+    make_msa_vae_metrics_loader,
+)
 from utils.msa_vae_training import (
     MSAVAELossWeights,
     build_global_alignment_target,
     build_msa_checkpoint_metadata,
+    build_phase2_optimizer_param_groups,
+    inherit_msa_checkpoint_lineage,
     compute_msa_vae_objective,
+    configure_msa_vae_trainability,
     save_msa_checkpoint,
     select_training_batch,
     validate_msa_checkpoint_metadata,
+    validate_phase2_parent_metadata,
+    validate_phase2_resume_requirement,
     validate_sequence_training_config,
+)
+from utils.msa_vae_validation import (
+    MSAValidationState,
+    publish_msa_validation,
+    run_deterministic_msa_validation,
 )
 import sys
 import warnings
@@ -104,29 +118,6 @@ class FrozenT5TextEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-#   Eval-compatible wrapper
-# ---------------------------------------------------------------------------
-class EvalCompat(nn.Module):
-    """Thin wrapper: MSA_HumanVAE dict output -> tuple for eval functions."""
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x):
-        out = self.model(x)
-        return out['x_recon'], out['mu'], out['logvar']
-
-    def forward_decoder(self, z):
-        return self.model.forward_decoder(z)
-
-    def state_dict(self, *args, **kwargs):
-        return self.model.state_dict(*args, **kwargs)
-
-    def load_state_dict(self, *args, **kwargs):
-        return self.model.load_state_dict(*args, **kwargs)
-
-
-# ---------------------------------------------------------------------------
 #   Helpers
 # ---------------------------------------------------------------------------
 def update_lr_warm_up(optimizer, nb_iter, warm_up_iter, lr):
@@ -169,6 +160,7 @@ def log_model_params(model, name="Model", accelerator=None):
 #   Main
 # ---------------------------------------------------------------------------
 args = option_msa_vae.get_args_parser()
+validate_phase2_resume_requirement(args)
 if args.msa_data_mode == 'babel_sparse_global':
     accelerator = Accelerator(
         dataloader_config=DataLoaderConfiguration(even_batches=False)
@@ -252,10 +244,8 @@ else:
         use_offline_global_text=args.use_offline_global_text,
         clip_global_embed_dir=args.clip_global_embed_dir,
         t5_global_embed_dir=args.t5_global_embed_dir,
-        sequence_mode=(
-            'window'
-            if args.sequence_mode == 'mixed'
-            else args.sequence_mode
+        sequence_mode=dataset_msa_vae.source_dataset_sequence_mode(
+            args.sequence_mode
         ),
     )
     full_loader = None
@@ -279,13 +269,29 @@ else:
             drop_last=True,
             seed=args.seed,
         )
-    validation_loader = dataset_eval_t2m.DATALoader(
-        args.dataname,
-        False,
-        32,
-        unit_length=unit_length,
-    )
-    validation_backend = 'humanml_tmr'
+    if accelerator.is_main_process:
+        validation_dataset = MSAVAEMetricsDataset(
+            'humanml3d_272',
+            split_file='humanml3d_272/split/val.txt',
+            unit_length=unit_length,
+        )
+        validation_loader = make_msa_vae_metrics_loader(
+            validation_dataset,
+            batch_size=args.validation_batch_size,
+            num_workers=8,
+            pin_memory=comp_device.type == 'cuda',
+        )
+        logger.info(
+            'Deterministic complete validation: split=val '
+            f'samples={len(validation_dataset)} '
+            f'sample_hash={validation_dataset.sample_hash} '
+            f'seed={args.validation_seed} '
+            f'batch_size={args.validation_batch_size}'
+        )
+    else:
+        validation_dataset = None
+        validation_loader = None
+    validation_backend = 'humanml_complete_deterministic'
 logger.info(f'MSA validation backend: {validation_backend}')
 
 ##### ---- Network ---- #####
@@ -369,6 +375,12 @@ if args.resume_pth:
             ckpt.get('metadata') if isinstance(ckpt, dict) else None
         )
         validate_msa_checkpoint_metadata(metadata, args)
+        validate_phase2_parent_metadata(metadata, args)
+        checkpoint_metadata = inherit_msa_checkpoint_lineage(
+            checkpoint_metadata,
+            metadata,
+            args.resume_pth,
+        )
     state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
     net.load_state_dict(state, strict=True)
 
@@ -379,31 +391,39 @@ if text_encoder is not None:
     text_encoder.eval()
 
 ##### ---- Phase-aware freeze / unfreeze ---- #####
-# Identify CNN params (bottom layer) vs top-layer params
-cnn_modules = ['msa_vae.cnn_encoder', 'msa_vae.cnn_decoder', 'msa_vae.decode_proj']
-top_modules = ['msa_vae.trans_encoder', 'msa_vae.trans_decoder',
-               'msa_vae.global_proj', 'msa_vae.local_proj']
-
-def set_cnn_frozen(model, frozen):
-    """Freeze or unfreeze CNN encoder/decoder/decode_proj."""
-    for name, param in model.named_parameters():
-        if any(name.startswith(m) for m in cnn_modules):
-            param.requires_grad = not frozen
+module_trainability = configure_msa_vae_trainability(
+    net,
+    phase=args.phase,
+    freeze_phase2_local_proj=args.freeze_phase2_local_proj,
+)
+if args.phase == 1:
+    logger.info(
+        'Phase 1: CNN encoder/decoder/decode_proj frozen; '
+        'semantic modules trainable'
+    )
+elif args.phase == 2:
+    logger.info(
+        'Phase 2: CNN and semantic modules trainable; '
+        f'local_proj frozen={args.freeze_phase2_local_proj}; '
+        f'CNN LR scale={args.cnn_lr_scale}'
+    )
+else:
+    logger.info(
+        'Phase 0: legacy mode, all model parameters trainable'
+    )
+logger.info(
+    'Module trainability: '
+    + json.dumps(module_trainability, sort_keys=True)
+)
 
 if args.phase == 1:
-    # Phase 1: freeze CNN, only train Transformer + projections
-    set_cnn_frozen(net, frozen=True)
-    n_frozen = sum(1 for n, p in net.named_parameters() if not p.requires_grad)
-    n_train = sum(1 for n, p in net.named_parameters() if p.requires_grad)
-    logger.info(f'Phase 1: CNN frozen ({n_frozen} params frozen, {n_train} trainable)')
+    phase_desc = 'Phase 1, CNN frozen'
+elif args.phase == 2 and args.freeze_phase2_local_proj:
+    phase_desc = 'Phase 2, local_proj frozen'
 elif args.phase == 2:
-    # Phase 2: all unfrozen (differential LR set in optimizer)
-    set_cnn_frozen(net, frozen=False)
-    logger.info(f'Phase 2: all params unfrozen, CNN LR scale = {args.cnn_lr_scale}')
+    phase_desc = 'Phase 2, all trainable'
 else:
-    logger.info(f'Phase 0: legacy mode, all params trainable with uniform LR')
-
-phase_desc = 'Phase 1, CNN frozen' if args.phase == 1 else ('Phase 2, all unfrozen' if args.phase == 2 else 'Phase 0, legacy')
+    phase_desc = 'Phase 0, legacy'
 log_model_params(net, name=f'MSA-HumanVAE ({phase_desc})', accelerator=accelerator)
 
 net.train()
@@ -421,7 +441,7 @@ if args.msa_data_mode == 'humanml_full':
         evaluator_modelpath, num_layers=4, latent_dim=256
     )
     eval_motionencoder = ActorAgnosticEncoder(
-        nfeats=272, vae=True, num_layers=4, latent_dim=256, max_len=300
+        nfeats=272, vae=True, num_layers=4, latent_dim=256, max_len=-1
     )
     evaluator_ckpt_path = 'Evaluator_272/experiments/temos/EXP1/checkpoints/epoch=99.ckpt'
     evaluator_ckpt = torch.load(evaluator_ckpt_path, map_location='cpu')
@@ -443,20 +463,20 @@ else:
 
 ##### ---- Optimizer & Scheduler ---- #####
 if args.phase == 2:
-    # Differential LR: CNN params get scaled-down LR
-    cnn_params, top_params = [], []
-    for name, param in net.named_parameters():
-        if any(name.startswith(m) for m in cnn_modules):
-            cnn_params.append(param)
-        else:
-            top_params.append(param)
-    param_groups = [
-        {'params': top_params, 'lr': args.lr},
-        {'params': cnn_params, 'lr': args.lr * args.cnn_lr_scale},
-    ]
-    optimizer = optim.AdamW(param_groups, betas=(0.9, 0.99),
-                            weight_decay=args.weight_decay)
-    logger.info(f'Optimizer: top LR={args.lr}, CNN LR={args.lr * args.cnn_lr_scale}')
+    param_groups = build_phase2_optimizer_param_groups(
+        net,
+        lr=args.lr,
+        cnn_lr_scale=args.cnn_lr_scale,
+    )
+    optimizer = optim.AdamW(
+        param_groups,
+        betas=(0.9, 0.99),
+        weight_decay=args.weight_decay,
+    )
+    logger.info(
+        f'Optimizer: top LR={args.lr}, '
+        f'CNN LR={args.lr * args.cnn_lr_scale}'
+    )
 else:
     # Phase 0/1: uniform LR on trainable params only
     trainable_params = [p for p in net.parameters() if p.requires_grad]
@@ -513,8 +533,6 @@ loss_weights = MSAVAELossWeights(
     global_align=args.global_align_weight,
     local_align=args.local_align_weight,
 )
-net_eval = EvalCompat(accelerator.unwrap_model(net))
-
 ##### ---- Training function (shared by warmup & main) ---- #####
 def compute_losses(batch, net_module):
     """Compute fixed-window sparse-supervision BABEL losses.
@@ -714,6 +732,51 @@ def select_current_training_batch(step):
     )
 
 
+def run_humanml_complete_validation(iteration, validation_state):
+    """Run main-rank complete validation and propagate failures to all ranks."""
+    accelerator.wait_for_everyone()
+    validation_error = [None]
+    caught_error = None
+    if accelerator.is_main_process:
+        try:
+            eval_model = accelerator.unwrap_model(net)
+            result = run_deterministic_msa_validation(
+                eval_model,
+                evaluator,
+                validation_loader,
+                comp_device,
+                seed=args.validation_seed,
+            )
+            validation_state = publish_msa_validation(
+                result=result,
+                iteration=iteration,
+                out_dir=args.out_dir,
+                model=eval_model,
+                metadata=checkpoint_metadata,
+                state=validation_state,
+                logger=logger,
+                writer=writer,
+                validation_seed=args.validation_seed,
+                validation_batch_size=args.validation_batch_size,
+            )
+        except Exception as exc:
+            caught_error = exc
+            validation_error[0] = (
+                f'{type(exc).__name__}: {exc}'
+            )
+    broadcast_object_list(validation_error, from_process=0)
+    if validation_error[0] is not None:
+        message = (
+            'deterministic HumanML validation failed on main rank: '
+            f'{validation_error[0]}'
+        )
+        if caught_error is not None:
+            raise RuntimeError(message) from caught_error
+        raise RuntimeError(message)
+    accelerator.wait_for_everyone()
+    return validation_state
+
+
 ##### ---- Warm-up ---- #####
 loss_log_names = [
     'recon', 'kl', 'root', 'latent', 'global_align', 'local_align',
@@ -759,10 +822,10 @@ for nb_iter in range(1, args.warm_up_iter):
 avg = {key: 0.0 for key in loss_log_names}
 
 # Initial eval
-eval_net = accelerator.unwrap_model(net)
-best_iter, best_fid = 0, 1e6
 best_semantic, best_mpjpe = float('inf'), float('inf')
+validation_state = MSAValidationState()
 if args.msa_data_mode == 'babel_sparse_global':
+    eval_net = accelerator.unwrap_model(net)
     babel_result = evaluate_msa_vae_babel(
         args.out_dir, validation_loader, eval_net, babel_validation_dataset,
         logger, writer, iteration=0, phase=args.phase,
@@ -773,12 +836,9 @@ if args.msa_data_mode == 'babel_sparse_global':
     best_semantic = babel_result.best_semantic
     best_mpjpe = babel_result.best_mpjpe
 else:
-    net_eval.model = eval_net
-    best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
-        args.out_dir, validation_loader, net_eval, logger, writer, 0,
-        best_iter=best_iter, best_fid=best_fid, best_mpjpe=best_mpjpe,
-        evaluator=evaluator, device=comp_device, accelerator=accelerator,
-        checkpoint_metadata=checkpoint_metadata,
+    validation_state = run_humanml_complete_validation(
+        iteration=0,
+        validation_state=validation_state,
     )
 
 logger.info(f'=== Main training: {args.total_iter} iterations ===')
@@ -818,8 +878,8 @@ for nb_iter in range(1, args.total_iter + 1):
         avg = {k: 0. for k in avg}
 
     if nb_iter % args.eval_iter == 0:
-        eval_net = accelerator.unwrap_model(net)
         if args.msa_data_mode == 'babel_sparse_global':
+            eval_net = accelerator.unwrap_model(net)
             babel_result = evaluate_msa_vae_babel(
                 args.out_dir, validation_loader, eval_net,
                 babel_validation_dataset, logger, writer,
@@ -831,12 +891,9 @@ for nb_iter in range(1, args.total_iter + 1):
             best_semantic = babel_result.best_semantic
             best_mpjpe = babel_result.best_mpjpe
         else:
-            net_eval.model = eval_net
-            best_iter, best_fid, best_mpjpe, writer, logger = eval_trans.evaluation_msa_vae_multi(
-                args.out_dir, validation_loader, net_eval, logger, writer, nb_iter,
-                best_iter, best_fid, best_mpjpe,
-                evaluator=evaluator, device=comp_device, accelerator=accelerator,
-                checkpoint_metadata=checkpoint_metadata,
+            validation_state = run_humanml_complete_validation(
+                iteration=nb_iter,
+                validation_state=validation_state,
             )
 
 accelerator.wait_for_everyone()

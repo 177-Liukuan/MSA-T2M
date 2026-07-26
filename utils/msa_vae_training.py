@@ -3,7 +3,9 @@
 import math
 import json
 import os
+import re
 import tempfile
+from collections.abc import Mapping
 from typing import NamedTuple
 
 import torch
@@ -15,6 +17,137 @@ MOTION_LENGTH_BIN_NAMES = (
     '65_to_128',
     'over_128',
 )
+
+TRAINING_IDENTITY_FIELDS = (
+    'dataname',
+    'batch_size',
+    'use_ft_split',
+    'length_bucket_size',
+    'hidden_size',
+    'down_t',
+    'stride_t',
+    'depth',
+    'dilation_growth_rate',
+    'latent_dim',
+    'trans_d_model',
+    'trans_nhead',
+    'trans_enc_layers',
+    'trans_dec_layers',
+    'trans_ff_size',
+    'trans_dropout',
+    'clip_dim',
+    'disable_decoupling',
+    'total_iter',
+    'warm_up_iter',
+    'eval_iter',
+    'validation_seed',
+    'validation_batch_size',
+    'lr',
+    'lr_scheduler',
+    'gamma',
+    'weight_decay',
+    'cnn_lr_scale',
+    'spotlight_alpha',
+    'num_gpus',
+    'seed',
+    'global_align_weight',
+    'local_align_weight',
+    'latent_recon_weight',
+    'root_loss',
+    'exp_name',
+    'msa_data_mode',
+    'text_encoder_type',
+    'text_embed_dim',
+    'use_offline_global_text',
+    'resume_cnn_pth',
+    'resume_cnn_sha256',
+    'freeze_phase2_local_proj',
+)
+
+MSA_REQUIRED_PHASE_MODULES = (
+    'cnn_encoder',
+    'cnn_decoder',
+    'decode_proj',
+    'local_proj',
+)
+MSA_CNN_MODULES = (
+    'cnn_encoder',
+    'cnn_decoder',
+    'decode_proj',
+)
+
+
+def _msa_core(model):
+    core = getattr(model, 'msa_vae', model)
+    missing = [
+        name
+        for name in MSA_REQUIRED_PHASE_MODULES
+        if not hasattr(core, name)
+    ]
+    if missing:
+        raise ValueError(
+            'MSA-VAE model is missing required modules: '
+            + ', '.join(missing)
+        )
+    return core
+
+
+def configure_msa_vae_trainability(
+        model, phase, freeze_phase2_local_proj=False):
+    """Apply the phase trainability contract after checkpoint loading."""
+    if phase not in (0, 1, 2):
+        raise ValueError(f'unsupported phase: {phase}')
+    if freeze_phase2_local_proj and phase != 2:
+        raise ValueError(
+            'freeze_phase2_local_proj is valid only for Phase 2'
+        )
+    core = _msa_core(model)
+    for parameter in core.parameters():
+        parameter.requires_grad = True
+    if phase == 1:
+        for name in MSA_CNN_MODULES:
+            for parameter in getattr(core, name).parameters():
+                parameter.requires_grad = False
+    elif phase == 2 and freeze_phase2_local_proj:
+        for parameter in core.local_proj.parameters():
+            parameter.requires_grad = False
+    return {
+        name: all(
+            parameter.requires_grad
+            for parameter in module.parameters()
+        )
+        for name, module in core.named_children()
+    }
+
+
+def build_phase2_optimizer_param_groups(model, lr, cnn_lr_scale):
+    """Build trainable-only top/CNN parameter groups for Phase 2."""
+    core = _msa_core(model)
+    cnn_parameter_ids = {
+        id(parameter)
+        for name in MSA_CNN_MODULES
+        for parameter in getattr(core, name).parameters()
+    }
+    cnn_params = []
+    top_params = []
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        if id(parameter) in cnn_parameter_ids:
+            cnn_params.append(parameter)
+        else:
+            top_params.append(parameter)
+    if not top_params:
+        raise ValueError('Phase 2 top optimizer group has no parameters')
+    if not cnn_params:
+        raise ValueError('Phase 2 CNN optimizer group has no parameters')
+    return [
+        {'params': top_params, 'lr': float(lr)},
+        {
+            'params': cnn_params,
+            'lr': float(lr) * float(cnn_lr_scale),
+        },
+    ]
 
 
 def motion_length_bin(length):
@@ -314,6 +447,14 @@ def build_global_alignment_target(global_text, local_pooled, has_local,
 
 def build_msa_checkpoint_metadata(args):
     """Record sequence-training structure without changing tensor keys."""
+    training_args = {
+        field: (
+            getattr(args, field, False)
+            if field == 'freeze_phase2_local_proj'
+            else getattr(args, field)
+        )
+        for field in TRAINING_IDENTITY_FIELDS
+    }
     return {
         'format_version': 1,
         'phase': int(args.phase),
@@ -326,6 +467,7 @@ def build_msa_checkpoint_metadata(args):
         'unit_length': int(args.stride_t) ** int(args.down_t),
         'latent_dim': int(args.latent_dim),
         'normalized_loss_version': 1,
+        'training_args': training_args,
     }
 
 
@@ -358,6 +500,99 @@ def validate_msa_checkpoint_metadata(metadata, args):
             f'checkpoint unit_length={actual_unit_length} does not match '
             f'requested unit_length={expected_unit_length}'
         )
+
+
+def validate_phase2_parent_metadata(metadata, args):
+    """Require Phase 2 to resume a traceable full-sequence Phase 1 run."""
+    if int(args.phase) != 2:
+        return
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            'Phase 2 requires checkpoint metadata from a fresh Phase 1 run'
+        )
+    validate_msa_checkpoint_metadata(metadata, args)
+    if metadata.get('phase') != 1:
+        raise ValueError(
+            f'Phase 2 parent checkpoint phase must be 1, '
+            f'got {metadata.get("phase")}'
+        )
+    if metadata.get('sequence_mode') != 'full':
+        raise ValueError(
+            'Phase 2 parent checkpoint sequence_mode must be full, '
+            f'got {metadata.get("sequence_mode")}'
+        )
+    parent_args = metadata.get('training_args')
+    if not isinstance(parent_args, Mapping):
+        raise ValueError(
+            'Phase 2 parent checkpoint is missing training metadata'
+        )
+    tae_path = parent_args.get('resume_cnn_pth')
+    tae_sha256 = parent_args.get('resume_cnn_sha256')
+    if not isinstance(tae_path, str) or not tae_path:
+        raise ValueError(
+            'Phase 2 parent checkpoint is missing fixed TAE path metadata'
+        )
+    if (
+        not isinstance(tae_sha256, str)
+        or re.fullmatch(r'[0-9a-fA-F]{64}', tae_sha256) is None
+    ):
+        raise ValueError(
+            'Phase 2 parent checkpoint is missing valid fixed TAE SHA-256 '
+            'metadata'
+        )
+
+
+def validate_phase2_resume_requirement(args):
+    """Reject a Phase 2 launch that has no Phase 1 checkpoint to resume."""
+    if int(args.phase) == 2 and not getattr(args, 'resume_pth', None):
+        raise ValueError(
+            'Phase 2 requires --resume-pth from a fresh Phase 1 run'
+        )
+
+
+def inherit_msa_checkpoint_lineage(
+        metadata, parent_metadata, parent_checkpoint_path):
+    """Carry Phase 1 seed and fixed-TAE identity into Phase 2 metadata."""
+    result = dict(metadata)
+    lineage = {
+        'parent_checkpoint_path': os.fspath(parent_checkpoint_path),
+        'parent_checkpoint_metadata': (
+            dict(parent_metadata)
+            if isinstance(parent_metadata, Mapping)
+            else None
+        ),
+    }
+    result['lineage'] = lineage
+    if not isinstance(parent_metadata, Mapping):
+        return result
+
+    current_args = dict(result.get('training_args') or {})
+    parent_args = parent_metadata.get('training_args')
+    if not isinstance(parent_args, Mapping):
+        return result
+    current_seed = current_args.get('seed')
+    parent_seed = parent_args.get('seed')
+    if (
+        current_seed is not None
+        and parent_seed is not None
+        and current_seed != parent_seed
+    ):
+        raise ValueError(
+            f'Phase 2 seed={current_seed} does not match '
+            f'Phase 1 seed={parent_seed}'
+        )
+    for field in ('resume_cnn_pth', 'resume_cnn_sha256'):
+        parent_value = parent_args.get(field)
+        current_value = current_args.get(field)
+        if current_value and parent_value and current_value != parent_value:
+            raise ValueError(
+                f'Phase 2 {field}={current_value} does not match '
+                f'Phase 1 {field}={parent_value}'
+            )
+        if not current_value:
+            current_args[field] = parent_value
+    result['training_args'] = current_args
+    return result
 
 
 def save_msa_checkpoint(path, model, metadata=None):

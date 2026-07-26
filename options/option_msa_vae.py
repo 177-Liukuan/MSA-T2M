@@ -152,6 +152,17 @@ def get_args_parser():
                              '2=unfreeze all with differential LR')
     parser.add_argument('--cnn_lr_scale', default=0.1, type=float,
                         help='LR scale factor for CNN params in phase 2')
+    parser.add_argument(
+        '--freeze-phase2-local-proj',
+        '--freeze_phase2_local_proj',
+        dest='freeze_phase2_local_proj',
+        action='store_true',
+        default=False,
+        help=(
+            'freeze the Phase-1 local projection during Phase 2 while '
+            'preserving gradients to CNN mu'
+        ),
+    )
 
     ## resume
     parser.add_argument('--resume-pth', type=str, default=None, help='resume pth for MSA-VAE')
@@ -174,6 +185,18 @@ def get_args_parser():
     ## other
     parser.add_argument('--print-iter', default=200, type=int, help='print frequency')
     parser.add_argument('--eval-iter', default=20000, type=int, help='evaluation frequency')
+    parser.add_argument(
+        '--validation-seed',
+        default=123,
+        type=int,
+        help='fixed RNG seed for deterministic internal validation',
+    )
+    parser.add_argument(
+        '--validation-batch-size',
+        default=32,
+        type=int,
+        help='batch size for deterministic complete-motion validation',
+    )
     parser.add_argument('--seed', default=123, type=int, help='seed for initializing training.')
     parser.add_argument('--vis-gt', action='store_true', help='whether visualize GT motions')
     parser.add_argument('--nb-vis', default=20, type=int, help='nb of visualizations')
@@ -181,6 +204,12 @@ def get_args_parser():
     parser.add_argument('--num_gpus', default=1, type=int, help='number of GPUs')
 
     args = parser.parse_args()
+    if args.freeze_phase2_local_proj and args.phase != 2:
+        parser.error(
+            '--freeze-phase2-local-proj is valid only with --phase 2'
+        )
+    if args.validation_batch_size < 1:
+        parser.error('--validation-batch-size must be positive')
     if args.msa_data_mode == 'babel_sparse_global':
         if args.phase == 0:
             parser.error('babel_sparse_global supports only --phase 1 or --phase 2')

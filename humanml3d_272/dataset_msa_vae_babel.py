@@ -16,7 +16,8 @@ import torch
 from torch.utils import data
 
 from humanml3d_272.babel_stream_t5_cache import CACHE_VERSION, validate_cache_manifest
-from humanml3d_272.dataset_msa_vae import _pool_to_latent, collate_fn
+from humanml3d_272.dataset_msa_vae import collate_fn
+from humanml3d_272.msa_text_targets import _pool_to_latent
 
 
 MOTION_DIM = 272

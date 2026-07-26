@@ -14,6 +14,12 @@ OFFICIAL_ROOT_ENTRYPOINTS = {
     "TRAIN_msa_vae_phase2.sh",
     "eval_msa_vae.py",
     "EVAL_msa_vae.sh",
+    "eval_msa_vae_metrics.py",
+    "EVAL_msa_vae_metrics.sh",
+    "eval_msa_vae_alignment.py",
+    "EVAL_msa_vae_alignment.sh",
+    "aggregate_msa_vae_metrics.py",
+    "AGGREGATE_msa_vae_metrics.sh",
     "TRAIN_msa_vae_babel_phase1.sh",
     "TRAIN_msa_vae_babel_phase2.sh",
     "EVAL_msa_vae_babel.sh",
@@ -25,11 +31,21 @@ OFFICIAL_ROOT_ENTRYPOINTS = {
     "TRAIN_t2m_rag.sh",
     "eval_msa_t2m_rag_t5.py",
     "EVAL_t2m_rag_t5.sh",
+    "eval_msa_t2m_rag_t5_optimized.py",
+    "EVAL_t2m_rag_t5_optimized.sh",
     "msa_gen_motion.py",
     "output_vis.py",
 }
 
 ARCHIVED_ENTRYPOINTS = {
+    "msa_vae_alignment_realism": {
+        "EVAL_PILOT.sh",
+        "RUN_PILOT.sh",
+        "STATUS_PILOT.sh",
+        "eval_variant.sh",
+        "pilot.py",
+        "run_variant.sh",
+    },
     "ablations/no_rag": {
         "demo_msa_t2m_no_rag_t5.py",
         "DEMO_msa_t2m_no_rag_t5.sh",
