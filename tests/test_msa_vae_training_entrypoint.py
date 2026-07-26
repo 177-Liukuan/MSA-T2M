@@ -18,6 +18,8 @@ from utils.msa_vae_training import (
     validate_phase2_resume_requirement,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 class TrainingBatchRoutingTest(unittest.TestCase):
     def test_modes_consume_the_expected_iterators(self):
@@ -336,6 +338,29 @@ class CheckpointMetadataTest(unittest.TestCase):
             validate_phase2_resume_requirement(
                 self._args(phase=2, sequence_mode="mixed")
             )
+
+
+class DeterministicValidationSourceContractTest(unittest.TestCase):
+    def test_training_uses_standard_complete_validation_without_rendering(self):
+        source = (ROOT / "train_msa_vae.py").read_text(encoding="utf-8")
+
+        for symbol in (
+            "MSAVAEMetricsDataset",
+            "make_msa_vae_metrics_loader",
+            "run_deterministic_msa_validation",
+            "publish_msa_validation",
+            "MSAValidationState",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertIn(symbol, source)
+        self.assertNotIn("dataset_eval_t2m.DATALoader(", source)
+        self.assertNotIn("evaluation_msa_vae_multi(", source)
+        self.assertNotIn("class EvalCompat", source)
+        self.assertNotIn("tensorborad_add_video_xyz(", source)
+        self.assertRegex(
+            source,
+            r"ActorAgnosticEncoder\([^)]*max_len=-1",
+        )
 
 
 if __name__ == "__main__":
