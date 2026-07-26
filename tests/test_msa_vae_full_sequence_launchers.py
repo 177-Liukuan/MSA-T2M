@@ -24,7 +24,7 @@ class MSAOptionTest(unittest.TestCase):
 
 
 class MSAFullSequenceLauncherTest(unittest.TestCase):
-    def _run_launcher(self, script_name, extra_env):
+    def _invoke_launcher(self, script_name, extra_env):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             capture = temp_root / "args.txt"
@@ -49,12 +49,30 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 check=False,
             )
-            self.assertEqual(
-                completed.returncode,
-                0,
-                msg=completed.stdout + completed.stderr,
-            )
-            return capture.read_text(encoding="utf-8").splitlines()
+            arguments = None
+            if capture.exists():
+                arguments = capture.read_text(encoding="utf-8").splitlines()
+            return completed, arguments
+
+    def _run_launcher(self, script_name, extra_env):
+        completed, arguments = self._invoke_launcher(script_name, extra_env)
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        self.assertIsNotNone(arguments)
+        return arguments
+
+    def _assert_launcher_rejected(self, script_name, extra_env, message):
+        completed, arguments = self._invoke_launcher(script_name, extra_env)
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        self.assertIsNone(arguments)
+        self.assertIn(message, completed.stdout + completed.stderr)
 
     @staticmethod
     def _value_after(arguments, flag):
@@ -67,6 +85,14 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
                 "FULL_SEQ_BATCH_SIZE": "7",
                 "LENGTH_BUCKET_SIZE": "19",
                 "CNN_CKPT": "Experiments/test-cnn.pth",
+                "EXP_NAME": "phase1-global-local-seed123",
+                "GLOBAL_ALIGN_WEIGHT": "0.25",
+                "LOCAL_ALIGN_WEIGHT": "0.05",
+                "SEED": "123",
+                "TOTAL_ITER": "17",
+                "WARM_UP_ITER": "3",
+                "EVAL_ITER": "4",
+                "OUT_DIR": "Experiments/test-ablation",
             },
         )
 
@@ -82,10 +108,22 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             self._value_after(arguments, "--length-bucket-size"),
             "19",
         )
-        self.assertIn(
-            "fullseq",
-            self._value_after(arguments, "--exp-name"),
-        )
+        expected = {
+            "--exp-name": "phase1-global-local-seed123",
+            "--global_align_weight": "0.25",
+            "--local_align_weight": "0.05",
+            "--seed": "123",
+            "--total-iter": "17",
+            "--warm-up-iter": "3",
+            "--eval-iter": "4",
+            "--out-dir": "Experiments/test-ablation",
+        }
+        for flag, value in expected.items():
+            self.assertEqual(
+                self._value_after(arguments, flag),
+                value,
+                msg=flag,
+            )
 
     def test_phase2_launches_mixed_training_from_final_phase1_state(self):
         arguments = self._run_launcher(
@@ -95,6 +133,14 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
                 "WINDOW_REPLAY_INTERVAL": "6",
                 "LENGTH_BUCKET_SIZE": "23",
                 "PHASE1_DIR": "Experiments/test-phase1",
+                "EXP_NAME": "phase2-global-local-seed456",
+                "GLOBAL_ALIGN_WEIGHT": "0.125",
+                "LOCAL_ALIGN_WEIGHT": "0.025",
+                "SEED": "456",
+                "TOTAL_ITER": "29",
+                "WARM_UP_ITER": "2",
+                "EVAL_ITER": "7",
+                "OUT_DIR": "Experiments/test-ablation",
             },
         )
 
@@ -118,10 +164,22 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             self._value_after(arguments, "--resume-pth"),
             "Experiments/test-phase1/net_last.pth",
         )
-        self.assertIn(
-            "fullseq_replay6",
-            self._value_after(arguments, "--exp-name"),
-        )
+        expected = {
+            "--exp-name": "phase2-global-local-seed456",
+            "--global_align_weight": "0.125",
+            "--local_align_weight": "0.025",
+            "--seed": "456",
+            "--total-iter": "29",
+            "--warm-up-iter": "2",
+            "--eval-iter": "7",
+            "--out-dir": "Experiments/test-ablation",
+        }
+        for flag, value in expected.items():
+            self.assertEqual(
+                self._value_after(arguments, flag),
+                value,
+                msg=flag,
+            )
 
     def test_phase2_default_phase1_path_matches_text_encoder(self):
         arguments = self._run_launcher(
@@ -136,6 +194,27 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             "Experiments/MSA_VAEv7_phase1_fullseq_t2m_272_clip_fulldb/"
             "net_last.pth",
         )
+
+    def test_launchers_reject_empty_names_and_negative_weights(self):
+        for script_name in (
+            "TRAIN_msa_vae_phase1.sh",
+            "TRAIN_msa_vae_phase2.sh",
+        ):
+            cases = (
+                ({"EXP_NAME": ""}, "EXP_NAME"),
+                ({"GLOBAL_ALIGN_WEIGHT": "-0.1"}, "GLOBAL_ALIGN_WEIGHT"),
+                ({"LOCAL_ALIGN_WEIGHT": "-0.1"}, "LOCAL_ALIGN_WEIGHT"),
+            )
+            for extra_env, message in cases:
+                with self.subTest(
+                    script_name=script_name,
+                    extra_env=extra_env,
+                ):
+                    self._assert_launcher_rejected(
+                        script_name,
+                        extra_env,
+                        message,
+                    )
 
 
 if __name__ == "__main__":
