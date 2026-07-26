@@ -2,6 +2,7 @@
 set -euo pipefail
 # -----------------------------------------------------------
 #  MSA-VAE Phase 2: Unfreeze CNN, differential LR, all 6 losses
+#  Optional FREEZE_PHASE2_LOCAL_PROJ=1 keeps the Phase-1 local projection fixed.
 #
 #  CNN params use lr * cnn_lr_scale (default 0.1)
 #  Top params (Transformer + proj) use lr
@@ -35,6 +36,20 @@ SEED=${SEED:-123}
 GLOBAL_ALIGN_WEIGHT=${GLOBAL_ALIGN_WEIGHT:-0.1}
 LOCAL_ALIGN_WEIGHT=${LOCAL_ALIGN_WEIGHT:-0.001}
 MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-}
+FREEZE_PHASE2_LOCAL_PROJ=${FREEZE_PHASE2_LOCAL_PROJ:-0}
+
+case "$FREEZE_PHASE2_LOCAL_PROJ" in
+  0)
+    PHASE2_LOCAL_PROJ_ARGS=()
+    ;;
+  1)
+    PHASE2_LOCAL_PROJ_ARGS=(--freeze-phase2-local-proj)
+    ;;
+  *)
+    echo "ERROR: FREEZE_PHASE2_LOCAL_PROJ must be 0 or 1, got '${FREEZE_PHASE2_LOCAL_PROJ}'" >&2
+    exit 2
+    ;;
+esac
 
 TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-t5}
 T5_EMBED_DIR=${T5_EMBED_DIR:-./humanml3d_272/t5_enc_single}
@@ -101,6 +116,7 @@ echo "Iterations      : $TOTAL_ITER (warm-up $WARM_UP_ITER)"
 echo "Eval interval   : $EVAL_ITER"
 echo "Validation      : seed=$VALIDATION_SEED batch=$VALIDATION_BATCH_SIZE"
 echo "Align weights   : global=$GLOBAL_ALIGN_WEIGHT local=$LOCAL_ALIGN_WEIGHT"
+echo "Freeze local proj: $FREEZE_PHASE2_LOCAL_PROJ"
 echo "====================================================="
 
 # Use full HumanML3D train split; L_local is auto-masked by has_local
@@ -108,6 +124,7 @@ accelerate launch --num_processes "$NUM_GPUS" \
   "${ACCELERATE_PORT_ARGS[@]}" --mixed_precision bf16 \
   train_msa_vae.py \
   --phase 2 \
+  "${PHASE2_LOCAL_PROJ_ARGS[@]}" \
   --cnn_lr_scale 0.1 \
   --batch-size "$BATCH_SIZE" \
   --sequence_mode mixed \

@@ -253,6 +253,31 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             "net_last.pth",
         )
 
+    def test_phase2_local_projection_freeze_is_default_off_and_opt_in(self):
+        default_arguments = self._run_launcher(
+            "TRAIN_msa_vae_phase2.sh",
+            {},
+        )
+        self.assertNotIn(
+            "--freeze-phase2-local-proj",
+            default_arguments,
+        )
+
+        enabled_arguments = self._run_launcher(
+            "TRAIN_msa_vae_phase2.sh",
+            {"FREEZE_PHASE2_LOCAL_PROJ": "1"},
+        )
+        self.assertIn(
+            "--freeze-phase2-local-proj",
+            enabled_arguments,
+        )
+
+        self._assert_launcher_rejected(
+            "TRAIN_msa_vae_phase2.sh",
+            {"FREEZE_PHASE2_LOCAL_PROJ": "yes"},
+            "FREEZE_PHASE2_LOCAL_PROJ",
+        )
+
     def test_launchers_reject_empty_names_and_negative_weights(self):
         for script_name in (
             "TRAIN_msa_vae_phase1.sh",

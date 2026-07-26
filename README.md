@@ -225,6 +225,21 @@ TEXT_ENCODER_TYPE=t5 \
 bash TRAIN_msa_vae_phase2.sh <NUM_GPUS> t2m_272
 ```
 
+For the fixed-local-coordinate reviewer experiment, explicitly freeze the
+Phase-1 local projection during Phase 2:
+
+```bash
+FREEZE_PHASE2_LOCAL_PROJ=1 \
+PHASE1_DIR="$PHASE1_DIR" \
+LOCAL_ALIGN_WEIGHT=0.05 \
+bash TRAIN_msa_vae_phase2.sh <NUM_GPUS> t2m_272
+```
+
+The projection remains in the autograd graph: its parameters are excluded
+from the optimizer, while local-alignment gradients still reach `mu` and the
+CNN encoder. This option does not directly give the CNN decoder a local-loss
+gradient.
+
 可通过以下变量覆盖显存和回放频率：
 
 ```bash
