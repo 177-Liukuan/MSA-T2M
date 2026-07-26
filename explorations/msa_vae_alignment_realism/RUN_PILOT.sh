@@ -13,6 +13,8 @@ PILOT_DRY_RUN=${PILOT_DRY_RUN:-0}
 RUNNER="${SCRIPT_DIR}/run_variant.sh"
 PILOT_CLI="${SCRIPT_DIR}/pilot.py"
 
+cd "$REPO_ROOT"
+
 pilot_python() {
     if [[ ${CONDA_DEFAULT_ENV:-} == mgpt ]]; then
         python "$PILOT_CLI" --output-root "$PILOT_ROOT" "$@"

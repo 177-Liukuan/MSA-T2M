@@ -7,6 +7,8 @@ PILOT_ROOT=${PILOT_ROOT:-"${REPO_ROOT}/Experiments/msa_vae_alignment_realism_pil
 SCREEN_BIN=${SCREEN_BIN:-screen}
 NVIDIA_SMI_BIN=${NVIDIA_SMI_BIN:-nvidia-smi}
 
+cd "$REPO_ROOT"
+
 echo "=== Screen sessions ==="
 "$SCREEN_BIN" -ls 2>&1 || true
 echo

@@ -21,6 +21,8 @@ TAE_SHA256=${TAE_SHA256:-7c92115aeb36c71f93baa381869ae35f391e7d4dc2b51fe2b8c6761
 PHASE1_LAUNCHER=${PHASE1_LAUNCHER:-"${REPO_ROOT}/TRAIN_msa_vae_phase1.sh"}
 PHASE2_LAUNCHER=${PHASE2_LAUNCHER:-"${REPO_ROOT}/TRAIN_msa_vae_phase2.sh"}
 
+cd "$REPO_ROOT"
+
 weight_name() {
     local value=$1
     printf '%s' "${value//./p}"
