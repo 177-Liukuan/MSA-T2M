@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 6 ]]; then
-    echo "Usage: $0 SLUG GPU_PAIR P1_GLOBAL P1_LOCAL P2_GLOBAL P2_LOCAL" >&2
+if [[ $# -ne 7 ]]; then
+    echo "Usage: $0 SLUG GPU_PAIR PORT P1_GLOBAL P1_LOCAL P2_GLOBAL P2_LOCAL" >&2
     exit 2
 fi
 
 SLUG=$1
 GPU_PAIR=$2
-P1_GLOBAL=$3
-P1_LOCAL=$4
-P2_GLOBAL=$5
-P2_LOCAL=$6
+MAIN_PROCESS_PORT=$3
+P1_GLOBAL=$4
+P1_LOCAL=$5
+P2_GLOBAL=$6
+P2_LOCAL=$7
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -20,6 +21,7 @@ TAE_CHECKPOINT=${TAE_CHECKPOINT:-"${REPO_ROOT}/Experiments/causal_TAE_t2m_272_h1
 TAE_SHA256=${TAE_SHA256:-7c92115aeb36c71f93baa381869ae35f391e7d4dc2b51fe2b8c6761bf352bdd8}
 PHASE1_LAUNCHER=${PHASE1_LAUNCHER:-"${REPO_ROOT}/TRAIN_msa_vae_phase1.sh"}
 PHASE2_LAUNCHER=${PHASE2_LAUNCHER:-"${REPO_ROOT}/TRAIN_msa_vae_phase2.sh"}
+PILOT_CLI="${SCRIPT_DIR}/pilot.py"
 
 cd "$REPO_ROOT"
 
@@ -45,6 +47,7 @@ write_status() {
         printf 'state=%s\n' "$state"
         printf 'variant=%s\n' "$SLUG"
         printf 'gpu_pair=%s\n' "$GPU_PAIR"
+        printf 'main_process_port=%s\n' "$MAIN_PROCESS_PORT"
         printf 'pid=%s\n' "$$"
         printf 'timestamp=%s\n' "$(date --iso-8601=seconds)"
         printf 'detail=%s\n' "$detail"
@@ -58,6 +61,9 @@ on_exit() {
     local code=$?
     if [[ $code -ne 0 ]]; then
         write_status "failed" "runner exited with code ${code}"
+        python "$PILOT_CLI" --output-root "$PILOT_ROOT" record-run \
+            --slug "$SLUG" --event failed --exit-code "$code" \
+            >/dev/null 2>&1 || true
     fi
 }
 trap on_exit EXIT
@@ -69,6 +75,8 @@ fi
 
 export CUDA_VISIBLE_DEVICES="$GPU_PAIR"
 
+python "$PILOT_CLI" --output-root "$PILOT_ROOT" record-run \
+    --slug "$SLUG" --event started >/dev/null
 write_status "phase1_running"
 if ! env \
     OUT_DIR="$PILOT_ROOT" \
@@ -78,6 +86,10 @@ if ! env \
     EVAL_ITER=5000 \
     VALIDATION_SEED=123 \
     VALIDATION_BATCH_SIZE=32 \
+    FULL_SEQ_BATCH_SIZE=16 \
+    WARM_UP_ITER=500 \
+    LENGTH_BUCKET_SIZE=256 \
+    MAIN_PROCESS_PORT="$MAIN_PROCESS_PORT" \
     GLOBAL_ALIGN_WEIGHT="$P1_GLOBAL" \
     LOCAL_ALIGN_WEIGHT="$P1_LOCAL" \
     CNN_CKPT="$TAE_CHECKPOINT" \
@@ -92,6 +104,8 @@ if [[ ! -s "${P1_DIR}/net_last.pth" ]]; then
     exit 21
 fi
 write_status "phase1_complete"
+python "$PILOT_CLI" --output-root "$PILOT_ROOT" record-run \
+    --slug "$SLUG" --event phase1_complete >/dev/null
 
 write_status "phase2_running"
 if ! env \
@@ -103,6 +117,11 @@ if ! env \
     EVAL_ITER=5000 \
     VALIDATION_SEED=123 \
     VALIDATION_BATCH_SIZE=32 \
+    FULL_SEQ_BATCH_SIZE=8 \
+    WARM_UP_ITER=1000 \
+    LENGTH_BUCKET_SIZE=256 \
+    WINDOW_REPLAY_INTERVAL=4 \
+    MAIN_PROCESS_PORT="$MAIN_PROCESS_PORT" \
     GLOBAL_ALIGN_WEIGHT="$P2_GLOBAL" \
     LOCAL_ALIGN_WEIGHT="$P2_LOCAL" \
     CNN_CKPT="$TAE_CHECKPOINT" \
@@ -118,4 +137,6 @@ if [[ ! -s "${P2_DIR}/net_last.pth" ]]; then
 fi
 
 write_status "complete"
+python "$PILOT_CLI" --output-root "$PILOT_ROOT" record-run \
+    --slug "$SLUG" --event phase2_complete >/dev/null
 echo "MSA-VAE pilot variant complete: ${SLUG}"

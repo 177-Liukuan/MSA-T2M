@@ -34,6 +34,7 @@ OUT_DIR=${OUT_DIR:-Experiments}
 SEED=${SEED:-123}
 GLOBAL_ALIGN_WEIGHT=${GLOBAL_ALIGN_WEIGHT:-0.1}
 LOCAL_ALIGN_WEIGHT=${LOCAL_ALIGN_WEIGHT:-0.001}
+MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-}
 
 TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-t5}
 T5_EMBED_DIR=${T5_EMBED_DIR:-./humanml3d_272/t5_enc_single}
@@ -62,6 +63,15 @@ validate_nonnegative_weight() {
 
 validate_nonnegative_weight "GLOBAL_ALIGN_WEIGHT" "$GLOBAL_ALIGN_WEIGHT"
 validate_nonnegative_weight "LOCAL_ALIGN_WEIGHT" "$LOCAL_ALIGN_WEIGHT"
+ACCELERATE_PORT_ARGS=()
+if [[ -n "$MAIN_PROCESS_PORT" ]]; then
+  if [[ ! "$MAIN_PROCESS_PORT" =~ ^[0-9]+$ ]] \
+      || (( MAIN_PROCESS_PORT < 1 || MAIN_PROCESS_PORT > 65535 )); then
+    echo "ERROR: MAIN_PROCESS_PORT must be an integer from 1 to 65535" >&2
+    exit 2
+  fi
+  ACCELERATE_PORT_ARGS=(--main_process_port "$MAIN_PROCESS_PORT")
+fi
 
 if [ "$TEXT_ENCODER_TYPE" = "t5" ]; then
   TEXT_EMBED_DIM=768
@@ -94,7 +104,8 @@ echo "Align weights   : global=$GLOBAL_ALIGN_WEIGHT local=$LOCAL_ALIGN_WEIGHT"
 echo "====================================================="
 
 # Use full HumanML3D train split; L_local is auto-masked by has_local
-accelerate launch --num_processes "$NUM_GPUS" --mixed_precision bf16 \
+accelerate launch --num_processes "$NUM_GPUS" \
+  "${ACCELERATE_PORT_ARGS[@]}" --mixed_precision bf16 \
   train_msa_vae.py \
   --phase 2 \
   --cnn_lr_scale 0.1 \

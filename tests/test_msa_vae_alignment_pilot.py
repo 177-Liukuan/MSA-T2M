@@ -35,10 +35,10 @@ EXPLORATION_ROOT = (
 class PilotContractTest(unittest.TestCase):
     def test_contract_matches_approved_matrix(self):
         expected = {
-            "no_align": ((0.0, 0.0), (0.0, 0.0), "0,1", "0"),
-            "global_only": ((0.2, 0.0), (0.05, 0.0), "2,3", "2"),
-            "local_only": ((0.0, 0.2), (0.0, 0.05), "4,5", "4"),
-            "global_local": ((0.2, 0.2), (0.05, 0.05), "6,7", "6"),
+            "no_align": ((0.0, 0.0), (0.0, 0.0), "0,1", "0", 29501),
+            "global_only": ((0.2, 0.0), (0.05, 0.0), "2,3", "2", 29502),
+            "local_only": ((0.0, 0.2), (0.0, 0.05), "4,5", "4", 29503),
+            "global_local": ((0.2, 0.2), (0.05, 0.05), "6,7", "6", 29504),
         }
         actual = {
             item.slug: (
@@ -46,6 +46,7 @@ class PilotContractTest(unittest.TestCase):
                 (item.phase2_global, item.phase2_local),
                 item.training_gpus,
                 item.evaluation_gpu,
+                item.main_process_port,
             )
             for item in PILOT_VARIANTS
         }
@@ -70,12 +71,12 @@ class PilotContractTest(unittest.TestCase):
         lines = emit_contract(Path("."), "tsv").splitlines()
         fields = [line.split("\t") for line in lines]
 
-        self.assertEqual(fields[0][5:], ["0", "0", "0", "0"])
-        self.assertEqual(fields[1][5:], ["0.2", "0", "0.05", "0"])
-        self.assertEqual(fields[2][5:], ["0", "0.2", "0", "0.05"])
+        self.assertEqual(fields[0][5:], ["29501", "0", "0", "0", "0"])
+        self.assertEqual(fields[1][5:], ["29502", "0.2", "0", "0.05", "0"])
+        self.assertEqual(fields[2][5:], ["29503", "0", "0.2", "0", "0.05"])
         self.assertEqual(
             fields[3][5:],
-            ["0.2", "0.2", "0.05", "0.05"],
+            ["29504", "0.2", "0.2", "0.05", "0.05"],
         )
 
 
@@ -136,6 +137,7 @@ class PilotCollectorTest(unittest.TestCase):
             "resume_cnn_sha256": TAE_SHA256,
             "sequence_mode": sequence_mode,
             "full_seq_batch_size": full_batch_size,
+            "window_replay_interval": 4,
         }
 
     @classmethod
@@ -222,6 +224,22 @@ class PilotCollectorTest(unittest.TestCase):
         manifests = []
         for index, variant in enumerate(PILOT_VARIANTS, start=1):
             manifest = cls._manifest(variant, index)
+            parent_path = phase_checkpoint_path(output_root, variant, 1)
+            phase2_path = phase_checkpoint_path(output_root, variant, 2)
+            parent_path.parent.mkdir(parents=True)
+            phase2_path.parent.mkdir(parents=True)
+            metadata = manifest["checkpoint"]["metadata"]
+            parent_metadata = metadata["lineage"][
+                "parent_checkpoint_metadata"
+            ]
+            metadata["lineage"]["parent_checkpoint_path"] = str(parent_path)
+            torch.save(
+                {"net": {}, "metadata": parent_metadata},
+                parent_path,
+            )
+            torch.save({"net": {}, "metadata": metadata}, phase2_path)
+            manifest["checkpoint"]["path"] = str(phase2_path)
+            manifest["checkpoint"]["sha256"] = cls._sha256(phase2_path)
             path = output_root / "evaluation" / variant.slug / "metrics.json"
             path.parent.mkdir(parents=True)
             path.write_text(
@@ -230,6 +248,12 @@ class PilotCollectorTest(unittest.TestCase):
             )
             manifests.append(manifest)
         return manifests
+
+    @staticmethod
+    def _sha256(path):
+        import hashlib
+
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
     def test_validates_and_writes_requested_raw_single_seed_table(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -347,6 +371,33 @@ class PilotCollectorTest(unittest.TestCase):
 
         self.assertEqual(len(validated), 4)
 
+    def test_rejects_manifest_not_bound_to_actual_phase2_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output_root = Path(temp)
+            manifests = self._write_manifests(output_root)
+            cases = (
+                ("path", "/tmp/net_last.pth", "checkpoint path"),
+                ("sha256", "f" * 64, "checkpoint SHA-256"),
+            )
+            for key, value, message in cases:
+                with self.subTest(key=key):
+                    manifest = dict(manifests[0])
+                    manifest["checkpoint"] = dict(manifest["checkpoint"])
+                    manifest["checkpoint"][key] = value
+                    path = (
+                        output_root
+                        / "evaluation"
+                        / PILOT_VARIANTS[0].slug
+                        / "metrics.json"
+                    )
+                    path.write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        validate_pilot_manifests(output_root)
+                    path.write_text(
+                        json.dumps(manifests[0]),
+                        encoding="utf-8",
+                    )
+
 
 class PilotRunnerTest(unittest.TestCase):
     @staticmethod
@@ -377,6 +428,11 @@ class PilotRunnerTest(unittest.TestCase):
             '  printf "cnn=%s\\n" "${CNN_CKPT:-}"\n'
             '  printf "cnn_sha=%s\\n" "${CNN_CKPT_SHA256:-}"\n'
             '  printf "phase1_dir=%s\\n" "${PHASE1_DIR:-}"\n'
+            '  printf "main_process_port=%s\\n" "${MAIN_PROCESS_PORT:-}"\n'
+            '  printf "full_seq_batch=%s\\n" "${FULL_SEQ_BATCH_SIZE:-}"\n'
+            '  printf "warm_up_iter=%s\\n" "${WARM_UP_ITER:-}"\n'
+            '  printf "length_bucket=%s\\n" "${LENGTH_BUCKET_SIZE:-}"\n'
+            '  printf "window_replay=%s\\n" "${WINDOW_REPLAY_INTERVAL:-}"\n'
             '} > "$capture"\n'
             f"{checkpoint_command}"
             f"exit {exit_code}\n",
@@ -418,6 +474,10 @@ class PilotRunnerTest(unittest.TestCase):
                 "PHASE2_LAUNCHER": str(phase2),
                 "CAPTURE_PHASE1": str(phase1_capture),
                 "CAPTURE_PHASE2": str(phase2_capture),
+                "FULL_SEQ_BATCH_SIZE": "999",
+                "WARM_UP_ITER": "999",
+                "LENGTH_BUCKET_SIZE": "999",
+                "WINDOW_REPLAY_INTERVAL": "999",
             }
         )
         completed = subprocess.run(
@@ -426,6 +486,7 @@ class PilotRunnerTest(unittest.TestCase):
                 str(EXPLORATION_ROOT / "run_variant.sh"),
                 "global_only",
                 "2,3",
+                "29502",
                 "0.2",
                 "0",
                 "0.05",
@@ -454,6 +515,11 @@ class PilotRunnerTest(unittest.TestCase):
                 / "status"
                 / "global_only.status"
             ).read_text(encoding="utf-8")
+            run_manifest = json.loads(
+                (temp_root / "pilot" / "run_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
         self.assertEqual(
             completed.returncode,
@@ -469,17 +535,36 @@ class PilotRunnerTest(unittest.TestCase):
             self.assertEqual(capture["eval_iter"], "5000")
             self.assertEqual(capture["validation_seed"], "123")
             self.assertEqual(capture["validation_batch"], "32")
+            self.assertEqual(capture["main_process_port"], "29502")
         self.assertEqual(phase1["global"], "0.2")
         self.assertEqual(phase1["local"], "0")
         self.assertEqual(phase1["cnn"], "/fixed/tae.pth")
         self.assertEqual(phase1["cnn_sha"], TAE_SHA256)
+        self.assertEqual(phase1["full_seq_batch"], "16")
+        self.assertEqual(phase1["warm_up_iter"], "500")
+        self.assertEqual(phase1["length_bucket"], "256")
         self.assertEqual(phase2["global"], "0.05")
         self.assertEqual(phase2["local"], "0")
+        self.assertEqual(phase2["full_seq_batch"], "8")
+        self.assertEqual(phase2["warm_up_iter"], "1000")
+        self.assertEqual(phase2["length_bucket"], "256")
+        self.assertEqual(phase2["window_replay"], "4")
         self.assertEqual(
             phase2["phase1_dir"],
             phase1["out_dir"] + "/" + phase1["exp_name"],
         )
         self.assertIn("state=complete", status)
+        run = run_manifest["variants"]["global_only"]
+        self.assertEqual(run["gpu_pair"], "2,3")
+        self.assertEqual(run["main_process_port"], 29502)
+        self.assertEqual(
+            [event["event"] for event in run["events"]],
+            ["started", "phase1_complete", "phase2_complete"],
+        )
+        self.assertEqual(run["phase1"]["exit_code"], 0)
+        self.assertEqual(run["phase2"]["exit_code"], 0)
+        self.assertRegex(run["phase1"]["checkpoint_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(run["phase2"]["checkpoint_sha256"], r"^[0-9a-f]{64}$")
 
     def test_phase1_failure_or_missing_checkpoint_never_starts_phase2(self):
         cases = (
@@ -525,6 +610,10 @@ class PilotScreenEntrypointTest(unittest.TestCase):
             '  printf "No Sockets found.\\n"\n'
             "  exit 1\n"
             "fi\n"
+            'if [[ -n ${FAIL_SCREEN_SESSION:-} '
+            '&& "$*" == *"$FAIL_SCREEN_SESSION"* ]]; then\n'
+            "  exit 9\n"
+            "fi\n"
             'printf "%s" "$1" >> "$SCREEN_CAPTURE"\n'
             'shift\n'
             'printf " %s" "$@" >> "$SCREEN_CAPTURE"\n'
@@ -559,6 +648,8 @@ class PilotScreenEntrypointTest(unittest.TestCase):
         dry_run=False,
         busy=False,
         contract_blank_line=False,
+        fail_screen_session="",
+        only_variant="",
     ):
         screen, nvidia, sha256sum, capture = self._fake_tools(
             temp_root,
@@ -577,6 +668,8 @@ class PilotScreenEntrypointTest(unittest.TestCase):
                 "SHA256SUM_BIN": str(sha256sum),
                 "SCREEN_CAPTURE": str(capture),
                 "PILOT_DRY_RUN": "1" if dry_run else "0",
+                "FAIL_SCREEN_SESSION": fail_screen_session,
+                "PILOT_ONLY_VARIANT": only_variant,
             }
         )
         if contract_blank_line:
@@ -619,6 +712,7 @@ class PilotScreenEntrypointTest(unittest.TestCase):
         for variant in PILOT_VARIANTS:
             self.assertIn(variant.screen_session, completed.stdout)
             self.assertIn(variant.training_gpus, completed.stdout)
+            self.assertIn(str(variant.main_process_port), completed.stdout)
 
     def test_launches_exactly_four_logged_detached_screens(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -638,6 +732,7 @@ class PilotScreenEntrypointTest(unittest.TestCase):
             self.assertIn("-dmS", line)
             self.assertIn(variant.screen_session, line)
             self.assertIn(variant.training_gpus, line)
+            self.assertIn(str(variant.main_process_port), line)
             self.assertIn("run_variant.sh", line)
 
     def test_ignores_conda_run_trailing_blank_contract_line(self):
@@ -664,6 +759,38 @@ class PilotScreenEntrypointTest(unittest.TestCase):
         self.assertIn("GPU compute process", completed.stderr)
         self.assertFalse(output_root.exists())
         self.assertFalse(capture.exists())
+
+    def test_records_partial_screen_launch_failure_for_safe_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            completed, output_root, capture = self._launch(
+                Path(temp),
+                fail_screen_session="msa_pilot_local_s123",
+            )
+            launch_rows = (
+                output_root / "launch_status.tsv"
+            ).read_text(encoding="utf-8").splitlines()
+            screen_lines = capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(completed.returncode, 5)
+        self.assertEqual(len(screen_lines), 3)
+        self.assertEqual(len(launch_rows), 5)
+        self.assertTrue(any("local_only" in row and "failed" in row
+                            for row in launch_rows))
+
+    def test_targeted_retry_dry_run_selects_only_one_variant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            completed, output_root, _ = self._launch(
+                Path(temp),
+                dry_run=True,
+                only_variant="local_only",
+            )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        self.assertIn("msa_pilot_local_s123", completed.stdout)
+        self.assertNotIn("msa_pilot_global_s123", completed.stdout)
+        self.assertFalse(output_root.exists())
 
 
 class PilotEvaluationTest(unittest.TestCase):

@@ -7,6 +7,9 @@ import hashlib
 import json
 import math
 import subprocess
+import tempfile
+import socket
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
@@ -64,6 +67,7 @@ class PilotVariant:
     training_gpus: str
     evaluation_gpu: str
     screen_session: str
+    main_process_port: int
     phase1_global: float
     phase1_local: float
     phase2_global: float
@@ -77,6 +81,7 @@ PILOT_VARIANTS = (
         "0,1",
         "0",
         "msa_pilot_no_align_s123",
+        29501,
         0.0,
         0.0,
         0.0,
@@ -88,6 +93,7 @@ PILOT_VARIANTS = (
         "2,3",
         "2",
         "msa_pilot_global_s123",
+        29502,
         0.2,
         0.0,
         0.05,
@@ -99,6 +105,7 @@ PILOT_VARIANTS = (
         "4,5",
         "4",
         "msa_pilot_local_s123",
+        29503,
         0.0,
         0.2,
         0.0,
@@ -110,6 +117,7 @@ PILOT_VARIANTS = (
         "6,7",
         "6",
         "msa_pilot_both_s123",
+        29504,
         0.2,
         0.2,
         0.05,
@@ -195,6 +203,187 @@ def contract_payload(output_root: Path) -> Dict[str, Any]:
     }
 
 
+def _variant_by_slug(slug: str) -> PilotVariant:
+    for variant in PILOT_VARIANTS:
+        if variant.slug == slug:
+            return variant
+    raise ValueError(f"unknown pilot variant: {slug}")
+
+
+def record_run_event(
+    output_root: Path,
+    slug: str,
+    event: str,
+    exit_code: int = 0,
+) -> Path:
+    """Atomically append one training lifecycle event to the run manifest."""
+    import fcntl
+
+    output_root = _resolve_output_root(output_root)
+    variant = _variant_by_slug(slug)
+    manifest_path = output_root / "run_manifest.json"
+    lock_path = output_root / ".run_manifest.lock"
+    output_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    phase1_path = phase_checkpoint_path(output_root, variant, 1)
+    phase2_path = phase_checkpoint_path(output_root, variant, 2)
+    phase1_dir = phase1_path.parent
+    phase2_dir = phase2_path.parent
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if manifest_path.exists():
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        else:
+            payload = {
+                "format_version": 1,
+                "git_commit": _git_commit(),
+                "tae_checkpoint": str(
+                    (_repo_root() / TAE_CHECKPOINT).resolve()
+                ),
+                "tae_sha256": TAE_SHA256,
+                "seed": PILOT_SEED,
+                "training_budget_per_phase": PHASE_ITERATIONS,
+                "validation": {
+                    "seed": VALIDATION_SEED,
+                    "batch_size": VALIDATION_BATCH_SIZE,
+                    "interval": EVAL_INTERVAL,
+                },
+                "variants": {},
+            }
+        run = payload["variants"].setdefault(
+            slug,
+            {
+                "label": variant.label,
+                "gpu_pair": variant.training_gpus,
+                "main_process_port": variant.main_process_port,
+                "weights": {
+                    "phase1": {
+                        "global": variant.phase1_global,
+                        "local": variant.phase1_local,
+                    },
+                    "phase2": {
+                        "global": variant.phase2_global,
+                        "local": variant.phase2_local,
+                    },
+                },
+                "phase1": {
+                    "experiment_dir": str(phase1_dir),
+                    "launcher": str(_repo_root() / "TRAIN_msa_vae_phase1.sh"),
+                    "command": [
+                        "bash",
+                        "TRAIN_msa_vae_phase1.sh",
+                        "2",
+                        "t2m_272",
+                    ],
+                    "environment": {
+                        "OUT_DIR": str(output_root),
+                        "EXP_NAME": phase_experiment_name(variant, 1),
+                        "SEED": PILOT_SEED,
+                        "TOTAL_ITER": PHASE_ITERATIONS,
+                        "WARM_UP_ITER": 500,
+                        "EVAL_ITER": EVAL_INTERVAL,
+                        "VALIDATION_SEED": VALIDATION_SEED,
+                        "VALIDATION_BATCH_SIZE": VALIDATION_BATCH_SIZE,
+                        "FULL_SEQ_BATCH_SIZE": 16,
+                        "LENGTH_BUCKET_SIZE": 256,
+                        "GLOBAL_ALIGN_WEIGHT": variant.phase1_global,
+                        "LOCAL_ALIGN_WEIGHT": variant.phase1_local,
+                        "MAIN_PROCESS_PORT": variant.main_process_port,
+                    },
+                },
+                "phase2": {
+                    "experiment_dir": str(phase2_dir),
+                    "launcher": str(_repo_root() / "TRAIN_msa_vae_phase2.sh"),
+                    "command": [
+                        "bash",
+                        "TRAIN_msa_vae_phase2.sh",
+                        "2",
+                        "t2m_272",
+                    ],
+                    "environment": {
+                        "OUT_DIR": str(output_root),
+                        "PHASE1_DIR": str(phase1_dir),
+                        "EXP_NAME": phase_experiment_name(variant, 2),
+                        "SEED": PILOT_SEED,
+                        "TOTAL_ITER": PHASE_ITERATIONS,
+                        "WARM_UP_ITER": 1000,
+                        "EVAL_ITER": EVAL_INTERVAL,
+                        "VALIDATION_SEED": VALIDATION_SEED,
+                        "VALIDATION_BATCH_SIZE": VALIDATION_BATCH_SIZE,
+                        "FULL_SEQ_BATCH_SIZE": 8,
+                        "LENGTH_BUCKET_SIZE": 256,
+                        "WINDOW_REPLAY_INTERVAL": 4,
+                        "GLOBAL_ALIGN_WEIGHT": variant.phase2_global,
+                        "LOCAL_ALIGN_WEIGHT": variant.phase2_local,
+                        "MAIN_PROCESS_PORT": variant.main_process_port,
+                    },
+                },
+                "events": [],
+            },
+        )
+        run["events"].append(
+            {
+                "event": event,
+                "timestamp": timestamp,
+                "exit_code": exit_code,
+            }
+        )
+        if event == "phase1_complete":
+            run["phase1"].update(
+                {
+                    "exit_code": exit_code,
+                    "completed_at": timestamp,
+                    "checkpoint_sha256": _file_sha256(phase1_path),
+                }
+            )
+        elif event == "phase2_complete":
+            run["phase2"].update(
+                {
+                    "exit_code": exit_code,
+                    "completed_at": timestamp,
+                    "checkpoint_sha256": _file_sha256(phase2_path),
+                }
+            )
+        elif event == "started":
+            run["started_at"] = timestamp
+        elif event == "failed":
+            run["failed_at"] = timestamp
+            run["exit_code"] = exit_code
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=output_root,
+            prefix=".run_manifest.",
+            delete=False,
+        ) as temporary:
+            json.dump(payload, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary_path = Path(temporary.name)
+        temporary_path.replace(manifest_path)
+    return manifest_path
+
+
+def check_pilot_ports() -> None:
+    """Fail unless every fixed Accelerate rendezvous port is available."""
+    sockets = []
+    try:
+        for variant in PILOT_VARIANTS:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listener.bind(("127.0.0.1", variant.main_process_port))
+            except OSError as error:
+                listener.close()
+                raise ValueError(
+                    "Accelerate port "
+                    f"{variant.main_process_port} is unavailable "
+                    f"for {variant.slug}"
+                ) from error
+            sockets.append(listener)
+    finally:
+        for listener in sockets:
+            listener.close()
+
+
 def emit_contract(output_root: Path, format_name: str) -> str:
     if format_name == "json":
         return json.dumps(
@@ -212,6 +401,7 @@ def emit_contract(output_root: Path, format_name: str) -> str:
             variant.training_gpus,
             variant.evaluation_gpu,
             variant.screen_session,
+            variant.main_process_port,
             format(variant.phase1_global, "g"),
             format(variant.phase1_local, "g"),
             format(variant.phase2_global, "g"),
@@ -278,6 +468,23 @@ def _validate_training_args(
         or training_args.get("eval_iter") != EVAL_INTERVAL
     ):
         raise ValueError("training budget does not match the pilot")
+    expected_full_batch = 16 if phase == 1 else 8
+    expected_warm_up = 500 if phase == 1 else 1000
+    expected_sequence_mode = "full" if phase == 1 else "mixed"
+    if (
+        training_args.get("batch_size") != 64
+        or training_args.get("full_seq_batch_size")
+        != expected_full_batch
+        or training_args.get("warm_up_iter") != expected_warm_up
+        or training_args.get("length_bucket_size") != 256
+        or training_args.get("sequence_mode")
+        != expected_sequence_mode
+        or (
+            phase == 2
+            and training_args.get("window_replay_interval") != 4
+        )
+    ):
+        raise ValueError("training schedule does not match the pilot")
     if (
         training_args.get("validation_seed") != VALIDATION_SEED
         or training_args.get("validation_batch_size")
@@ -496,9 +703,35 @@ def _load_pilot_manifests(output_root: Path) -> List[Dict[str, Any]]:
 
 
 def validate_pilot_manifests(output_root: Path) -> List[Dict[str, Any]]:
+    output_root = _resolve_output_root(output_root)
+    checkpoint_records = validate_pilot_checkpoints(output_root)
     manifests = _load_pilot_manifests(output_root)
-    for manifest, variant in zip(manifests, PILOT_VARIANTS):
+    for manifest, variant, checkpoint in zip(
+        manifests,
+        PILOT_VARIANTS,
+        checkpoint_records,
+    ):
         _validate_variant_manifest(manifest, variant)
+        manifest_path = _nested(
+            manifest,
+            ("checkpoint", "path"),
+            "checkpoint path",
+        )
+        if Path(manifest_path).resolve() != Path(
+            checkpoint["phase2_path"]
+        ).resolve():
+            raise ValueError(
+                f"checkpoint path mismatch for {variant.slug}"
+            )
+        manifest_sha = _nested(
+            manifest,
+            ("checkpoint", "sha256"),
+            "checkpoint SHA-256",
+        )
+        if manifest_sha != checkpoint["phase2_sha256"]:
+            raise ValueError(
+                f"checkpoint SHA-256 mismatch for {variant.slug}"
+            )
 
     common_identities = (
         (("protocol",), "protocol"),
@@ -609,6 +842,20 @@ def _build_parser() -> argparse.ArgumentParser:
     contract.add_argument("--format", choices=("json", "tsv"), default="json")
     subparsers.add_parser("verify")
     subparsers.add_parser("collect")
+    subparsers.add_parser("check-ports")
+    record = subparsers.add_parser("record-run")
+    record.add_argument("--slug", required=True)
+    record.add_argument(
+        "--event",
+        required=True,
+        choices=(
+            "started",
+            "phase1_complete",
+            "phase2_complete",
+            "failed",
+        ),
+    )
+    record.add_argument("--exit-code", type=int, default=0)
     return parser
 
 
@@ -626,6 +873,19 @@ def main(argv=None) -> None:
                 sort_keys=True,
             )
         )
+        return
+    if args.command == "record-run":
+        print(
+            record_run_event(
+                output_root,
+                args.slug,
+                args.event,
+                args.exit_code,
+            )
+        )
+        return
+    if args.command == "check-ports":
+        check_pilot_ports()
         return
     paths = write_pilot_table(output_root)
     for name, path in paths.items():

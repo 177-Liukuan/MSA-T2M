@@ -61,7 +61,10 @@ if [[ -n ${EVAL_COMMAND:-} ]]; then
 elif [[ ${CONDA_DEFAULT_ENV:-} == mgpt ]]; then
     command=(python "${REPO_ROOT}/eval_msa_vae_metrics.py")
 else
-    command=(conda run -n mgpt python "${REPO_ROOT}/eval_msa_vae_metrics.py")
+    command=(
+        conda run --no-capture-output -n mgpt
+        python "${REPO_ROOT}/eval_msa_vae_metrics.py"
+    )
 fi
 
 "${command[@]}" \

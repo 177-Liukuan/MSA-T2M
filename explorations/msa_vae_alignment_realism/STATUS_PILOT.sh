@@ -36,4 +36,4 @@ echo "=== GPUs ==="
     --format=csv,noheader
 echo
 echo "=== Disk ==="
-df -h "$REPO_ROOT/Experiments"
+df -h "$(dirname "$PILOT_ROOT")"

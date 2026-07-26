@@ -24,6 +24,18 @@ bash explorations/msa_vae_alignment_realism/RUN_PILOT.sh
 bash explorations/msa_vae_alignment_realism/STATUS_PILOT.sh
 ```
 
+If a Screen command failed before creating that variant's phase directory,
+retry only the missing variant after the GPUs become idle:
+
+```bash
+PILOT_ONLY_VARIANT=global_only \
+bash explorations/msa_vae_alignment_realism/RUN_PILOT.sh
+```
+
+Launch attempts are appended to `launch_status.tsv`. Commands, lifecycle
+timestamps, exit codes, and final checkpoint hashes are stored in
+`run_manifest.json`.
+
 Attach to one training session:
 
 ```bash

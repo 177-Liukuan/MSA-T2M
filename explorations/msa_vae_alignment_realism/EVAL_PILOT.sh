@@ -29,11 +29,22 @@ weight_name() {
 mapfile -t contract_lines < <(
     pilot_python contract --format tsv | sed '/^[[:space:]]*$/d'
 )
+if [[ ${#contract_lines[@]} -ne 4 ]]; then
+    echo "Pilot contract must contain exactly four variants" >&2
+    exit 2
+fi
+for line in "${contract_lines[@]}"; do
+    if [[ $(awk -F '\t' '{print NF}' <<< "$line") -ne 10 ]]; then
+        echo "Pilot contract row must contain exactly ten fields" >&2
+        exit 2
+    fi
+done
 pilot_python verify >/dev/null
 screen_listing=$("$SCREEN_BIN" -ls 2>&1 || true)
 
 for line in "${contract_lines[@]}"; do
     IFS=$'\t' read -r slug label gpu_pair eval_gpu training_session \
+        main_process_port \
         p1_global p1_local p2_global p2_local <<< "$line"
     status_file="${PILOT_ROOT}/status/${slug}.status"
     if [[ ! -f "$status_file" ]] || ! grep -qx 'state=complete' "$status_file"; then
@@ -68,6 +79,7 @@ fi
 export PILOT_ROOT
 for line in "${contract_lines[@]}"; do
     IFS=$'\t' read -r slug label gpu_pair eval_gpu training_session \
+        main_process_port \
         p1_global p1_local p2_global p2_local <<< "$line"
     p2_name="${slug}_s123_phase2_25k_g$(weight_name "$p2_global")_l$(weight_name "$p2_local")"
     checkpoint="${PILOT_ROOT}/${p2_name}/net_last.pth"

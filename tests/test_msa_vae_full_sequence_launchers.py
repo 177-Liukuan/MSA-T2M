@@ -229,6 +229,8 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
                 ({"EXP_NAME": ""}, "EXP_NAME"),
                 ({"GLOBAL_ALIGN_WEIGHT": "-0.1"}, "GLOBAL_ALIGN_WEIGHT"),
                 ({"LOCAL_ALIGN_WEIGHT": "-0.1"}, "LOCAL_ALIGN_WEIGHT"),
+                ({"MAIN_PROCESS_PORT": "not-a-port"}, "MAIN_PROCESS_PORT"),
+                ({"MAIN_PROCESS_PORT": "65536"}, "MAIN_PROCESS_PORT"),
             )
             for extra_env, message in cases:
                 with self.subTest(
@@ -251,6 +253,21 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             {"CNN_CKPT_SHA256": "0" * 64},
             "does not match",
         )
+
+    def test_launchers_forward_optional_accelerate_port(self):
+        for script_name in (
+            "TRAIN_msa_vae_phase1.sh",
+            "TRAIN_msa_vae_phase2.sh",
+        ):
+            with self.subTest(script_name=script_name):
+                arguments = self._run_launcher(
+                    script_name,
+                    {"MAIN_PROCESS_PORT": "29502"},
+                )
+                self.assertEqual(
+                    self._value_after(arguments, "--main_process_port"),
+                    "29502",
+                )
 
 
 if __name__ == "__main__":

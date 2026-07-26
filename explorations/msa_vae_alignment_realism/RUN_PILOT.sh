@@ -10,6 +10,7 @@ SCREEN_BIN=${SCREEN_BIN:-screen}
 NVIDIA_SMI_BIN=${NVIDIA_SMI_BIN:-nvidia-smi}
 SHA256SUM_BIN=${SHA256SUM_BIN:-sha256sum}
 PILOT_DRY_RUN=${PILOT_DRY_RUN:-0}
+PILOT_ONLY_VARIANT=${PILOT_ONLY_VARIANT:-}
 RUNNER="${SCRIPT_DIR}/run_variant.sh"
 PILOT_CLI="${SCRIPT_DIR}/pilot.py"
 
@@ -55,10 +56,29 @@ if [[ ${#contract_lines[@]} -ne 4 ]]; then
     echo "Pilot contract must contain exactly four variants" >&2
     exit 2
 fi
+for line in "${contract_lines[@]}"; do
+    if [[ $(awk -F '\t' '{print NF}' <<< "$line") -ne 10 ]]; then
+        echo "Pilot contract row must contain exactly ten fields" >&2
+        exit 2
+    fi
+done
+if [[ -n "$PILOT_ONLY_VARIANT" ]]; then
+    variant_found=0
+    for line in "${contract_lines[@]}"; do
+        IFS=$'\t' read -r slug _ <<< "$line"
+        [[ "$slug" == "$PILOT_ONLY_VARIANT" ]] && variant_found=1
+    done
+    if [[ $variant_found -ne 1 ]]; then
+        echo "Unknown PILOT_ONLY_VARIANT: ${PILOT_ONLY_VARIANT}" >&2
+        exit 2
+    fi
+fi
 
 for line in "${contract_lines[@]}"; do
-    IFS=$'\t' read -r slug label gpu_pair eval_gpu session \
+    IFS=$'\t' read -r slug label gpu_pair eval_gpu session main_process_port \
         p1_global p1_local p2_global p2_local <<< "$line"
+    [[ -n "$PILOT_ONLY_VARIANT" && "$slug" != "$PILOT_ONLY_VARIANT" ]] \
+        && continue
     if grep -Eq "[.]${session}([[:space:]]|$)" <<< "$screen_listing"; then
         echo "Screen session already exists: ${session}" >&2
         exit 3
@@ -101,13 +121,16 @@ if [[ $gpu_count -ne 8 ]]; then
     echo "Expected exactly eight visible GPUs, found ${gpu_count}" >&2
     exit 4
 fi
+pilot_python check-ports
 
 if [[ "$PILOT_DRY_RUN" == 1 ]]; then
     echo "Dry run: no directories or Screen sessions will be created."
     for line in "${contract_lines[@]}"; do
-        IFS=$'\t' read -r slug label gpu_pair eval_gpu session \
+        IFS=$'\t' read -r slug label gpu_pair eval_gpu session main_process_port \
             p1_global p1_local p2_global p2_local <<< "$line"
-        echo "SCREEN ${session} GPUs=${gpu_pair}: ${RUNNER} ${slug} ${gpu_pair} ${p1_global} ${p1_local} ${p2_global} ${p2_local}"
+        [[ -n "$PILOT_ONLY_VARIANT" && "$slug" != "$PILOT_ONLY_VARIANT" ]] \
+            && continue
+        echo "SCREEN ${session} GPUs=${gpu_pair} port=${main_process_port}: ${RUNNER} ${slug} ${gpu_pair} ${main_process_port} ${p1_global} ${p1_local} ${p2_global} ${p2_local}"
     done
     exit 0
 fi
@@ -118,15 +141,37 @@ pilot_python contract --format json > "$contract_tmp"
 mv -f "$contract_tmp" "${PILOT_ROOT}/contract.json"
 
 export PILOT_ROOT TAE_CHECKPOINT TAE_SHA256
+launch_status="${PILOT_ROOT}/launch_status.tsv"
+if [[ ! -e "$launch_status" ]]; then
+    printf 'timestamp\tslug\tsession\tresult\n' > "$launch_status"
+fi
+launch_failures=0
 for line in "${contract_lines[@]}"; do
-    IFS=$'\t' read -r slug label gpu_pair eval_gpu session \
+    IFS=$'\t' read -r slug label gpu_pair eval_gpu session main_process_port \
         p1_global p1_local p2_global p2_local <<< "$line"
+    [[ -n "$PILOT_ONLY_VARIANT" && "$slug" != "$PILOT_ONLY_VARIANT" ]] \
+        && continue
     log_file="${PILOT_ROOT}/logs/${slug}.screen.log"
-    "$SCREEN_BIN" -L -Logfile "$log_file" -dmS "$session" \
-        bash "$RUNNER" "$slug" "$gpu_pair" \
-        "$p1_global" "$p1_local" "$p2_global" "$p2_local"
-    echo "Started ${session}: ${label}, GPUs ${gpu_pair}"
+    if "$SCREEN_BIN" -L -Logfile "$log_file" -dmS "$session" \
+            conda run --no-capture-output -n mgpt \
+            bash "$RUNNER" "$slug" "$gpu_pair" "$main_process_port" \
+            "$p1_global" "$p1_local" "$p2_global" "$p2_local"; then
+        printf '%s\t%s\t%s\tstarted\n' \
+            "$(date --iso-8601=seconds)" "$slug" "$session" \
+            >> "$launch_status"
+        echo "Started ${session}: ${label}, GPUs ${gpu_pair}"
+    else
+        printf '%s\t%s\t%s\tfailed\n' \
+            "$(date --iso-8601=seconds)" "$slug" "$session" \
+            >> "$launch_status"
+        echo "Failed to start ${session}: ${label}" >&2
+        launch_failures=$((launch_failures + 1))
+    fi
 done
+if [[ $launch_failures -ne 0 ]]; then
+    echo "${launch_failures} Screen session(s) failed; see ${launch_status}" >&2
+    exit 5
+fi
 
 echo "Status: bash ${SCRIPT_DIR}/STATUS_PILOT.sh"
 echo "Attach: screen -r <session>; detach with Ctrl-A then D"
