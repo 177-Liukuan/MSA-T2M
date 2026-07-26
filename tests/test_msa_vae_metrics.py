@@ -171,6 +171,16 @@ class DistributionAndRetrievalMetricsTest(unittest.TestCase):
         self.assertEqual(metrics["t2m_medr"], 1.5)
         self.assertEqual(metrics["m2t_medr"], 1.5)
 
+    def test_retrieval_r5_includes_rank_four_and_excludes_rank_five(self):
+        similarity = np.eye(6)
+        similarity[0] = np.array([0.0, 4.0, 3.0, 2.0, 1.0, -1.0])
+        similarity[1] = np.array([5.0, 0.0, 4.0, 3.0, 2.0, 1.0])
+
+        metrics = retrieval_metrics_from_similarity(similarity)
+
+        self.assertAlmostEqual(metrics["t2m_r5_percent"], 500.0 / 6.0)
+        self.assertIn("m2t_r5_percent", metrics)
+
     def test_bidirectional_retrieval_l2_normalizes_embeddings(self):
         text = torch.tensor([[10.0, 0.0], [0.0, 2.0]])
         motion = torch.tensor([[3.0, 0.0], [0.0, 7.0]])

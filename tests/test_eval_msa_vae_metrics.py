@@ -209,10 +209,12 @@ class ResultArtifactTest(unittest.TestCase):
             "t2m_r1_percent": 10.0,
             "t2m_r2_percent": 20.0,
             "t2m_r3_percent": 30.0,
+            "t2m_r5_percent": 40.0,
             "t2m_medr": 7.0,
             "m2t_r1_percent": 11.0,
             "m2t_r2_percent": 21.0,
             "m2t_r3_percent": 31.0,
+            "m2t_r5_percent": 41.0,
             "m2t_medr": 8.0,
         }
         self.dataset = SimpleNamespace(
@@ -263,7 +265,7 @@ class ResultArtifactTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(loaded["protocol"]["retrieval"], "TMR-full-normal")
-        self.assertEqual(loaded["protocol"]["version"], "msa-vae-standard-v1")
+        self.assertEqual(loaded["protocol"]["version"], "msa-vae-standard-v2")
         self.assertEqual(
             loaded["protocol"]["caption_policy"],
             "first complete-motion caption",
@@ -279,7 +281,9 @@ class ResultArtifactTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["checkpoint_sha256"], "f" * 64)
         self.assertEqual(float(rows[0]["t2m_r1_percent"]), 10.0)
+        self.assertEqual(float(rows[0]["t2m_r5_percent"]), 40.0)
         self.assertIn("TMR-full-normal", log_text)
+        self.assertEqual(log_text.count("R@5"), 2)
         self.assertEqual(log_text.count("P-MPJPE"), 1)
         self.assertEqual(log_text.count("ACCEL"), 1)
 

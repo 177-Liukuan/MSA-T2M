@@ -38,10 +38,12 @@ METRIC_KEYS = (
     "t2m_r1_percent",
     "t2m_r2_percent",
     "t2m_r3_percent",
+    "t2m_r5_percent",
     "t2m_medr",
     "m2t_r1_percent",
     "m2t_r2_percent",
     "m2t_r3_percent",
+    "m2t_r5_percent",
     "m2t_medr",
 )
 
@@ -484,7 +486,7 @@ def build_result_manifest(
         raise ValueError("result sample count does not match deterministic dataset")
     return {
         "protocol": {
-            "version": "msa-vae-standard-v1",
+            "version": "msa-vae-standard-v2",
             "dataset": "HumanML3D-272-complete-motion-test",
             "retrieval": "TMR-full-normal",
             "retrieval_similarity": "L2-normalized cosine",
@@ -502,10 +504,12 @@ def build_result_manifest(
             "t2m_r1_percent": "percent",
             "t2m_r2_percent": "percent",
             "t2m_r3_percent": "percent",
+            "t2m_r5_percent": "percent",
             "t2m_medr": "rank",
             "m2t_r1_percent": "percent",
             "m2t_r2_percent": "percent",
             "m2t_r3_percent": "percent",
+            "m2t_r5_percent": "percent",
             "m2t_medr": "rank",
         },
         "checkpoint": dict(checkpoint),
@@ -533,9 +537,9 @@ def _format_final_report(manifest):
         "P-MPJPE {pmpjpe:.3f} mm | ACCEL {accel:.3f} mm/frame^2 | "
         "Skating {skating:.3f}%\n"
         "Text-to-motion: R@1 {t1:.3f}% | R@2 {t2:.3f}% | "
-        "R@3 {t3:.3f}% | MedR {tm:.3f}\n"
+        "R@3 {t3:.3f}% | R@5 {t5:.3f}% | MedR {tm:.3f}\n"
         "Motion-to-text: R@1 {m1:.3f}% | R@2 {m2:.3f}% | "
-        "R@3 {m3:.3f}% | MedR {mm:.3f}\n"
+        "R@3 {m3:.3f}% | R@5 {m5:.3f}% | MedR {mm:.3f}\n"
     ).format(
         protocol=manifest["protocol"]["retrieval"],
         samples=manifest["dataset"]["sample_count"],
@@ -547,10 +551,12 @@ def _format_final_report(manifest):
         t1=metrics["t2m_r1_percent"],
         t2=metrics["t2m_r2_percent"],
         t3=metrics["t2m_r3_percent"],
+        t5=metrics["t2m_r5_percent"],
         tm=metrics["t2m_medr"],
         m1=metrics["m2t_r1_percent"],
         m2=metrics["m2t_r2_percent"],
         m3=metrics["m2t_r3_percent"],
+        m5=metrics["m2t_r5_percent"],
         mm=metrics["m2t_medr"],
     )
 
