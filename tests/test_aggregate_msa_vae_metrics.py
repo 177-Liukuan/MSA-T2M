@@ -40,6 +40,8 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                         "seed": seed,
                         "global_align_weight": 0.25,
                         "local_align_weight": 0.05,
+                        "resume_cnn_pth": "/models/fixed-tae.pth",
+                        "resume_cnn_sha256": "d" * 64,
                     }
                 },
             },
@@ -119,6 +121,12 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
             "global_align_weight"
         ] = 0.5
         mutations["alignment weights"] = weight_mismatch
+
+        tae_mismatch = self._manifests()
+        tae_mismatch[1]["checkpoint"]["metadata"]["training_args"][
+            "resume_cnn_sha256"
+        ] = "c" * 64
+        mutations["TAE"] = tae_mismatch
 
         missing_metric = self._manifests()
         del missing_metric[1]["metrics"]["fid"]

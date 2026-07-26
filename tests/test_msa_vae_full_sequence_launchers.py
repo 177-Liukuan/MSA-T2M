@@ -85,6 +85,7 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
                 "FULL_SEQ_BATCH_SIZE": "7",
                 "LENGTH_BUCKET_SIZE": "19",
                 "CNN_CKPT": "Experiments/test-cnn.pth",
+                "CNN_CKPT_SHA256": "d" * 64,
                 "EXP_NAME": "phase1-global-local-seed123",
                 "GLOBAL_ALIGN_WEIGHT": "0.25",
                 "LOCAL_ALIGN_WEIGHT": "0.05",
@@ -117,6 +118,7 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             "--warm-up-iter": "3",
             "--eval-iter": "4",
             "--out-dir": "Experiments/test-ablation",
+            "--resume-cnn-sha256": "d" * 64,
         }
         for flag, value in expected.items():
             self.assertEqual(
@@ -215,6 +217,12 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
                         extra_env,
                         message,
                     )
+
+        self._assert_launcher_rejected(
+            "TRAIN_msa_vae_phase1.sh",
+            {"CNN_CKPT_SHA256": "not-a-sha256"},
+            "CNN_CKPT_SHA256",
+        )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import math
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from typing import NamedTuple
 
 import torch
@@ -41,6 +42,7 @@ TRAINING_IDENTITY_FIELDS = (
     'text_encoder_type',
     'text_embed_dim',
     'resume_cnn_pth',
+    'resume_cnn_sha256',
 )
 
 
@@ -390,6 +392,51 @@ def validate_msa_checkpoint_metadata(metadata, args):
             f'checkpoint unit_length={actual_unit_length} does not match '
             f'requested unit_length={expected_unit_length}'
         )
+
+
+def inherit_msa_checkpoint_lineage(
+        metadata, parent_metadata, parent_checkpoint_path):
+    """Carry Phase 1 seed and fixed-TAE identity into Phase 2 metadata."""
+    result = dict(metadata)
+    lineage = {
+        'parent_checkpoint_path': os.fspath(parent_checkpoint_path),
+        'parent_checkpoint_metadata': (
+            dict(parent_metadata)
+            if isinstance(parent_metadata, Mapping)
+            else None
+        ),
+    }
+    result['lineage'] = lineage
+    if not isinstance(parent_metadata, Mapping):
+        return result
+
+    current_args = dict(result.get('training_args') or {})
+    parent_args = parent_metadata.get('training_args')
+    if not isinstance(parent_args, Mapping):
+        return result
+    current_seed = current_args.get('seed')
+    parent_seed = parent_args.get('seed')
+    if (
+        current_seed is not None
+        and parent_seed is not None
+        and current_seed != parent_seed
+    ):
+        raise ValueError(
+            f'Phase 2 seed={current_seed} does not match '
+            f'Phase 1 seed={parent_seed}'
+        )
+    for field in ('resume_cnn_pth', 'resume_cnn_sha256'):
+        parent_value = parent_args.get(field)
+        current_value = current_args.get(field)
+        if current_value and parent_value and current_value != parent_value:
+            raise ValueError(
+                f'Phase 2 {field}={current_value} does not match '
+                f'Phase 1 {field}={parent_value}'
+            )
+        if not current_value:
+            current_args[field] = parent_value
+    result['training_args'] = current_args
+    return result
 
 
 def save_msa_checkpoint(path, model, metadata=None):

@@ -37,6 +37,7 @@ T5_EMBED_DIR=${T5_EMBED_DIR:-./humanml3d_272/t5_enc_single}
 CLIP_EMBED_DIR=${CLIP_EMBED_DIR:-./humanml3d_272/clip_enc_single}
 T5_MODEL_PATH=${T5_MODEL_PATH:-sentencet5-xxl/}
 CNN_CKPT=${CNN_CKPT:-Experiments/causal_TAE_t2m_272_h100_20260203/net_best_mpjpe.pth}
+CNN_CKPT_SHA256=${CNN_CKPT_SHA256:-}
 
 if [[ ${EXP_NAME+x} && -z "$EXP_NAME" ]]; then
   echo "ERROR: EXP_NAME must not be empty" >&2
@@ -60,6 +61,18 @@ validate_nonnegative_weight() {
 validate_nonnegative_weight "GLOBAL_ALIGN_WEIGHT" "$GLOBAL_ALIGN_WEIGHT"
 validate_nonnegative_weight "LOCAL_ALIGN_WEIGHT" "$LOCAL_ALIGN_WEIGHT"
 
+if [[ -z "$CNN_CKPT_SHA256" ]]; then
+  if [[ ! -f "$CNN_CKPT" ]]; then
+    echo "ERROR: CNN_CKPT is not a file: $CNN_CKPT" >&2
+    exit 2
+  fi
+  CNN_CKPT_SHA256=$(sha256sum -- "$CNN_CKPT" | awk '{print $1}')
+fi
+if [[ ! "$CNN_CKPT_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+  echo "ERROR: CNN_CKPT_SHA256 must contain 64 hexadecimal characters" >&2
+  exit 2
+fi
+
 if [ "$TEXT_ENCODER_TYPE" = "t5" ]; then
   TEXT_EMBED_DIM=768
 else
@@ -78,6 +91,7 @@ echo "Length bucket   : $LENGTH_BUCKET_SIZE"
 echo "Text encoder    : $TEXT_ENCODER_TYPE"
 echo "Text dim        : $TEXT_EMBED_DIM"
 echo "CNN checkpoint  : $CNN_CKPT"
+echo "CNN SHA-256     : $CNN_CKPT_SHA256"
 echo "Experiment      : $EXP_NAME"
 echo "Output root     : $OUT_DIR"
 echo "Seed            : $SEED"
@@ -129,6 +143,7 @@ accelerate launch --num_processes "$NUM_GPUS" --mixed_precision bf16 \
   --no_ft_split \
   --num_gpus "$NUM_GPUS" \
   --resume-cnn-pth "$CNN_CKPT" \
+  --resume-cnn-sha256 "$CNN_CKPT_SHA256" \
   --eval-iter "$EVAL_ITER" \
   --print-iter 200 \
   --seed "$SEED"

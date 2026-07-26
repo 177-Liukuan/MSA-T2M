@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from utils.msa_vae_training import (
     build_global_alignment_target,
     build_msa_checkpoint_metadata,
+    inherit_msa_checkpoint_lineage,
     save_msa_checkpoint,
     select_training_batch,
     validate_msa_checkpoint_metadata,
@@ -143,6 +144,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             "text_encoder_type": "t5",
             "text_embed_dim": 768,
             "resume_cnn_pth": "Experiments/causal-tae/net.pth",
+            "resume_cnn_sha256": "a" * 64,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -161,6 +163,10 @@ class CheckpointMetadataTest(unittest.TestCase):
         self.assertEqual(
             metadata["training_args"]["exp_name"],
             "global_local_seed123",
+        )
+        self.assertEqual(
+            metadata["training_args"]["resume_cnn_sha256"],
+            "a" * 64,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -207,6 +213,57 @@ class CheckpointMetadataTest(unittest.TestCase):
 
     def test_legacy_checkpoint_without_metadata_is_accepted(self):
         validate_msa_checkpoint_metadata(None, self._args())
+
+    def test_phase2_inherits_fixed_tae_identity_and_parent_metadata(self):
+        parent = build_msa_checkpoint_metadata(self._args(phase=1))
+        current = build_msa_checkpoint_metadata(
+            self._args(
+                phase=2,
+                sequence_mode="mixed",
+                exp_name="phase2_seed123",
+                resume_cnn_pth=None,
+                resume_cnn_sha256=None,
+            )
+        )
+
+        inherited = inherit_msa_checkpoint_lineage(
+            current,
+            parent,
+            "/models/phase1_seed123/net_last.pth",
+        )
+
+        self.assertEqual(
+            inherited["training_args"]["resume_cnn_pth"],
+            "Experiments/causal-tae/net.pth",
+        )
+        self.assertEqual(
+            inherited["training_args"]["resume_cnn_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            inherited["lineage"]["parent_checkpoint_path"],
+            "/models/phase1_seed123/net_last.pth",
+        )
+        self.assertEqual(
+            inherited["lineage"]["parent_checkpoint_metadata"],
+            parent,
+        )
+
+        mismatched_seed = build_msa_checkpoint_metadata(
+            self._args(
+                phase=2,
+                sequence_mode="mixed",
+                seed=456,
+                resume_cnn_pth=None,
+                resume_cnn_sha256=None,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "seed"):
+            inherit_msa_checkpoint_lineage(
+                mismatched_seed,
+                parent,
+                "/models/phase1_seed123/net_last.pth",
+            )
 
 
 if __name__ == "__main__":

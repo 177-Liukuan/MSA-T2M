@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
@@ -166,6 +167,34 @@ def aggregate_variant(
             raise ValueError(f"alignment weights mismatch for {key}")
         alignment_weights[key] = values[0]
 
+    tae_path = _same_identity(
+        manifests,
+        (
+            "checkpoint",
+            "metadata",
+            "training_args",
+            "resume_cnn_pth",
+        ),
+        "TAE",
+    )
+    tae_sha256 = _same_identity(
+        manifests,
+        (
+            "checkpoint",
+            "metadata",
+            "training_args",
+            "resume_cnn_sha256",
+        ),
+        "TAE",
+    )
+    if not isinstance(tae_path, str) or not tae_path:
+        raise ValueError("TAE checkpoint path must be a non-empty string")
+    if (
+        not isinstance(tae_sha256, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", tae_sha256) is None
+    ):
+        raise ValueError("TAE checkpoint SHA-256 must be 64 hexadecimal characters")
+
     aggregated_metrics = {}
     for name in TARGET_METRICS:
         values = []
@@ -207,6 +236,10 @@ def aggregate_variant(
         "skating": skating,
         "model_config": model_values,
         "alignment_weights": alignment_weights,
+        "tae_checkpoint": {
+            "path": tae_path,
+            "sha256": tae_sha256.lower(),
+        },
         "metrics": aggregated_metrics,
         "sources": sources,
     }

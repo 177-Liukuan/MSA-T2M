@@ -49,6 +49,7 @@ from utils.msa_vae_training import (
     MSAVAELossWeights,
     build_global_alignment_target,
     build_msa_checkpoint_metadata,
+    inherit_msa_checkpoint_lineage,
     compute_msa_vae_objective,
     save_msa_checkpoint,
     select_training_batch,
@@ -367,6 +368,11 @@ if args.resume_pth:
             ckpt.get('metadata') if isinstance(ckpt, dict) else None
         )
         validate_msa_checkpoint_metadata(metadata, args)
+        checkpoint_metadata = inherit_msa_checkpoint_lineage(
+            checkpoint_metadata,
+            metadata,
+            args.resume_pth,
+        )
     state = ckpt if not isinstance(ckpt, dict) or 'net' not in ckpt else ckpt['net']
     net.load_state_dict(state, strict=True)
 
