@@ -58,6 +58,7 @@ class MSAAdapter(Adapter):
 
     def _load(self):
         t, i, d = self.torch, self.impl, self.device_obj
+        from sentence_transformers import SentenceTransformer
         import models.msa_vae as msa_vae
         from models.llama_model import LLaMAHF, LLaMAHFConfig
         from models.llama_rag_model import LLaMARAGWrapper
