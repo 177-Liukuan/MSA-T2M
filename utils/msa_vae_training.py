@@ -16,6 +16,33 @@ MOTION_LENGTH_BIN_NAMES = (
     'over_128',
 )
 
+TRAINING_IDENTITY_FIELDS = (
+    'hidden_size',
+    'down_t',
+    'stride_t',
+    'depth',
+    'dilation_growth_rate',
+    'latent_dim',
+    'trans_d_model',
+    'trans_nhead',
+    'trans_enc_layers',
+    'trans_dec_layers',
+    'trans_ff_size',
+    'trans_dropout',
+    'clip_dim',
+    'disable_decoupling',
+    'seed',
+    'global_align_weight',
+    'local_align_weight',
+    'latent_recon_weight',
+    'root_loss',
+    'exp_name',
+    'msa_data_mode',
+    'text_encoder_type',
+    'text_embed_dim',
+    'resume_cnn_pth',
+)
+
 
 def motion_length_bin(length):
     """Return the reporting bin for a motion length in frames."""
@@ -314,6 +341,10 @@ def build_global_alignment_target(global_text, local_pooled, has_local,
 
 def build_msa_checkpoint_metadata(args):
     """Record sequence-training structure without changing tensor keys."""
+    training_args = {
+        field: getattr(args, field)
+        for field in TRAINING_IDENTITY_FIELDS
+    }
     return {
         'format_version': 1,
         'phase': int(args.phase),
@@ -326,6 +357,7 @@ def build_msa_checkpoint_metadata(args):
         'unit_length': int(args.stride_t) ** int(args.down_t),
         'latent_dim': int(args.latent_dim),
         'normalized_loss_version': 1,
+        'training_args': training_args,
     }
 
 

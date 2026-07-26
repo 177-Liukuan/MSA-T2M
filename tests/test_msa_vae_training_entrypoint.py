@@ -122,6 +122,27 @@ class CheckpointMetadataTest(unittest.TestCase):
             "down_t": 2,
             "stride_t": 2,
             "latent_dim": 16,
+            "hidden_size": 1024,
+            "depth": 3,
+            "dilation_growth_rate": 3,
+            "trans_d_model": 768,
+            "trans_nhead": 8,
+            "trans_enc_layers": 6,
+            "trans_dec_layers": 6,
+            "trans_ff_size": 2048,
+            "trans_dropout": 0.1,
+            "clip_dim": 768,
+            "disable_decoupling": False,
+            "seed": 123,
+            "global_align_weight": 0.25,
+            "local_align_weight": 0.05,
+            "latent_recon_weight": 1.0,
+            "root_loss": 7.0,
+            "exp_name": "global_local_seed123",
+            "msa_data_mode": "humanml_full",
+            "text_encoder_type": "t5",
+            "text_embed_dim": 768,
+            "resume_cnn_pth": "Experiments/causal-tae/net.pth",
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -131,6 +152,16 @@ class CheckpointMetadataTest(unittest.TestCase):
         metadata = build_msa_checkpoint_metadata(self._args())
 
         self.assertEqual(metadata["unit_length"], 4)
+        self.assertEqual(metadata["training_args"]["seed"], 123)
+        self.assertEqual(
+            metadata["training_args"]["global_align_weight"],
+            0.25,
+        )
+        self.assertEqual(metadata["training_args"]["trans_enc_layers"], 6)
+        self.assertEqual(
+            metadata["training_args"]["exp_name"],
+            "global_local_seed123",
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "checkpoint.pth"
