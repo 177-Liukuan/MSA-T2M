@@ -15,6 +15,7 @@ from utils.msa_vae_training import (
     select_training_batch,
     validate_msa_checkpoint_metadata,
     validate_phase2_parent_metadata,
+    validate_phase2_resume_requirement,
 )
 
 
@@ -142,6 +143,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             "seed": 123,
             "total_iter": 50000,
             "warm_up_iter": 500,
+            "eval_iter": 2500,
             "lr": 1e-4,
             "lr_scheduler": [50000],
             "gamma": 0.05,
@@ -160,6 +162,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             "num_gpus": 2,
             "resume_cnn_pth": "Experiments/causal-tae/net.pth",
             "resume_cnn_sha256": "a" * 64,
+            "resume_pth": None,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -183,6 +186,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             metadata["training_args"]["resume_cnn_sha256"],
             "a" * 64,
         )
+        self.assertEqual(metadata["training_args"]["eval_iter"], 2500)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "checkpoint.pth"
@@ -310,6 +314,21 @@ class CheckpointMetadataTest(unittest.TestCase):
         missing_tae["training_args"]["resume_cnn_sha256"] = None
         with self.assertRaisesRegex(ValueError, "TAE"):
             validate_phase2_parent_metadata(missing_tae, phase2_args)
+
+    def test_phase2_requires_resume_path_before_training_starts(self):
+        validate_phase2_resume_requirement(self._args(phase=1))
+        validate_phase2_resume_requirement(
+            self._args(
+                phase=2,
+                sequence_mode="mixed",
+                resume_pth="/models/phase1/net_last.pth",
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "resume-pth"):
+            validate_phase2_resume_requirement(
+                self._args(phase=2, sequence_mode="mixed")
+            )
 
 
 if __name__ == "__main__":

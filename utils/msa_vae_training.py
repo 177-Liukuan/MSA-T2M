@@ -39,6 +39,7 @@ TRAINING_IDENTITY_FIELDS = (
     'disable_decoupling',
     'total_iter',
     'warm_up_iter',
+    'eval_iter',
     'lr',
     'lr_scheduler',
     'gamma',
@@ -446,6 +447,14 @@ def validate_phase2_parent_metadata(metadata, args):
         raise ValueError(
             'Phase 2 parent checkpoint is missing valid fixed TAE SHA-256 '
             'metadata'
+        )
+
+
+def validate_phase2_resume_requirement(args):
+    """Reject a Phase 2 launch that has no Phase 1 checkpoint to resume."""
+    if int(args.phase) == 2 and not getattr(args, 'resume_pth', None):
+        raise ValueError(
+            'Phase 2 requires --resume-pth from a fresh Phase 1 run'
         )
 
 

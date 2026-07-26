@@ -55,6 +55,7 @@ from utils.msa_vae_training import (
     select_training_batch,
     validate_msa_checkpoint_metadata,
     validate_phase2_parent_metadata,
+    validate_phase2_resume_requirement,
     validate_sequence_training_config,
 )
 import sys
@@ -171,6 +172,7 @@ def log_model_params(model, name="Model", accelerator=None):
 #   Main
 # ---------------------------------------------------------------------------
 args = option_msa_vae.get_args_parser()
+validate_phase2_resume_requirement(args)
 if args.msa_data_mode == 'babel_sparse_global':
     accelerator = Accelerator(
         dataloader_config=DataLoaderConfiguration(even_batches=False)

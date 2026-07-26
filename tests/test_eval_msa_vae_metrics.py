@@ -247,6 +247,7 @@ class ResultArtifactTest(unittest.TestCase):
             resolved_config=self.resolved,
             dataset=self.dataset,
             seed=123,
+            batch_size=32,
             skating_config=SkatingConfig(),
         )
 
@@ -277,6 +278,7 @@ class ResultArtifactTest(unittest.TestCase):
         )
         self.assertEqual(loaded["dataset"]["sample_hash"], "abc123")
         self.assertEqual(loaded["dataset"]["sample_ids"], ["a", "b", "c"])
+        self.assertEqual(loaded["batch_size"], 32)
         self.assertEqual(loaded["skating"]["smoothing_window_frames"], 8)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["checkpoint_sha256"], "f" * 64)
@@ -299,6 +301,7 @@ class ResultArtifactTest(unittest.TestCase):
                 resolved_config=self.resolved,
                 dataset=self.dataset,
                 seed=123,
+                batch_size=32,
                 skating_config=SkatingConfig(),
             )
 

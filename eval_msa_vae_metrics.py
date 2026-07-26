@@ -471,6 +471,7 @@ def build_result_manifest(
     resolved_config,
     dataset,
     seed,
+    batch_size,
     skating_config,
 ):
     missing_metrics = [key for key in METRIC_KEYS if key not in metrics]
@@ -524,6 +525,7 @@ def build_result_manifest(
             "sample_ids": list(dataset.sample_ids),
         },
         "seed": int(seed),
+        "batch_size": int(batch_size),
         "skating": asdict(skating_config),
     }
 
@@ -578,6 +580,7 @@ def write_result_artifacts(manifest, output_dir):
         "sample_count": manifest["dataset"]["sample_count"],
         "sample_hash": manifest["dataset"]["sample_hash"],
         "seed": manifest["seed"],
+        "batch_size": manifest["batch_size"],
     }
     row.update(manifest["metrics"])
     with (output_dir / "metrics.csv").open(
@@ -654,6 +657,7 @@ def main(argv=None):
         resolved_config=resolved_config,
         dataset=dataset,
         seed=args.seed,
+        batch_size=args.batch_size,
         skating_config=skating_config,
     )
     report = write_result_artifacts(manifest, paths.output_dir)

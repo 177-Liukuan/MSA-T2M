@@ -133,6 +133,39 @@ def _canonical_training_configuration(metadata: Any) -> Dict[str, Any]:
     return configuration
 
 
+def _validate_official_two_stage_protocol(metadata: Any) -> None:
+    """Require the final HumanML result protocol approved for the paper."""
+    if not isinstance(metadata, Mapping):
+        raise ValueError("official two-stage protocol metadata is missing")
+    training_args = metadata.get("training_args")
+    lineage = metadata.get("lineage")
+    if not isinstance(training_args, Mapping) or not isinstance(lineage, Mapping):
+        raise ValueError("official two-stage protocol lineage is missing")
+    parent_path = lineage.get("parent_checkpoint_path")
+    parent = lineage.get("parent_checkpoint_metadata")
+    if (
+        metadata.get("phase") != 2
+        or metadata.get("sequence_mode") != "mixed"
+        or training_args.get("msa_data_mode") != "humanml_full"
+        or training_args.get("use_ft_split") is not False
+        or training_args.get("num_gpus") != 2
+        or not isinstance(parent_path, str)
+        or not parent_path
+        or not isinstance(parent, Mapping)
+    ):
+        raise ValueError("checkpoint does not follow official two-stage protocol")
+    parent_args = parent.get("training_args")
+    if (
+        parent.get("phase") != 1
+        or parent.get("sequence_mode") != "full"
+        or not isinstance(parent_args, Mapping)
+        or parent_args.get("msa_data_mode") != "humanml_full"
+        or parent_args.get("use_ft_split") is not False
+        or parent_args.get("num_gpus") != 2
+    ):
+        raise ValueError("checkpoint does not follow official two-stage protocol")
+
+
 def aggregate_variant(
     variant: str,
     manifests: Sequence[Mapping[str, Any]],
@@ -187,6 +220,17 @@ def aggregate_variant(
     )
     if isinstance(evaluation_seed, bool) or not isinstance(evaluation_seed, int):
         raise ValueError("evaluation seed must be an integer")
+    evaluation_batch_size = _same_identity(
+        manifests,
+        ("batch_size",),
+        "evaluation batch size",
+    )
+    if (
+        isinstance(evaluation_batch_size, bool)
+        or not isinstance(evaluation_batch_size, int)
+        or evaluation_batch_size < 1
+    ):
+        raise ValueError("evaluation batch size must be a positive integer")
 
     checkpoint_shas = [
         _nested(item, ("checkpoint", "sha256"), "checkpoint")
@@ -270,6 +314,14 @@ def aggregate_variant(
         for configuration in training_configurations[1:]
     ):
         raise ValueError("training configuration mismatch across manifests")
+    for item in manifests:
+        _validate_official_two_stage_protocol(
+            _nested(
+                item,
+                ("checkpoint", "metadata"),
+                "official two-stage protocol",
+            )
+        )
 
     aggregated_metrics = {}
     for name in TARGET_METRICS:
@@ -307,6 +359,7 @@ def aggregate_variant(
         "seed_count": 3,
         "seeds": sorted(seeds),
         "evaluation_seed": evaluation_seed,
+        "evaluation_batch_size": evaluation_batch_size,
         "protocol": protocols[0],
         "evaluator_sha256": evaluator_sha,
         "dataset": dataset_identity,

@@ -26,8 +26,35 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
             name: float(metric_value)
             for name in TARGET_METRICS
         }
+        parent_metadata = {
+            "format_version": 1,
+            "phase": 1,
+            "sequence_mode": "full",
+            "window_size": 64,
+            "full_seq_batch_size": 16,
+            "window_replay_interval": 4,
+            "down_t": 2,
+            "stride_t": 2,
+            "unit_length": 4,
+            "latent_dim": 16,
+            "normalized_loss_version": 1,
+            "training_args": {
+                "seed": seed,
+                "exp_name": f"phase1-seed-{seed}",
+                "global_align_weight": 0.25,
+                "local_align_weight": 0.05,
+                "root_loss": 7.0,
+                "latent_recon_weight": 1.0,
+                "msa_data_mode": "humanml_full",
+                "use_ft_split": False,
+                "num_gpus": 2,
+                "resume_cnn_pth": "/models/fixed-tae.pth",
+                "resume_cnn_sha256": "d" * 64,
+            },
+        }
         return {
             "seed": 2026,
+            "batch_size": 32,
             "protocol": {
                 "version": "msa-vae-standard-v2",
                 "retrieval": "TMR-full-normal",
@@ -48,6 +75,12 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                     "unit_length": 4,
                     "latent_dim": 16,
                     "normalized_loss_version": 1,
+                    "lineage": {
+                        "parent_checkpoint_path": (
+                            f"/models/phase1-seed-{seed}.pth"
+                        ),
+                        "parent_checkpoint_metadata": parent_metadata,
+                    },
                     "training_args": {
                         "seed": seed,
                         "exp_name": f"variant-seed-{seed}",
@@ -57,6 +90,7 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                         "latent_recon_weight": 1.0,
                         "msa_data_mode": "humanml_full",
                         "use_ft_split": False,
+                        "num_gpus": 2,
                         "resume_cnn_pth": "/models/fixed-tae.pth",
                         "resume_cnn_sha256": "d" * 64,
                     }
@@ -149,6 +183,10 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
         evaluation_seed_mismatch[1]["seed"] = 2027
         mutations["evaluation seed"] = evaluation_seed_mismatch
 
+        evaluation_batch_mismatch = self._manifests()
+        evaluation_batch_mismatch[1]["batch_size"] = 16
+        mutations["evaluation batch size"] = evaluation_batch_mismatch
+
         training_config_mutations = (
             (("phase",), 1),
             (("sequence_mode",), "window"),
@@ -157,6 +195,7 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
             (("training_args", "latent_recon_weight"), 0.5),
             (("training_args", "msa_data_mode"), "babel_sparse_global"),
             (("training_args", "use_ft_split"), True),
+            (("training_args", "num_gpus"), 1),
         )
         for keys, value in training_config_mutations:
             incompatible = self._manifests()
@@ -182,6 +221,40 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
         for message, manifests in mutations.items():
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
+                    aggregate_variant("variant", manifests)
+
+    def test_rejects_runs_outside_official_two_stage_humanml_protocol(self):
+        cases = (
+            (("phase",), 1),
+            (("sequence_mode",), "full"),
+            (("training_args", "msa_data_mode"), "babel_sparse_global"),
+            (("training_args", "use_ft_split"), True),
+            (("lineage",), None),
+            (
+                ("lineage", "parent_checkpoint_metadata", "phase"),
+                2,
+            ),
+            (
+                (
+                    "lineage",
+                    "parent_checkpoint_metadata",
+                    "sequence_mode",
+                ),
+                "window",
+            ),
+        )
+        for keys, value in cases:
+            manifests = self._manifests()
+            for manifest in manifests:
+                target = manifest["checkpoint"]["metadata"]
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = value
+            with self.subTest(keys=keys, value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "official two-stage protocol",
+                ):
                     aggregate_variant("variant", manifests)
 
     def test_writes_json_numeric_csv_and_requested_markdown_row(self):
