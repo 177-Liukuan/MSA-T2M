@@ -448,7 +448,11 @@ def build_global_alignment_target(global_text, local_pooled, has_local,
 def build_msa_checkpoint_metadata(args):
     """Record sequence-training structure without changing tensor keys."""
     training_args = {
-        field: getattr(args, field)
+        field: (
+            getattr(args, field, False)
+            if field == 'freeze_phase2_local_proj'
+            else getattr(args, field)
+        )
         for field in TRAINING_IDENTITY_FIELDS
     }
     return {

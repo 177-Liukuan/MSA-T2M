@@ -367,6 +367,16 @@ class CheckpointMetadataTest(unittest.TestCase):
         for key, value in model.state_dict().items():
             torch.testing.assert_close(payload["net"][key], value)
 
+    def test_checkpoint_metadata_defaults_missing_frozen_projection_flag(self):
+        args = self._args()
+        del args.freeze_phase2_local_proj
+
+        metadata = build_msa_checkpoint_metadata(args)
+
+        self.assertFalse(
+            metadata["training_args"]["freeze_phase2_local_proj"]
+        )
+
     def test_structural_metadata_is_validated_but_phase_handoff_is_allowed(self):
         metadata = build_msa_checkpoint_metadata(self._args(phase=1))
 
