@@ -7,8 +7,11 @@ import numpy as np
 import torch
 
 from humanml3d_272.dataset_eval_msa_vae_metrics import (
+    MSAVAEAlignmentDataset,
     MSAVAEMetricsDataset,
+    collate_msa_vae_alignment,
     collate_msa_vae_metrics,
+    make_msa_vae_alignment_loader,
     make_msa_vae_metrics_loader,
 )
 
@@ -20,6 +23,8 @@ class MSAVAEMetricsDatasetTest(unittest.TestCase):
         (self.root / "motion_data").mkdir()
         (self.root / "texts").mkdir()
         (self.root / "mean_std").mkdir()
+        (self.root / "global_text").mkdir()
+        (self.root / "local_text").mkdir()
         np.save(self.root / "mean_std" / "Mean.npy", np.zeros(272))
         np.save(self.root / "mean_std" / "Std.npy", np.ones(272))
         self.split_file = self.root / "test.txt"
@@ -158,6 +163,222 @@ class MSAVAEMetricsDatasetTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unique"):
             self._dataset()
+
+    def test_global_alignment_view_uses_every_complete_caption_cache_row(self):
+        self._write_fixture(
+            split_ids=["motion_b"],
+            motions={"motion_b": np.zeros((64, 272), dtype=np.float32)},
+            texts={
+                "motion_b": [
+                    "segment#tok#0.5#1.5",
+                    "first full#tok#0#0",
+                    "second full#tok#nan#nan",
+                ],
+            },
+        )
+        np.save(
+            self.root / "global_text" / "motion_b.npy",
+            np.array(
+                [
+                    [100.0, 101.0],
+                    [200.0, 201.0],
+                    [300.0, 301.0],
+                ],
+                dtype=np.float32,
+            ),
+        )
+
+        dataset = MSAVAEAlignmentDataset(
+            data_root=self.root,
+            split_file=self.split_file,
+            unit_length=4,
+            target_mode="global",
+            text_embed_dim=2,
+            global_text_embed_dir=self.root / "global_text",
+        )
+        item = dataset[0]
+
+        self.assertEqual(item["all_captions"], ("first full", "second full"))
+        self.assertEqual(item["caption_line_indices"], (1, 2))
+        torch.testing.assert_close(
+            item["global_text_embeddings"],
+            torch.tensor([[200.0, 201.0], [300.0, 301.0]]),
+        )
+        self.assertEqual(dataset.target_mode, "global")
+        self.assertEqual(dataset.caption_count, 2)
+        self.assertEqual(
+            dataset.target_directory,
+            str((self.root / "global_text").resolve()),
+        )
+        self.assertEqual(len(dataset.target_hash), 64)
+        self.assertEqual(dataset.sample_ids, ["motion_b"])
+        self.assertEqual(item["raw_length"], 64)
+
+    def test_alignment_collator_preserves_variable_captions_and_local_masks(self):
+        self._write_fixture(
+            split_ids=["a", "b"],
+            motions={
+                "a": np.zeros((64, 272), dtype=np.float32),
+                "b": np.zeros((68, 272), dtype=np.float32),
+            },
+            texts={
+                "a": ["a full#tok#0#0"],
+                "b": [
+                    "b first#tok#0#0",
+                    "b second#tok#nan#nan",
+                ],
+            },
+        )
+        np.save(
+            self.root / "global_text" / "a.npy",
+            np.array([[1.0, 0.0]], dtype=np.float32),
+        )
+        np.save(
+            self.root / "global_text" / "b.npy",
+            np.array([[0.0, 1.0], [1.0, 1.0]], dtype=np.float32),
+        )
+        np.save(
+            self.root / "local_text" / "a.npy",
+            np.stack(
+                [
+                    np.arange(64, dtype=np.float32),
+                    -np.arange(64, dtype=np.float32),
+                ],
+                axis=1,
+            ),
+        )
+        np.save(
+            self.root / "local_text" / "b.npy",
+            np.stack(
+                [
+                    np.arange(68, dtype=np.float32),
+                    -np.arange(68, dtype=np.float32),
+                ],
+                axis=1,
+            ),
+        )
+
+        global_dataset = MSAVAEAlignmentDataset(
+            data_root=self.root,
+            split_file=self.split_file,
+            unit_length=4,
+            target_mode="global",
+            text_embed_dim=2,
+            global_text_embed_dir=self.root / "global_text",
+        )
+        global_batch = collate_msa_vae_alignment(
+            [global_dataset[0], global_dataset[1]]
+        )
+
+        self.assertEqual(global_batch["target_mode"], "global")
+        self.assertEqual(
+            global_batch["all_captions"],
+            [("a full",), ("b first", "b second")],
+        )
+        self.assertEqual(
+            [tuple(value.shape) for value in global_batch["global_text_embeddings"]],
+            [(1, 2), (2, 2)],
+        )
+        self.assertEqual(tuple(global_batch["motions"].shape), (2, 68, 272))
+
+        local_dataset = MSAVAEAlignmentDataset(
+            data_root=self.root,
+            split_file=self.split_file,
+            unit_length=4,
+            target_mode="local",
+            text_embed_dim=2,
+            local_text_embed_dir=self.root / "local_text",
+        )
+        loader = make_msa_vae_alignment_loader(
+            local_dataset,
+            batch_size=2,
+            num_workers=0,
+        )
+        local_batch = next(iter(loader))
+
+        self.assertEqual(local_batch["target_mode"], "local")
+        self.assertEqual(
+            tuple(local_batch["local_text_embeddings"].shape),
+            (2, 17, 2),
+        )
+        self.assertEqual(
+            local_batch["local_mask"].tolist(),
+            [[True] * 16 + [False], [True] * 17],
+        )
+        torch.testing.assert_close(
+            local_batch["local_text_embeddings"][0, 0],
+            torch.tensor([1.5, -1.5]),
+        )
+        self.assertEqual(local_dataset.local_token_count, 33)
+        self.assertEqual(local_dataset.caption_count, 0)
+
+    def test_alignment_view_fails_closed_on_missing_or_malformed_targets(self):
+        self._write_fixture(
+            split_ids=["sample"],
+            motions={"sample": np.zeros((64, 272), dtype=np.float32)},
+            texts={"sample": ["full#tok#0#0"]},
+        )
+
+        with self.assertRaisesRegex(FileNotFoundError, "global"):
+            MSAVAEAlignmentDataset(
+                data_root=self.root,
+                split_file=self.split_file,
+                unit_length=4,
+                target_mode="global",
+                text_embed_dim=2,
+                global_text_embed_dir=self.root / "global_text",
+            )
+
+        np.save(
+            self.root / "global_text" / "sample.npy",
+            np.ones((1, 3), dtype=np.float32),
+        )
+        with self.assertRaisesRegex(ValueError, "dimension"):
+            MSAVAEAlignmentDataset(
+                data_root=self.root,
+                split_file=self.split_file,
+                unit_length=4,
+                target_mode="global",
+                text_embed_dim=2,
+                global_text_embed_dir=self.root / "global_text",
+            )
+
+        np.save(
+            self.root / "global_text" / "sample.npy",
+            np.empty((0, 2), dtype=np.float32),
+        )
+        with self.assertRaisesRegex(ValueError, "caption row"):
+            MSAVAEAlignmentDataset(
+                data_root=self.root,
+                split_file=self.split_file,
+                unit_length=4,
+                target_mode="global",
+                text_embed_dim=2,
+                global_text_embed_dir=self.root / "global_text",
+            )
+
+        local = np.ones((64, 2), dtype=np.float32)
+        local[0, 0] = np.nan
+        np.save(self.root / "local_text" / "sample.npy", local)
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            MSAVAEAlignmentDataset(
+                data_root=self.root,
+                split_file=self.split_file,
+                unit_length=4,
+                target_mode="local",
+                text_embed_dim=2,
+                local_text_embed_dir=self.root / "local_text",
+            )
+
+        with self.assertRaisesRegex(ValueError, "target_mode"):
+            MSAVAEAlignmentDataset(
+                data_root=self.root,
+                split_file=self.split_file,
+                unit_length=4,
+                target_mode="mixed",
+                text_embed_dim=2,
+                global_text_embed_dir=self.root / "global_text",
+            )
 
 
 if __name__ == "__main__":
