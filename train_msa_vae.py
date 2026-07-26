@@ -252,10 +252,8 @@ else:
         use_offline_global_text=args.use_offline_global_text,
         clip_global_embed_dir=args.clip_global_embed_dir,
         t5_global_embed_dir=args.t5_global_embed_dir,
-        sequence_mode=(
-            'window'
-            if args.sequence_mode == 'mixed'
-            else args.sequence_mode
+        sequence_mode=dataset_msa_vae.source_dataset_sequence_mode(
+            args.sequence_mode
         ),
     )
     full_loader = None

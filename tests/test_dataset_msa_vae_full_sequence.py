@@ -190,6 +190,7 @@ class FullSequenceCollateTest(unittest.TestCase):
         dataset.window_size = 64
         dataset.unit_length = 4
         dataset.data = [
+            {"motion": np.zeros((20, 272), dtype=np.float32)},
             {"motion": np.zeros((70, 272), dtype=np.float32), "marker": base}
         ]
 
@@ -198,9 +199,24 @@ class FullSequenceCollateTest(unittest.TestCase):
 
         self.assertIs(full.dataset, dataset)
         self.assertIs(window.dataset, dataset)
-        self.assertIs(full.dataset.data[0]["marker"], base)
-        self.assertEqual(full.source_lengths, [68])
+        self.assertIs(full.dataset.data[1]["marker"], base)
+        self.assertEqual(len(full), 2)
+        self.assertEqual(len(window), 1)
+        self.assertEqual(full.source_lengths, [20, 68])
         self.assertEqual(window.source_lengths, [64])
+        self.assertEqual(window.indices, [1])
+
+    def test_mixed_training_loads_full_source_records(self):
+        self.assertEqual(
+            dataset_msa_vae.source_dataset_sequence_mode("mixed"),
+            "full",
+        )
+        self.assertEqual(
+            dataset_msa_vae.source_dataset_sequence_mode("window"),
+            "window",
+        )
+        with self.assertRaisesRegex(ValueError, "sequence_mode"):
+            dataset_msa_vae.source_dataset_sequence_mode("prefix")
 
 
 class LengthBucketBatchSamplerTest(unittest.TestCase):

@@ -275,6 +275,15 @@ class MotionSequenceTooShortError(ValueError):
     """A motion cannot produce even one complete temporal latent token."""
 
 
+def source_dataset_sequence_mode(sequence_mode):
+    """Keep every full-sequence record when mixed replay is requested."""
+    if sequence_mode == 'mixed':
+        return 'full'
+    if sequence_mode in ('window', 'full'):
+        return sequence_mode
+    raise ValueError(f'unknown sequence_mode: {sequence_mode}')
+
+
 class MSAVAESequenceView(data.Dataset):
     """Select a sequence view without duplicating the loaded source records."""
 
@@ -285,22 +294,30 @@ class MSAVAESequenceView(data.Dataset):
             )
         self.dataset = dataset
         self.sequence_mode = sequence_mode
+        if sequence_mode == 'window':
+            self.indices = [
+                index
+                for index, entry in enumerate(dataset.data)
+                if len(entry['motion']) >= dataset.window_size
+            ]
+        else:
+            self.indices = list(range(len(dataset.data)))
 
     @property
     def source_lengths(self):
         if self.sequence_mode == 'window':
-            return [self.dataset.window_size] * len(self.dataset)
+            return [self.dataset.window_size] * len(self.indices)
         return [
-            (len(entry['motion']) // self.dataset.unit_length)
+            (len(self.dataset.data[index]['motion']) // self.dataset.unit_length)
             * self.dataset.unit_length
-            for entry in self.dataset.data
+            for index in self.indices
         ]
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.indices)
 
     def __getitem__(self, item):
-        return self.dataset.get_item(item, self.sequence_mode)
+        return self.dataset.get_item(self.indices[item], self.sequence_mode)
 
 
 class LengthBucketBatchSampler(torch.utils.data.Sampler):
