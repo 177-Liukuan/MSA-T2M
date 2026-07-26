@@ -143,18 +143,27 @@ def _validate_official_two_stage_protocol(metadata: Any) -> None:
         raise ValueError("official two-stage protocol lineage is missing")
     parent_path = lineage.get("parent_checkpoint_path")
     parent = lineage.get("parent_checkpoint_metadata")
+    eval_iter = training_args.get("eval_iter")
     if (
         metadata.get("phase") != 2
         or metadata.get("sequence_mode") != "mixed"
         or training_args.get("msa_data_mode") != "humanml_full"
         or training_args.get("use_ft_split") is not False
         or training_args.get("num_gpus") != 2
+        or isinstance(eval_iter, bool)
+        or not isinstance(eval_iter, int)
+        or eval_iter < 1
         or not isinstance(parent_path, str)
         or not parent_path
         or not isinstance(parent, Mapping)
     ):
         raise ValueError("checkpoint does not follow official two-stage protocol")
     parent_args = parent.get("training_args")
+    parent_eval_iter = (
+        parent_args.get("eval_iter")
+        if isinstance(parent_args, Mapping)
+        else None
+    )
     if (
         parent.get("phase") != 1
         or parent.get("sequence_mode") != "full"
@@ -162,6 +171,9 @@ def _validate_official_two_stage_protocol(metadata: Any) -> None:
         or parent_args.get("msa_data_mode") != "humanml_full"
         or parent_args.get("use_ft_split") is not False
         or parent_args.get("num_gpus") != 2
+        or isinstance(parent_eval_iter, bool)
+        or not isinstance(parent_eval_iter, int)
+        or parent_eval_iter < 1
     ):
         raise ValueError("checkpoint does not follow official two-stage protocol")
 

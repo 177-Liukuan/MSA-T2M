@@ -45,6 +45,7 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                 "local_align_weight": 0.05,
                 "root_loss": 7.0,
                 "latent_recon_weight": 1.0,
+                "eval_iter": 2500,
                 "msa_data_mode": "humanml_full",
                 "use_ft_split": False,
                 "num_gpus": 2,
@@ -88,6 +89,7 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                         "local_align_weight": 0.05,
                         "root_loss": 7.0,
                         "latent_recon_weight": 1.0,
+                        "eval_iter": 2500,
                         "msa_data_mode": "humanml_full",
                         "use_ft_split": False,
                         "num_gpus": 2,
@@ -256,6 +258,32 @@ class AggregateMSAVAEMetricsTest(unittest.TestCase):
                     "official two-stage protocol",
                 ):
                     aggregate_variant("variant", manifests)
+
+    def test_rejects_missing_or_invalid_eval_interval_in_either_phase(self):
+        phase_paths = (
+            ("training_args",),
+            ("lineage", "parent_checkpoint_metadata", "training_args"),
+        )
+        for phase_path in phase_paths:
+            for invalid_value in (None, 0, True, 1.5):
+                manifests = self._manifests()
+                for manifest in manifests:
+                    target = manifest["checkpoint"]["metadata"]
+                    for key in phase_path:
+                        target = target[key]
+                    if invalid_value is None:
+                        del target["eval_iter"]
+                    else:
+                        target["eval_iter"] = invalid_value
+                with self.subTest(
+                    phase_path=phase_path,
+                    invalid_value=invalid_value,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "official two-stage protocol",
+                    ):
+                        aggregate_variant("variant", manifests)
 
     def test_writes_json_numeric_csv_and_requested_markdown_row(self):
         result = aggregate_variant("Global + Local", self._manifests())
