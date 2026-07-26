@@ -8,8 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.msa_vae_training import (
+    build_phase2_optimizer_param_groups,
     build_global_alignment_target,
     build_msa_checkpoint_metadata,
+    configure_msa_vae_trainability,
     inherit_msa_checkpoint_lineage,
     save_msa_checkpoint,
     select_training_batch,
@@ -115,6 +117,149 @@ class GlobalTargetRoutingTest(unittest.TestCase):
         )
 
 
+class TinyMSACore(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cnn_encoder = nn.Linear(3, 2, bias=False)
+        self.cnn_decoder = nn.Linear(2, 3, bias=False)
+        self.decode_proj = nn.Linear(2, 2, bias=False)
+        self.trans_encoder = nn.Linear(2, 2, bias=False)
+        self.trans_decoder = nn.Linear(2, 2, bias=False)
+        self.global_proj = nn.Linear(2, 4, bias=False)
+        self.local_proj = nn.Linear(2, 4, bias=False)
+
+
+class TinyMSAWrapper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.msa_vae = TinyMSACore()
+
+
+class PhaseTrainabilityTest(unittest.TestCase):
+    def test_phase2_frozen_local_projection_preserves_requested_module_states(self):
+        model = TinyMSAWrapper()
+
+        state = configure_msa_vae_trainability(
+            model,
+            phase=2,
+            freeze_phase2_local_proj=True,
+        )
+
+        self.assertFalse(state["local_proj"])
+        for name in (
+            "cnn_encoder",
+            "cnn_decoder",
+            "decode_proj",
+            "trans_encoder",
+            "trans_decoder",
+            "global_proj",
+        ):
+            self.assertTrue(state[name], msg=name)
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in model.msa_vae.cnn_encoder.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in model.msa_vae.local_proj.parameters()
+            )
+        )
+
+    def test_local_loss_crosses_frozen_projection_and_optimizer_excludes_it(self):
+        torch.manual_seed(123)
+        model = TinyMSAWrapper()
+        configure_msa_vae_trainability(
+            model,
+            phase=2,
+            freeze_phase2_local_proj=True,
+        )
+        groups = build_phase2_optimizer_param_groups(
+            model,
+            lr=1e-3,
+            cnn_lr_scale=0.1,
+        )
+        optimizer = torch.optim.SGD(groups)
+        local_parameter_ids = {
+            id(parameter)
+            for parameter in model.msa_vae.local_proj.parameters()
+        }
+        optimizer_parameter_ids = {
+            id(parameter)
+            for group in groups
+            for parameter in group["params"]
+        }
+        self.assertTrue(local_parameter_ids.isdisjoint(optimizer_parameter_ids))
+
+        encoder_before = model.msa_vae.cnn_encoder.weight.detach().clone()
+        projection_before = model.msa_vae.local_proj.weight.detach().clone()
+        inputs = torch.ones(4, 3)
+        mu = model.msa_vae.cnn_encoder(inputs)
+        prediction = model.msa_vae.local_proj(mu)
+        loss = (prediction - torch.ones_like(prediction)).square().mean()
+        loss.backward()
+
+        encoder_grad = model.msa_vae.cnn_encoder.weight.grad
+        self.assertIsNotNone(encoder_grad)
+        self.assertTrue(torch.isfinite(encoder_grad).all())
+        self.assertGreater(encoder_grad.abs().sum().item(), 0.0)
+        self.assertIsNone(model.msa_vae.local_proj.weight.grad)
+
+        optimizer.step()
+        self.assertFalse(
+            torch.equal(
+                encoder_before,
+                model.msa_vae.cnn_encoder.weight.detach(),
+            )
+        )
+        torch.testing.assert_close(
+            projection_before,
+            model.msa_vae.local_proj.weight.detach(),
+        )
+
+    def test_phase0_and_phase1_preserve_existing_trainability_contracts(self):
+        model = TinyMSAWrapper()
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        phase0 = configure_msa_vae_trainability(model, phase=0)
+        self.assertTrue(all(phase0.values()))
+
+        phase1 = configure_msa_vae_trainability(model, phase=1)
+        for name in ("cnn_encoder", "cnn_decoder", "decode_proj"):
+            self.assertFalse(phase1[name], msg=name)
+        for name in (
+            "trans_encoder",
+            "trans_decoder",
+            "global_proj",
+            "local_proj",
+        ):
+            self.assertTrue(phase1[name], msg=name)
+
+    def test_missing_required_module_and_empty_optimizer_group_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "local_proj"):
+            configure_msa_vae_trainability(
+                nn.Linear(2, 2),
+                phase=2,
+                freeze_phase2_local_proj=True,
+            )
+
+        model = TinyMSAWrapper()
+        model.msa_vae.trans_encoder = nn.Identity()
+        model.msa_vae.trans_decoder = nn.Identity()
+        model.msa_vae.global_proj = nn.Identity()
+        model.msa_vae.local_proj = nn.Identity()
+        configure_msa_vae_trainability(model, phase=2)
+        with self.assertRaisesRegex(ValueError, "top"):
+            build_phase2_optimizer_param_groups(
+                model,
+                lr=1e-3,
+                cnn_lr_scale=0.1,
+            )
+
+
 class CheckpointMetadataTest(unittest.TestCase):
     @staticmethod
     def _args(**overrides):
@@ -167,6 +312,7 @@ class CheckpointMetadataTest(unittest.TestCase):
             "resume_cnn_pth": "Experiments/causal-tae/net.pth",
             "resume_cnn_sha256": "a" * 64,
             "resume_pth": None,
+            "freeze_phase2_local_proj": False,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -195,6 +341,16 @@ class CheckpointMetadataTest(unittest.TestCase):
         self.assertEqual(
             metadata["training_args"]["validation_batch_size"],
             32,
+        )
+        self.assertFalse(
+            metadata["training_args"]["freeze_phase2_local_proj"]
+        )
+
+        enabled = build_msa_checkpoint_metadata(
+            self._args(phase=2, freeze_phase2_local_proj=True)
+        )
+        self.assertTrue(
+            enabled["training_args"]["freeze_phase2_local_proj"]
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:

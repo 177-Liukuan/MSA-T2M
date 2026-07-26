@@ -61,7 +61,93 @@ TRAINING_IDENTITY_FIELDS = (
     'use_offline_global_text',
     'resume_cnn_pth',
     'resume_cnn_sha256',
+    'freeze_phase2_local_proj',
 )
+
+MSA_REQUIRED_PHASE_MODULES = (
+    'cnn_encoder',
+    'cnn_decoder',
+    'decode_proj',
+    'local_proj',
+)
+MSA_CNN_MODULES = (
+    'cnn_encoder',
+    'cnn_decoder',
+    'decode_proj',
+)
+
+
+def _msa_core(model):
+    core = getattr(model, 'msa_vae', model)
+    missing = [
+        name
+        for name in MSA_REQUIRED_PHASE_MODULES
+        if not hasattr(core, name)
+    ]
+    if missing:
+        raise ValueError(
+            'MSA-VAE model is missing required modules: '
+            + ', '.join(missing)
+        )
+    return core
+
+
+def configure_msa_vae_trainability(
+        model, phase, freeze_phase2_local_proj=False):
+    """Apply the phase trainability contract after checkpoint loading."""
+    if phase not in (0, 1, 2):
+        raise ValueError(f'unsupported phase: {phase}')
+    if freeze_phase2_local_proj and phase != 2:
+        raise ValueError(
+            'freeze_phase2_local_proj is valid only for Phase 2'
+        )
+    core = _msa_core(model)
+    for parameter in core.parameters():
+        parameter.requires_grad = True
+    if phase == 1:
+        for name in MSA_CNN_MODULES:
+            for parameter in getattr(core, name).parameters():
+                parameter.requires_grad = False
+    elif phase == 2 and freeze_phase2_local_proj:
+        for parameter in core.local_proj.parameters():
+            parameter.requires_grad = False
+    return {
+        name: all(
+            parameter.requires_grad
+            for parameter in module.parameters()
+        )
+        for name, module in core.named_children()
+    }
+
+
+def build_phase2_optimizer_param_groups(model, lr, cnn_lr_scale):
+    """Build trainable-only top/CNN parameter groups for Phase 2."""
+    core = _msa_core(model)
+    cnn_parameter_ids = {
+        id(parameter)
+        for name in MSA_CNN_MODULES
+        for parameter in getattr(core, name).parameters()
+    }
+    cnn_params = []
+    top_params = []
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        if id(parameter) in cnn_parameter_ids:
+            cnn_params.append(parameter)
+        else:
+            top_params.append(parameter)
+    if not top_params:
+        raise ValueError('Phase 2 top optimizer group has no parameters')
+    if not cnn_params:
+        raise ValueError('Phase 2 CNN optimizer group has no parameters')
+    return [
+        {'params': top_params, 'lr': float(lr)},
+        {
+            'params': cnn_params,
+            'lr': float(lr) * float(cnn_lr_scale),
+        },
+    ]
 
 
 def motion_length_bin(length):
