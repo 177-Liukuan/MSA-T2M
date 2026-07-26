@@ -468,21 +468,11 @@ def _validate_training_args(
         or training_args.get("eval_iter") != EVAL_INTERVAL
     ):
         raise ValueError("training budget does not match the pilot")
-    expected_full_batch = 16 if phase == 1 else 8
     expected_warm_up = 500 if phase == 1 else 1000
-    expected_sequence_mode = "full" if phase == 1 else "mixed"
     if (
         training_args.get("batch_size") != 64
-        or training_args.get("full_seq_batch_size")
-        != expected_full_batch
         or training_args.get("warm_up_iter") != expected_warm_up
         or training_args.get("length_bucket_size") != 256
-        or training_args.get("sequence_mode")
-        != expected_sequence_mode
-        or (
-            phase == 2
-            and training_args.get("window_replay_interval") != 4
-        )
     ):
         raise ValueError("training schedule does not match the pilot")
     if (
@@ -509,6 +499,20 @@ def _validate_training_args(
         or training_args.get("resume_cnn_sha256") != TAE_SHA256
     ):
         raise ValueError("TAE identity does not match the fixed checkpoint")
+
+
+def _validate_metadata_schedule(
+    metadata: Mapping[str, Any],
+    phase: int,
+) -> None:
+    expected_sequence_mode = "full" if phase == 1 else "mixed"
+    expected_full_batch = 16 if phase == 1 else 8
+    if (
+        metadata.get("sequence_mode") != expected_sequence_mode
+        or metadata.get("full_seq_batch_size") != expected_full_batch
+        or metadata.get("window_replay_interval") != 4
+    ):
+        raise ValueError("training schedule does not match the pilot")
 
 
 def _validate_variant_manifest(
@@ -542,10 +546,10 @@ def _validate_variant_manifest(
     if (
         not isinstance(metadata, Mapping)
         or metadata.get("phase") != 2
-        or metadata.get("sequence_mode") != "mixed"
         or metadata.get("normalized_loss_version") != 1
     ):
         raise ValueError("Phase 2 checkpoint metadata is invalid")
+    _validate_metadata_schedule(metadata, phase=2)
     _validate_training_args(metadata.get("training_args"), variant, phase=2)
 
     lineage = metadata.get("lineage")
@@ -562,11 +566,11 @@ def _validate_variant_manifest(
     if (
         not isinstance(parent, Mapping)
         or parent.get("phase") != 1
-        or parent.get("sequence_mode") != "full"
         or not isinstance(parent_path, str)
         or Path(parent_path).name != "net_last.pth"
     ):
         raise ValueError("Phase 1 lineage is invalid")
+    _validate_metadata_schedule(parent, phase=1)
     _validate_training_args(parent.get("training_args"), variant, phase=1)
 
     metrics = _nested(manifest, ("metrics",), "metric")
@@ -628,11 +632,11 @@ def validate_pilot_checkpoints(output_root: Path) -> List[Dict[str, Any]]:
         if (
             not isinstance(parent_metadata, Mapping)
             or parent_metadata.get("phase") != 1
-            or parent_metadata.get("sequence_mode") != "full"
         ):
             raise ValueError(
                 f"Phase 1 checkpoint metadata is invalid for {variant.slug}"
             )
+        _validate_metadata_schedule(parent_metadata, phase=1)
         _validate_training_args(
             parent_metadata.get("training_args"),
             variant,
@@ -641,11 +645,11 @@ def validate_pilot_checkpoints(output_root: Path) -> List[Dict[str, Any]]:
         if (
             not isinstance(metadata, Mapping)
             or metadata.get("phase") != 2
-            or metadata.get("sequence_mode") != "mixed"
         ):
             raise ValueError(
                 f"Phase 2 checkpoint metadata is invalid for {variant.slug}"
             )
+        _validate_metadata_schedule(metadata, phase=2)
         _validate_training_args(
             metadata.get("training_args"),
             variant,

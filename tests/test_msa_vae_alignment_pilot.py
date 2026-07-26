@@ -135,9 +135,6 @@ class PilotCollectorTest(unittest.TestCase):
             "use_offline_global_text": True,
             "resume_cnn_pth": TAE_CHECKPOINT,
             "resume_cnn_sha256": TAE_SHA256,
-            "sequence_mode": sequence_mode,
-            "full_seq_batch_size": full_batch_size,
-            "window_replay_interval": 4,
         }
 
     @classmethod
@@ -309,6 +306,9 @@ class PilotCollectorTest(unittest.TestCase):
             ("training budget", lambda manifests: manifests[0]["checkpoint"][
                 "metadata"
             ]["training_args"].update({"total_iter": 50000})),
+            ("training schedule", lambda manifests: manifests[0][
+                "checkpoint"
+            ]["metadata"].update({"full_seq_batch_size": 999})),
             ("alignment weights", lambda manifests: manifests[0]["checkpoint"][
                 "metadata"
             ]["training_args"].update({"global_align_weight": 0.1})),
