@@ -278,6 +278,12 @@ class MSAFullSequenceLauncherTest(unittest.TestCase):
             "FREEZE_PHASE2_LOCAL_PROJ",
         )
 
+        self._assert_launcher_rejected(
+            "TRAIN_msa_vae_phase2.sh",
+            {"FREEZE_PHASE2_LOCAL_PROJ": ""},
+            "FREEZE_PHASE2_LOCAL_PROJ",
+        )
+
     def test_launchers_reject_empty_names_and_negative_weights(self):
         for script_name in (
             "TRAIN_msa_vae_phase1.sh",
