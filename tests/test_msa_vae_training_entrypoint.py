@@ -528,6 +528,22 @@ class DeterministicValidationSourceContractTest(unittest.TestCase):
             r"ActorAgnosticEncoder\([^)]*max_len=-1",
         )
 
+    def test_entrypoint_applies_phase_trainability_before_optimizer(self):
+        source = (ROOT / "train_msa_vae.py").read_text(encoding="utf-8")
+        configure_at = source.index(
+            "module_trainability = configure_msa_vae_trainability("
+        )
+        optimizer_at = source.index(
+            "param_groups = build_phase2_optimizer_param_groups("
+        )
+
+        self.assertLess(configure_at, optimizer_at)
+        self.assertIn(
+            "freeze_phase2_local_proj=args.freeze_phase2_local_proj",
+            source,
+        )
+        self.assertNotIn("def set_cnn_frozen(", source)
+
 
 if __name__ == "__main__":
     unittest.main()

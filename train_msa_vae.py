@@ -53,8 +53,10 @@ from utils.msa_vae_training import (
     MSAVAELossWeights,
     build_global_alignment_target,
     build_msa_checkpoint_metadata,
+    build_phase2_optimizer_param_groups,
     inherit_msa_checkpoint_lineage,
     compute_msa_vae_objective,
+    configure_msa_vae_trainability,
     save_msa_checkpoint,
     select_training_batch,
     validate_msa_checkpoint_metadata,
@@ -389,31 +391,39 @@ if text_encoder is not None:
     text_encoder.eval()
 
 ##### ---- Phase-aware freeze / unfreeze ---- #####
-# Identify CNN params (bottom layer) vs top-layer params
-cnn_modules = ['msa_vae.cnn_encoder', 'msa_vae.cnn_decoder', 'msa_vae.decode_proj']
-top_modules = ['msa_vae.trans_encoder', 'msa_vae.trans_decoder',
-               'msa_vae.global_proj', 'msa_vae.local_proj']
-
-def set_cnn_frozen(model, frozen):
-    """Freeze or unfreeze CNN encoder/decoder/decode_proj."""
-    for name, param in model.named_parameters():
-        if any(name.startswith(m) for m in cnn_modules):
-            param.requires_grad = not frozen
+module_trainability = configure_msa_vae_trainability(
+    net,
+    phase=args.phase,
+    freeze_phase2_local_proj=args.freeze_phase2_local_proj,
+)
+if args.phase == 1:
+    logger.info(
+        'Phase 1: CNN encoder/decoder/decode_proj frozen; '
+        'semantic modules trainable'
+    )
+elif args.phase == 2:
+    logger.info(
+        'Phase 2: CNN and semantic modules trainable; '
+        f'local_proj frozen={args.freeze_phase2_local_proj}; '
+        f'CNN LR scale={args.cnn_lr_scale}'
+    )
+else:
+    logger.info(
+        'Phase 0: legacy mode, all model parameters trainable'
+    )
+logger.info(
+    'Module trainability: '
+    + json.dumps(module_trainability, sort_keys=True)
+)
 
 if args.phase == 1:
-    # Phase 1: freeze CNN, only train Transformer + projections
-    set_cnn_frozen(net, frozen=True)
-    n_frozen = sum(1 for n, p in net.named_parameters() if not p.requires_grad)
-    n_train = sum(1 for n, p in net.named_parameters() if p.requires_grad)
-    logger.info(f'Phase 1: CNN frozen ({n_frozen} params frozen, {n_train} trainable)')
+    phase_desc = 'Phase 1, CNN frozen'
+elif args.phase == 2 and args.freeze_phase2_local_proj:
+    phase_desc = 'Phase 2, local_proj frozen'
 elif args.phase == 2:
-    # Phase 2: all unfrozen (differential LR set in optimizer)
-    set_cnn_frozen(net, frozen=False)
-    logger.info(f'Phase 2: all params unfrozen, CNN LR scale = {args.cnn_lr_scale}')
+    phase_desc = 'Phase 2, all trainable'
 else:
-    logger.info(f'Phase 0: legacy mode, all params trainable with uniform LR')
-
-phase_desc = 'Phase 1, CNN frozen' if args.phase == 1 else ('Phase 2, all unfrozen' if args.phase == 2 else 'Phase 0, legacy')
+    phase_desc = 'Phase 0, legacy'
 log_model_params(net, name=f'MSA-HumanVAE ({phase_desc})', accelerator=accelerator)
 
 net.train()
@@ -453,20 +463,20 @@ else:
 
 ##### ---- Optimizer & Scheduler ---- #####
 if args.phase == 2:
-    # Differential LR: CNN params get scaled-down LR
-    cnn_params, top_params = [], []
-    for name, param in net.named_parameters():
-        if any(name.startswith(m) for m in cnn_modules):
-            cnn_params.append(param)
-        else:
-            top_params.append(param)
-    param_groups = [
-        {'params': top_params, 'lr': args.lr},
-        {'params': cnn_params, 'lr': args.lr * args.cnn_lr_scale},
-    ]
-    optimizer = optim.AdamW(param_groups, betas=(0.9, 0.99),
-                            weight_decay=args.weight_decay)
-    logger.info(f'Optimizer: top LR={args.lr}, CNN LR={args.lr * args.cnn_lr_scale}')
+    param_groups = build_phase2_optimizer_param_groups(
+        net,
+        lr=args.lr,
+        cnn_lr_scale=args.cnn_lr_scale,
+    )
+    optimizer = optim.AdamW(
+        param_groups,
+        betas=(0.9, 0.99),
+        weight_decay=args.weight_decay,
+    )
+    logger.info(
+        f'Optimizer: top LR={args.lr}, '
+        f'CNN LR={args.lr * args.cnn_lr_scale}'
+    )
 else:
     # Phase 0/1: uniform LR on trainable params only
     trainable_params = [p for p in net.parameters() if p.requires_grad]

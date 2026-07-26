@@ -27,6 +27,39 @@ class MSAOptionTest(unittest.TestCase):
         self.assertEqual(args.validation_seed, 123)
         self.assertEqual(args.validation_batch_size, 32)
 
+    def test_phase2_local_projection_freeze_is_explicit_and_phase_scoped(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "train_msa_vae.py",
+                "--phase",
+                "2",
+                "--freeze-phase2-local-proj",
+            ],
+        ):
+            enabled = option_msa_vae.get_args_parser()
+        self.assertTrue(enabled.freeze_phase2_local_proj)
+
+        with mock.patch.object(sys, "argv", ["train_msa_vae.py"]):
+            default = option_msa_vae.get_args_parser()
+        self.assertFalse(default.freeze_phase2_local_proj)
+
+        for phase in ("0", "1"):
+            with self.subTest(phase=phase):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "train_msa_vae.py",
+                        "--phase",
+                        phase,
+                        "--freeze-phase2-local-proj",
+                    ],
+                ):
+                    with self.assertRaises(SystemExit):
+                        option_msa_vae.get_args_parser()
+
 
 class MSAFullSequenceLauncherTest(unittest.TestCase):
     def _invoke_launcher(self, script_name, extra_env):
